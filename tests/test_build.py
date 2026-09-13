@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tartarus import cli  # noqa: E402
 from tartarus.config import Config, Guest  # noqa: E402
-from tartarus.errors import TartarusError  # noqa: E402
 
 
 def make_config(*guests: Guest) -> Config:

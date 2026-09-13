@@ -1,9 +1,9 @@
-"""Tests for ARP-based guest IP resolution (Darwin MicroVMs).
+"""Tests for host-reachable guest IP resolution (Darwin MicroVMs).
 
-``vmnet``'s DHCP server does not record leases where the host can read them
-(only bootpd's own, unrelated to QEMU's deterministic MAC), so the host ARP
-table is the only way to map a running guest's MAC to its IP. A guest that has
-just booted may not be in the table yet, so ``resolve_running_ip`` polls.
+``vmnet``'s DHCP server is not usable (and guests are configured with a
+deterministic static address anyway), so ``resolve_running_ip`` probes the
+known address to prime the host ARP cache, prefers whatever the table then
+reports, and falls back to the deterministic address instead of failing.
 
 Run from the repository root::
 
@@ -12,7 +12,6 @@ Run from the repository root::
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -49,13 +48,6 @@ def _running_state(config: Config, name: str = "litellm", guest_id: int = 12) ->
     (state / "cid").write_text(str(guest_id))
 
 
-def _arp_run(stdout: str):
-    def fake_run(cmd, **_kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout, "")
-
-    return fake_run
-
-
 # --- arp_ip_for_mac -------------------------------------------------------
 
 
@@ -79,38 +71,34 @@ def test_waits_until_the_arp_entry_appears(monkeypatch, capsys, tmp_path):
     config = make_config(tmp_path)
     _running_state(config)
     monkeypatch.setattr(ssh, "is_running", lambda *_a, **_k: True)
+    monkeypatch.setattr(ssh, "_ping_once", lambda _ip: None)
+    monkeypatch.setattr(ssh.time, "sleep", lambda _seconds: None)
 
     outputs = iter([ARP_OTHER, ARP_OTHER, ARP_LITELLM])
-    monkeypatch.setattr(
-        ssh.subprocess,
-        "run",
-        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, next(outputs), ""),
-    )
-    monkeypatch.setattr(ssh.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(ssh, "_arp_table", lambda: next(outputs))
 
     assert ssh.resolve_running_ip(config, "litellm") == "192.168.64.54"
 
     # The progress note must not touch stdout: this path backs ssh's
     # ProxyCommand, where stdout is the SSH transport.
     captured = capsys.readouterr()
-    assert "waiting for 'litellm'" in captured.err
+    assert "probing 'litellm'" in captured.err
     assert captured.out == ""
 
 
-def test_dies_once_the_wait_expires(monkeypatch, capsys, tmp_path):
+def test_falls_back_to_the_deterministic_static_ip(monkeypatch, capsys, tmp_path):
     config = make_config(tmp_path)
-    _running_state(config)
+    _running_state(config, name="network", guest_id=9)
     monkeypatch.setattr(ssh, "is_running", lambda *_a, **_k: True)
-    monkeypatch.setattr(ssh.subprocess, "run", _arp_run(ARP_OTHER))
+    monkeypatch.setattr(ssh, "_ping_once", lambda _ip: None)
+    monkeypatch.setattr(ssh, "_arp_table", lambda: ARP_OTHER)
+    # Force the Darwin static-address formula regardless of the test host.
+    monkeypatch.setattr(ssh.system, "is_darwin", lambda: True)
     monkeypatch.setattr(ssh.time, "sleep", lambda _seconds: None)
-
-    ticks = iter([0.0, 0.0, 1000.0])
+    ticks = iter([0.0, 1000.0])
     monkeypatch.setattr(ssh.time, "monotonic", lambda: next(ticks))
 
-    with pytest.raises(SystemExit) as exc:
-        ssh.resolve_running_ip(config, "litellm")
-    assert exc.value.code == 1
-    assert "no ARP entry for 'litellm'" in capsys.readouterr().err
+    assert ssh.resolve_running_ip(config, "network") == "192.168.64.51"
 
 
 def test_does_not_wait_when_the_guest_is_stopped(monkeypatch, capsys, tmp_path):

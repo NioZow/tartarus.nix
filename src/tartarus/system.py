@@ -120,6 +120,11 @@ def ctn_ip(guest_id: int) -> str:
     return f"10.201.0.{guest_id}"
 
 
+def guest_ip(guest_id: int) -> str:
+    """The guest's deterministic host-reachable IP (static on both platforms)."""
+    return vm_ip_nat(guest_id) if is_darwin() else vm_ip(guest_id)
+
+
 def guest_mac(guest_id: int) -> str:
     """The guest's ethernet MAC, exactly as ``ids.nix`` derives it."""
     return f"02:00:00:00:00:{guest_id:02x}"

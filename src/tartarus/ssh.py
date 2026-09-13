@@ -178,8 +178,38 @@ def arp_ip_for_mac(arp_output: str, mac_want: str) -> str | None:
     return None
 
 
+def _arp_table() -> str:
+    # -n: skip reverse-DNS on every entry (plain `arp -a` blocks on lookups
+    # that always fail for local bridge/vmnet addresses). Output format is
+    # identical since none of these addresses have reverse DNS.
+    result = subprocess.run(["arp", "-an"], capture_output=True, text=True)
+    if result.returncode != 0:
+        die(f"failed to run `arp -an`: {result.stderr.strip()}")
+    return result.stdout
+
+
+def _ping_once(ip: str) -> None:
+    """Best-effort probe that populates the host ARP cache for ``ip``.
+
+    ARP resolves at L2, so the entry appears even if the guest filters ICMP.
+    """
+    if system.is_darwin():
+        cmd = ["ping", "-c", "1", "-t", "1", ip]
+    else:
+        cmd = ["ping", "-c", "1", "-W", "1", ip]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def resolve_running_ip(config: Config, name: str) -> str:
-    """Resolve the host-reachable IP of a running MicroVM via the ARP table."""
+    """Resolve the host-reachable IP of a running MicroVM.
+
+    Guests are configured with a deterministic static address and send no
+    gratuitous ARP, so the host's ARP cache stays empty until we address them.
+    Probe the known address to populate it, prefer whatever the table then
+    reports (covers a shifted subnet), and otherwise trust the deterministic
+    address -- never fail with "no ARP entry": the caller (ssh/nc) surfaces a
+    real connection error if the address is wrong.
+    """
     if name.endswith(".trs"):
         name = name[: -len(".trs")]
 
@@ -200,25 +230,25 @@ def resolve_running_ip(config: Config, name: str) -> str:
         guest_id = flake.guest_id(config, "vm", base)
 
     mac = system.guest_mac(guest_id)
-    # -n: skip reverse-DNS on every entry (plain `arp -a` blocks on lookups
-    # that always fail for local bridge/vmnet addresses). Output format is
-    # identical since none of these addresses have reverse DNS.
+    expected = system.guest_ip(guest_id)
+
+    ip = arp_ip_for_mac(_arp_table(), mac)
+    if ip is not None:
+        return ip
+
     deadline = time.monotonic() + ARP_WAIT_SECONDS
     announced = False
     while True:
-        arp_result = subprocess.run(["arp", "-an"], capture_output=True, text=True)
-        if arp_result.returncode != 0:
-            die(f"failed to run `arp -an`: {arp_result.stderr.strip()}")
-        ip = arp_ip_for_mac(arp_result.stdout, mac)
+        if not announced:
+            note(f"probing '{name}' at {expected} (mac {mac})...")
+            announced = True
+        _ping_once(expected)
+        ip = arp_ip_for_mac(_arp_table(), mac)
         if ip is not None:
             return ip
         if time.monotonic() >= deadline:
-            break
-        if not announced:
-            note(f"waiting for '{name}' to get a network address (mac {mac})...")
-            announced = True
+            return expected
         time.sleep(ARP_POLL_INTERVAL)
-    die(f"no ARP entry for '{name}' (mac {mac}) -- is it running and has it gotten a network address?")
 
 
 def action_cid(config: Config, name: str) -> None:
