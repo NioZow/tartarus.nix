@@ -16,16 +16,12 @@ in
     version = "0.1.0";
     pyproject = true;
 
-    # `src/` and `pyproject.toml` live at the flake root; pull in exactly what
-    # the build needs (PLAN.md is referenced as the project readme). Only
-    # ``.py`` files under ``src`` are taken so stray ``__pycache__``/``.pyc``
-    # never influence the build.
     src = lib.fileset.toSource {
       root = ../..;
       fileset = lib.fileset.unions [
         ../../pyproject.toml
         ../../uv.lock
-        ../../PLAN.md
+        ../../README.md
         (lib.fileset.fileFilter (file: file.hasExt "py") ../../src)
       ];
     };

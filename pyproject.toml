@@ -2,7 +2,7 @@
 name = "tartarus"
 version = "0.1.0"
 description = "Ad-hoc MicroVMs and containers, driven from the user's own flake"
-readme = "PLAN.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = []
