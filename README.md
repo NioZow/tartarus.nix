@@ -176,7 +176,7 @@ tartarus spawn <template>         # an extra, independent instance
 tartarus stop <name> [--purge]    # shut down (optionally delete state)
 tartarus restart <name>
 tartarus logs <name>              # console log / journal
-tartarus ssh <name>
+tartarus ssh <name> [-s|--start]  # start it first if it isn't running
 tartarus cid <name>               # MicroVM VSOCK CID
 tartarus ip <name>                # host-reachable IP (Darwin: via ARP)
 tartarus proxy <name>             # ProxyCommand helper (VSOCK)

@@ -285,9 +285,11 @@ def action_logs(config: Config, name: str) -> NoReturn:
     os.execvp("journalctl", ["journalctl", "-u", f"container@{name}", "-f"])
 
 
-def action_ssh(config: Config, name: str) -> NoReturn:
+def action_ssh(config: Config, name: str, start: bool = False) -> NoReturn:
     base = base_name(config, name)
     require_template(config, base)
+    if start and not is_running(name):
+        action_start(config, name)
     if not is_running(name):
         die(f"'{name}' is not running. Start it first: tartarus --container start {name}")
 
@@ -347,4 +349,4 @@ def dispatch(config: Config, args) -> None:
     elif args.command == "logs":
         action_logs(config, args.name)
     elif args.command == "ssh":
-        action_ssh(config, args.name)
+        action_ssh(config, args.name, args.start)

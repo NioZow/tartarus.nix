@@ -92,6 +92,12 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
 
     p = sub.add_parser("ssh", help="SSH into a running instance")
     p.add_argument("name", help="instance name (base template or template-N)")
+    p.add_argument(
+        "-s",
+        "--start",
+        action="store_true",
+        help="start the instance first if it isn't already running",
+    )
 
     p = sub.add_parser("cid", help="print a MicroVM instance's VSOCK CID (resolves by name, running or not)")
     p.add_argument("name", help="instance name, with or without a trailing '.trs'")
