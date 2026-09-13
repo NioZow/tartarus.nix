@@ -282,6 +282,53 @@
       };
     };
   };
+  # Darwin with a valid guest-hosted proxy now passes (vmnet-shared guests
+  # can reach each other).
+  hostDarwinGuestProxyOk = lib.nixosSystem {
+    system = "aarch64-darwin";
+    pkgs = import inputs.nixpkgs {
+      system = "aarch64-darwin";
+      config.allowUnfree = true;
+    };
+    specialArgs = {
+      username = "user";
+      homeDir = "/Users/user";
+      system = "aarch64-darwin";
+    };
+    modules = [
+      inputs.home-manager.nixosModules.home-manager
+      self.nixosModules.tartarus
+      darwinStub
+      base
+      {
+        tartarus.ca.enable = false;
+        tartarus.ssh.enable = false;
+        tartarus.proxy = {
+          enable = true;
+          location = "proxyvm";
+          port = 3128;
+        };
+        tartarus.guests = {
+          proxyvm = {
+            enable = true;
+            kind = "vm";
+            id = 5;
+            internet = true;
+          };
+          client = {
+            enable = true;
+            kind = "vm";
+            id = 8;
+            internet = false;
+            proxy = {
+              enable = true;
+              allowHosts = ["a.example"];
+            };
+          };
+        };
+      }
+    ];
+  };
 
   hostBadInternetProxy = mkHost {
     proxy = fullProxy;
@@ -369,6 +416,44 @@
       kind = "vm";
       id = 2;
       internet = true;
+    };
+  };
+
+  # requires tests
+  hostRequiresMissing = mkHost {
+    guests = {
+      a = {
+        enable = true;
+        kind = "vm";
+        id = 3;
+        internet = true;
+        requires = ["ghost"];
+      };
+    };
+  };
+  hostRequiresCycle = mkHost {
+    guests = {
+      a = {
+        enable = true;
+        kind = "vm";
+        id = 3;
+        internet = true;
+        requires = ["b"];
+      };
+      b = {
+        enable = true;
+        kind = "vm";
+        id = 4;
+        internet = true;
+        requires = ["c"];
+      };
+      c = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        requires = ["a"];
+      };
     };
   };
 
@@ -749,6 +834,12 @@ in {
       T (!assertionsPass hostBadFirewallDarwin) "firewall.location=host was accepted on Darwin";
     "assertions/darwin-guest-firewall-ok" =
       T (assertionsPass hostDarwinGuestFw) "firewall.location=guest was rejected on Darwin";
+    "assertions/darwin-guest-proxy-ok" =
+      T (assertionsPass hostDarwinGuestProxyOk) "valid Darwin guest-hosted proxy was rejected";
+    "assertions/requires-missing-rejected" =
+      T (!assertionsPass hostRequiresMissing) "requires naming a disabled/missing guest was accepted";
+    "assertions/requires-cycle-rejected" =
+      T (!assertionsPass hostRequiresCycle) "requires cycle was accepted";
 
     # ---- rendered Squid config -----------------------------------------
     "squid/src-acl" = inStr "acl g_vault src 10.200.0.3/32" squidDefault;

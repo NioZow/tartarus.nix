@@ -10,12 +10,16 @@
   inherit
     (lib)
     all
+    any
     attrValues
     concatLists
     concatMapStringsSep
     count
+    elem
     filter
     filterAttrs
+    hasAttr
+    head
     length
     mapAttrsToList
     mkOption
@@ -55,7 +59,8 @@
     guests);
 
   # A guest-hosted proxy must be a reachable egress point: an enabled VM with
-  # internet. Darwin has no guest-to-guest routing under vmnet-shared.
+  # internet. vmnet-shared NAT on Darwin still lets guests reach each other
+  # and the host, so guest-hosted proxies are supported on both platforms.
   proxyLocationAssertion = let
     location = config.tartarus.proxy.location;
     namedGuest = guests.${location} or null;
@@ -66,12 +71,34 @@
       && namedGuest.kind == "vm"
       && namedGuest.internet;
   in {
-    assertion = location == "host" || (isLinux && guestOk);
-    message =
-      if isDarwin
-      then "tartarus: `tartarus.proxy.location = \"${location}\"` is invalid on Darwin; the proxy must run on the host (`\"host\"`)."
-      else "tartarus: `tartarus.proxy.location = \"${location}\"` must be \"host\" or name an enabled `kind = \"vm\"` guest with `internet = true`.";
+    assertion = location == "host" || guestOk;
+    message = "tartarus: `tartarus.proxy.location = \"${location}\"` must be \"host\" or name an enabled `kind = \"vm\"` guest with `internet = true`.";
   };
+
+  requiresAssertions = let
+    enabledGuestList = filterAttrs (_: g: g.enable) guests;
+    missingDeps = guest: filter (d: !(hasAttr d guests)) guest.requires;
+    requiresCycle = start: let
+      go = seen: n: let
+        deps = (guests.${n} or {}).requires or [];
+      in
+        any (d: elem d seen || (hasAttr d guests && go (seen ++ [d]) d)) deps;
+    in
+      go [start] start;
+  in
+    concatLists (mapAttrsToList (name: guest: let
+        missing = missingDeps guest;
+      in [
+        {
+          assertion = missing == [];
+          message = "tartarus: guest '${name}' has `requires` entries that are not enabled guests: ${toString missing}.";
+        }
+        {
+          assertion = !(requiresCycle name);
+          message = "tartarus: guest '${name}' has a dependency cycle in requires.";
+        }
+      ])
+      enabledGuestList);
 
   mkIdAssertions = kind: let
     enabled = filterAttrs (_: guest: guest.enable && guest.kind == kind) guests;
@@ -98,6 +125,7 @@
   tartarusAssertions =
     guestAssertions
     ++ [proxyLocationAssertion]
+    ++ requiresAssertions
     ++ mkIdAssertions "vm"
     ++ mkIdAssertions "container";
 in {

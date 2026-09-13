@@ -1,4 +1,4 @@
-"""MicroVM actions: list/status/start/spawn/stop/restart/logs/ssh/cid/ip/proxy.
+"""MicroVM actions: list/status/start/spawn/stop/restart/logs/ssh/cid/ip/proxy/build.
 
 Ported from the original single-file script. The flake being built is always
 the **user's** flake (``flake_ref``), never tartarus's own repo, and guest
@@ -24,6 +24,28 @@ from .nix import eval as nix_eval
 from .nix import flake
 from .output import c, die, info, ok, print_table, warn
 from .process import run_quiet
+
+# Guards infinite recursion when a dependency cycle exists at runtime.
+_STARTING: set[str] = set()
+
+
+def _ensure_dependencies(config: Config, name: str) -> None:
+    """Start any `requires` dependencies before ``name``."""
+    guest = config.guest(name, "vm")
+    if guest is None:
+        return
+    for dep in guest.requires:
+        if ssh.is_running(config, dep):
+            continue
+        if dep in _STARTING:
+            continue
+        dep_guest = config.require_guest(dep)
+        if dep_guest.kind == "container":
+            from . import ctn  # lazy to avoid a circular import
+
+            ctn.action_start(config, dep)
+        else:
+            action_start(config, dep, mounts=[])
 
 
 def mount_type(value: str) -> str:
@@ -131,21 +153,10 @@ def next_instance_name(config: Config, base: str) -> str:
     die(f"no free instance number for '{base}'")
 
 
-def action_start(config: Config, name: str, mounts: list[str]) -> None:
+def _build_runner(config: Config, name: str, mounts: list[str]) -> tuple[Path, int | None]:
     base = flake.base_name(config, "vm", name)
-    flake.require_template(config, "vm", base)
-
-    ca.ensure_vm_certs(config, base)
-
-    if ssh.is_running(config, name):
-        pid = (config.state_dir(name) / "microvm.pid").read_text().strip()
-        warn(f"'{name}' is already running (pid {pid}).")
-        return
-
     state = config.state_dir(name)
     state.mkdir(parents=True, exist_ok=True)
-    (state / "microvm.pid").unlink(missing_ok=True)
-    (state / "cid").unlink(missing_ok=True)
 
     # The guest flake mounts $HOME/shared/<name>; for the canonical instance a
     # rebuild's tmpfiles rule already made it, but numbered instances aren't
@@ -174,6 +185,40 @@ def action_start(config: Config, name: str, mounts: list[str]) -> None:
 
     info(f"Building '{name}'...")
     nix_eval.build(flake.flake_ref(config), attr, state / "result", env=env)
+    return state / "result", cid
+
+
+def action_build(config: Config, name: str, mounts: list[str]) -> None:
+    base = flake.base_name(config, "vm", name)
+    flake.require_template(config, "vm", base)
+    result, _cid = _build_runner(config, name, mounts)
+    ok(f"'{name}' built. Result: {result}")
+
+
+def action_start(config: Config, name: str, mounts: list[str]) -> None:
+    base = flake.base_name(config, "vm", name)
+    flake.require_template(config, "vm", base)
+
+    ca.ensure_vm_certs(config, base)
+
+    if ssh.is_running(config, name):
+        pid = (config.state_dir(name) / "microvm.pid").read_text().strip()
+        warn(f"'{name}' is already running (pid {pid}).")
+        return
+
+    _STARTING.add(name)
+    try:
+        _ensure_dependencies(config, name)
+    finally:
+        _STARTING.discard(name)
+
+    result, cid = _build_runner(config, name, mounts)
+    state = result.parent
+
+    # Clear stale bookkeeping from a previous run before launching (only safe
+    # here, after the running check above).
+    (state / "microvm.pid").unlink(missing_ok=True)
+    (state / "cid").unlink(missing_ok=True)
 
     if cid is None:
         cid = flake.guest_id(config, "vm", base)
@@ -287,6 +332,8 @@ def dispatch(config: Config, args) -> None:
         action_status(config, args.name)
     elif args.command == "start":
         action_start(config, args.name, args.mounts)
+    elif args.command == "build":
+        action_build(config, args.name, args.mounts)
     elif args.command == "spawn":
         action_spawn(config, args.template, args.name, args.mounts)
     elif args.command == "stop":

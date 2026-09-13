@@ -43,6 +43,8 @@ in {
       mkService = mkServiceHome;
       username = g.user.name;
       homeDir = g.user.home;
+      # Let the user's home-manager imports see the source guest record.
+      tartarusGuest = g;
     };
 
     users.${user} = mkMerge [

@@ -1,4 +1,4 @@
-"""Container actions: list/status/start/spawn/stop/restart/logs/ssh.
+"""Container actions: list/status/start/spawn/stop/restart/logs/ssh/build.
 
 Containers are systemd-nspawn guests. Canonical instances are provisioned
 host-side (``nixos-container`` registration, CA-signed host key, bind mounts)
@@ -17,6 +17,7 @@ from typing import NoReturn
 
 from . import ca, system
 from .config import Config
+from .nix import eval as nix_eval
 from .nix import flake
 from .output import c, die, info, ok, print_table, warn
 from .process import run_sudo, run_sudo_quiet
@@ -25,6 +26,28 @@ from .process import run_sudo, run_sudo_quiet
 # with "nixos-" to avoid colliding with podman/OCI's /etc/containers.
 CTN_CONF_DIR = Path("/etc/nixos-containers")
 _CTN_SKIP_CONF = {"libpod.conf", "containers.conf", "registries.conf"}
+
+# Guards infinite recursion when a dependency cycle exists at runtime.
+_STARTING: set[str] = set()
+
+
+def _ensure_dependencies(config: Config, name: str) -> None:
+    """Start any `requires` dependencies before ``name``."""
+    guest = config.guest(name, "container")
+    if guest is None:
+        return
+    for dep in guest.requires:
+        if is_running(dep):
+            continue
+        if dep in _STARTING:
+            continue
+        dep_guest = config.require_guest(dep)
+        if dep_guest.kind == "vm":
+            from . import vm  # lazy to avoid a circular import
+
+            vm.action_start(config, dep, mounts=[])
+        else:
+            action_start(config, dep)
 
 
 def status_word(state: str) -> str:
@@ -197,9 +220,25 @@ def action_start(config: Config, name: str) -> None:
     if is_running(name):
         warn(f"'{name}' is already running.")
         return
+
+    _STARTING.add(name)
+    try:
+        _ensure_dependencies(config, name)
+    finally:
+        _STARTING.discard(name)
+
     ca.ensure_ctn_certs(config, base)
     run_sudo(["systemctl", "start", f"container@{name}"])
     ok(f"'{name}' started.")
+
+
+def action_build(config: Config, name: str) -> None:
+    base = base_name(config, name)
+    require_template(config, base)
+    state = config.state_dir(name)
+    state.mkdir(parents=True, exist_ok=True)
+    nix_eval.build(flake.flake_ref(config), flake.ctn_config_attr(base), state / "result")
+    ok(f"'{name}' built. Result: {state / 'result'}")
 
 
 def action_spawn(config: Config, template: str, name_override: str | None) -> None:
@@ -297,6 +336,8 @@ def dispatch(config: Config, args) -> None:
         action_status(config, args.name)
     elif args.command == "start":
         action_start(config, args.name)
+    elif args.command == "build":
+        action_build(config, args.name)
     elif args.command == "spawn":
         action_spawn(config, args.template, args.name)
     elif args.command == "stop":

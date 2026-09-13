@@ -106,6 +106,7 @@
     services = g.services;
     firewall = g.firewall;
     proxy = g.proxy;
+    requires = g.requires;
   };
 
   details = lib.mapAttrs detail (vmEnabled // ctnEnabled);

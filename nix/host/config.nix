@@ -94,6 +94,7 @@
     graphical = ${tBool g.graphical}
     autostart = ${tBool g.autostart}
     shared_folder = ${tBool g.sharedFolder}
+    requires = ${tArr g.requires}
     proxy = ${tInline {
       enable = tBool g.proxy.enable;
       allow_hosts = tArr g.proxy.allowHosts;

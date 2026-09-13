@@ -38,6 +38,18 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         help="ad-hoc 9p share chosen at launch time (repeatable; MicroVMs only)",
     )
 
+    p = sub.add_parser("build", help="build (if needed) a guest without starting it")
+    p.add_argument("name", help="template name (canonical instance) or an existing instance name")
+    p.add_argument(
+        "--mount",
+        dest="mounts",
+        action="append",
+        default=[],
+        type=vm.mount_type,
+        metavar="HOST_PATH:GUEST_PATH",
+        help="ad-hoc 9p share chosen at launch time (repeatable; MicroVMs only)",
+    )
+
     p = sub.add_parser("spawn", help="start an additional, independent instance of a template")
     p.add_argument("template", help="template to spawn a new instance of")
     p.add_argument("--name", help="use this exact instance name instead of auto-numbering <template>-<N>")

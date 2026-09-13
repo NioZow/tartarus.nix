@@ -43,6 +43,7 @@ TOML schema -- ``$XDG_CONFIG_HOME/tartarus/config.toml`` (default
     graphical = false
     autostart = false
     shared_folder = false
+    requires = []
     proxy = { enable = true, allow_hosts = ["example.com"] }
 
     [[guests]]
@@ -53,6 +54,7 @@ TOML schema -- ``$XDG_CONFIG_HOME/tartarus/config.toml`` (default
     graphical = false
     autostart = false
     shared_folder = false
+    requires = []
     proxy = { enable = false, allow_hosts = [] }
 
 Precedence, highest first: **CLI flag > environment variable > config.toml >
@@ -99,6 +101,7 @@ class Guest:
     graphical: bool = False
     autostart: bool = False
     shared_folder: bool = False
+    requires: list[str] = field(default_factory=list)
     proxy: GuestProxy = field(default_factory=GuestProxy)
 
 
@@ -294,6 +297,7 @@ def _parse_guests(raw: Any) -> list[Guest]:
                 graphical=_as_bool(item.get("graphical", False), f"guest '{name}'.graphical"),
                 autostart=_as_bool(item.get("autostart", False), f"guest '{name}'.autostart"),
                 shared_folder=_as_bool(item.get("shared_folder", False), f"guest '{name}'.shared_folder"),
+                requires=_as_list(item.get("requires"), f"guest '{name}'.requires"),
                 proxy=GuestProxy(
                     enable=_as_bool(proxy_raw.get("enable", False), f"guest '{name}'.proxy.enable"),
                     allow_hosts=_as_list(proxy_raw.get("allow_hosts"), f"guest '{name}'.proxy.allow_hosts"),

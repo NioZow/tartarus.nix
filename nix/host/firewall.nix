@@ -17,7 +17,9 @@
 # Guest mode emits an in-guest nftables output policy for guests that opt into
 # `firewall.location = "guest"` (the only option on Darwin, where there is no
 # host nftables). It restricts ordinary processes; root can flush it, which is
-# accepted as a policy rather than a hard boundary.
+# accepted as a policy rather than a hard boundary. On macOS, Darwin guests
+# under vmnet-shared NAT share 192.168.64.0/24 and can reach each other and the
+# host; a guest-hosted proxy works there too.
 {mode ? "host"}: let
   hostModule = {
     config,
@@ -383,9 +385,15 @@
     # explicitly permitted to egress, so the firewall would be a no-op.
     enable = (fw.enable or false) && (fw.location or "guest") == "guest" && !(g.internet or true);
 
-    proxyRule =
+    proxyTcpRule =
       optionalString (proxy.enable or false)
       "ip daddr ${proxy.host} tcp dport ${toString (proxy.port or 3128)} counter accept comment \"proxy\"";
+    proxyUdpDnsRule =
+      optionalString (proxy.enable or false)
+      "ip daddr ${proxy.host} udp dport 53 counter accept comment \"proxy-dns\"";
+    proxyTcpDnsRule =
+      optionalString (proxy.enable or false)
+      "ip daddr ${proxy.host} tcp dport 53 counter accept comment \"proxy-dns\"";
     allowEntry = a:
       if lib.hasInfix " " a
       then a
@@ -408,7 +416,11 @@
             ip daddr ${p.gateway} udp dport 53 counter accept
             ip daddr ${p.gateway} tcp dport 53 counter accept
 
-            ${proxyRule}
+            # Proxy and DNS to the proxy host; the whole vm/ctn subnets are
+            # already reachable below, but these are explicit in case that changes.
+            ${proxyTcpRule}
+            ${proxyUdpDnsRule}
+            ${proxyTcpDnsRule}
             ${allowRules}
 
             ip daddr ${ids.vmSubnet} counter accept

@@ -308,7 +308,7 @@ tartarus.guests.vault = {
 
 - `!(guest.internet && guest.proxy.enable)` — the two are mutually exclusive.
 - `guest.proxy.enable` requires `tartarus.proxy.enable`.
-- `tartarus.proxy.location` may name only an enabled `kind = "vm"` guest with `internet = true`, and only on **Linux** (Darwin must use `"host"`).
+- `tartarus.proxy.location` may name only an enabled `kind = "vm"` guest with `internet = true` (both Linux and Darwin).
 - `firewall.location = "host"` is Linux-only.
 - IDs unique within a kind and in the reserved range; auto-assignment starts at 101.
 
@@ -414,9 +414,10 @@ masquerade so the client's source IP survives. This keeps a **single `:3128`** a
 per-guest `src`-keyed ACLs valid. A host-side userspace forwarder (`socket-proxyd`/`socat`)
 would terminate the connection and hide the client IP, so it is **not** used.
 
-**macOS is host-only (decided).** Under vmnet-shared NAT guests cannot address each other, so
-a guest-hosted proxy is not reachable; on Darwin `tartarus.proxy.location` must be `"host"`
-(enforced by assertion).
+**macOS vmnet-shared NAT.** vfkit's `--device virtio-net,nat` runs in vmnet shared mode,
+under which guests share `192.168.64.0/24` and can reach each other and the host. A
+guest-hosted proxy is therefore supported on Darwin too. Darwin egress is enforced by the
+in-guest nftables output policy (there is no host nftables on macOS).
 
 **Guest-side env (automatic)**
 

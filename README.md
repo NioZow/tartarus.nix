@@ -107,7 +107,7 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enable` | bool | `false` | Enable the HTTP proxy. |
-| `location` | str | `"host"` | `"host"`, or the name of an enabled `kind = "vm"` guest with `internet = true` (Linux only). |
+| `location` | str | `"host"` | `"host"`, or the name of an enabled `kind = "vm"` guest with `internet = true` (Linux and Darwin). |
 | `port` | port | `3128` | Proxy port. |
 | `listenAddresses` | null or list | `null` | Bind addresses; derived from enabled guest kinds (the `trs` bridges, or the vmnet gateway on Darwin) when null. Never loopback. |
 | `log` | bool | `false` | Metadata-only logging (client IP, CONNECT host) to journald. |
@@ -125,6 +125,7 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `shares` | list | `[]` | Extra host/guest directory shares (passed to `microvm.shares`; `proto` is normalized per platform). |
 | `apps` | list | `[]` | Host `.desktop` launchers for apps running in the guest. |
 | `autostart` | bool | `false` | Start on login via a tartarus user service. |
+| `requires` | list | `[]` | Names of other enabled guests that must be started before this one. `tartarus start` auto-starts dependencies first. The graph must be acyclic. |
 | `services.clipboardBridge` | bool | `false` | Clipboard bridge (guest client + host server, mTLS). |
 | `services.sshAuthProxy` | bool | `false` | Forward the host ssh-agent into the guest. |
 | `services.sudoAuthProxy` | bool | `false` | PAM sudo authentication proxy. |
@@ -159,7 +160,7 @@ trust (`tartarus.ssh.*`), and the generated CLI config
 - `internet = true` and `proxy.enable = true` are mutually exclusive.
 - `proxy.enable` requires the global `tartarus.proxy.enable`.
 - `tartarus.proxy.location` must be `"host"` or an enabled `kind = "vm"` guest
-  with `internet = true`, and must be `"host"` on Darwin.
+  with `internet = true` (both Linux and Darwin).
 - `firewall.location = "host"` is Linux-only.
 - Static ids must be unique within a kind and in 3-100 (auto ids start at 101).
 
@@ -169,6 +170,7 @@ trust (`tartarus.ssh.*`), and the generated CLI config
 tartarus list                     # every guest and whether it is running
 tartarus status [name]            # detailed status
 tartarus start <name>             # build (if needed) and launch in the background
+tartarus build <name>             # build (if needed) without starting
 tartarus spawn <template>         # an extra, independent instance
 tartarus stop <name> [--purge]    # shut down (optionally delete state)
 tartarus restart <name>
@@ -293,8 +295,7 @@ generated `environment.d` proxy variables, and `mkGuests` output names/ids. See
 
 This project and two of its components (`ssh-agent-proxy`, `sudo-auth-proxy`)
 were inspired by the work of **Floriant Guilbert** and the **mofos** project
-(https://github.com/synacktiv/mofos). `clipboard-bridge` is not derived from
-their work.
+(https://github.com/synacktiv/mofos).
 
 ## License
 

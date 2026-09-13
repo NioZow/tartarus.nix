@@ -109,6 +109,12 @@ in {
           description = "Start this guest automatically on login via a tartarus user service.";
         };
 
+        requires = mkOption {
+          type = types.listOf types.str;
+          default = [];
+          description = "Names of other enabled guests that must be started before this one. tartarus start/spawn/autostart start them first; the graph must be acyclic.";
+        };
+
         services = mkOption {
           type = shared.serviceFlags;
           default = {};
