@@ -110,6 +110,10 @@ in {
           description = "${g.name} user";
           home = g.user.home;
           linger = true;
+          # macOS guests are forced into a system user (host uid 501 < 1000),
+          # whose NixOS-default shell is `pkgs.shadow` -> nologin. Pin an
+          # interactive shell so `ssh <guest>` works on Darwin too.
+          shell = pkgs.bashInteractive;
           extraGroups = ["wheel"];
           openssh.authorizedKeys.keys =
             optionals (builtins.pathExists pubKeyFile) [(builtins.readFile pubKeyFile)];

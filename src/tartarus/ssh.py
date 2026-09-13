@@ -14,17 +14,24 @@ import os
 import re
 import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import NoReturn
 
 from . import system
 from .config import Config
 from .nix import flake
-from .output import die, info
+from .output import die, info, note
 from .process import run_quiet
 
 KNOWN_HOSTS_TRS_NAME = "known_hosts_trs"
 USER_SSH_KEY_NAME = "tartarus"
+
+# A freshly started MicroVM needs a moment to bring up its interface and get a
+# DHCP lease; until then the host ARP table has no entry for its MAC. Poll
+# instead of failing the first `ssh` that races the guest's boot.
+ARP_WAIT_SECONDS = 20.0
+ARP_POLL_INTERVAL = 0.5
 
 
 def user_ssh_key(config: Config) -> Path:
@@ -196,13 +203,22 @@ def resolve_running_ip(config: Config, name: str) -> str:
     # -n: skip reverse-DNS on every entry (plain `arp -a` blocks on lookups
     # that always fail for local bridge/vmnet addresses). Output format is
     # identical since none of these addresses have reverse DNS.
-    arp_result = subprocess.run(["arp", "-an"], capture_output=True, text=True)
-    if arp_result.returncode != 0:
-        die(f"failed to run `arp -an`: {arp_result.stderr.strip()}")
-    ip = arp_ip_for_mac(arp_result.stdout, mac)
-    if ip is None:
-        die(f"no ARP entry for '{name}' (mac {mac}) -- is it running and has it gotten a network address?")
-    return ip
+    deadline = time.monotonic() + ARP_WAIT_SECONDS
+    announced = False
+    while True:
+        arp_result = subprocess.run(["arp", "-an"], capture_output=True, text=True)
+        if arp_result.returncode != 0:
+            die(f"failed to run `arp -an`: {arp_result.stderr.strip()}")
+        ip = arp_ip_for_mac(arp_result.stdout, mac)
+        if ip is not None:
+            return ip
+        if time.monotonic() >= deadline:
+            break
+        if not announced:
+            note(f"waiting for '{name}' to get a network address (mac {mac})...")
+            announced = True
+        time.sleep(ARP_POLL_INTERVAL)
+    die(f"no ARP entry for '{name}' (mac {mac}) -- is it running and has it gotten a network address?")
 
 
 def action_cid(config: Config, name: str) -> None:

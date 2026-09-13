@@ -35,6 +35,15 @@ def info(message: str) -> None:
     print(f"{mark('*', '36')} {message}")
 
 
+def note(message: str) -> None:
+    """Like ``info`` but on stderr.
+
+    Used from ``ProxyCommand`` paths where stdout carries the SSH transport and
+    any stray byte would corrupt the connection.
+    """
+    print(f"{mark('*', '36', sys.stderr)} {message}", file=sys.stderr)
+
+
 def ok(message: str) -> None:
     print(f"{mark('+', '32')} {message}")
 
