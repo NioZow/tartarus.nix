@@ -112,8 +112,9 @@ in {
           linger = true;
           # macOS guests are forced into a system user (host uid 501 < 1000),
           # whose NixOS-default shell is `pkgs.shadow` -> nologin. Pin an
-          # interactive shell so `ssh <guest>` works on Darwin too.
-          shell = pkgs.bashInteractive;
+          # interactive shell so `ssh <guest>` works on Darwin too. Low
+          # priority so guest content (systemConfig) can pick e.g. zsh.
+          shell = mkDefault pkgs.bashInteractive;
           extraGroups = ["wheel"];
           openssh.authorizedKeys.keys =
             optionals (builtins.pathExists pubKeyFile) [(builtins.readFile pubKeyFile)];
