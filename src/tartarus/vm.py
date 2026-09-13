@@ -231,11 +231,21 @@ def action_start(config: Config, name: str, mounts: list[str]) -> None:
     run_cmd = [str(state / "result/bin/microvm-run")]
 
     # vfkit's non-graphical console puts stdin into termios raw mode, which
-    # needs a real tty. A closed-immediately PTY slave satisfies it without an
-    # interactive console; guest output still goes to console_log. QEMU has no
-    # such requirement, so Linux keeps the plain DEVNULL.
+    # needs a real tty. A PTY slave satisfies it without an interactive
+    # console; guest output still goes to console_log. QEMU has no such
+    # requirement, so Linux keeps the plain DEVNULL.
+    #
+    # The master must outlive this CLI process: vfkit makes the slave its
+    # controlling terminal, so when the master closes the kernel hangs up the
+    # slave and vfkit stops the VM. Python fds are close-on-exec (PEP 446), so
+    # inheriting them via close_fds=False is not enough -- clear CLOEXEC and
+    # pass both ends explicitly, letting vfkit hold the master for the VM's
+    # whole lifetime.
     pty_fds = pty.openpty() if platform.system() == "Darwin" else None
     stdin = pty_fds[1] if pty_fds else subprocess.DEVNULL
+    if pty_fds:
+        for fd in pty_fds:
+            os.set_inheritable(fd, True)
     proc = subprocess.Popen(
         run_cmd,
         cwd=state,
@@ -243,15 +253,8 @@ def action_start(config: Config, name: str, mounts: list[str]) -> None:
         stderr=subprocess.STDOUT,
         stdin=stdin,
         start_new_session=True,
-        # Keep all fds open on Darwin so vfkit's stdio console stays valid
-        # through initialization.
-        close_fds=bool(not pty_fds),
+        pass_fds=tuple(pty_fds) if pty_fds else (),
     )
-    if pty_fds:
-        # Do NOT close the PTY fds: vfkit's console init calls setRawMode on
-        # stdin asynchronously; closing the parent copies too early causes
-        # ENOTTY. They are cleaned up when the parent process exits.
-        proc._tartarus_pty_fds = pty_fds
     console_log.close()
     (state / "microvm.pid").write_text(f"{proc.pid}\n")
 
