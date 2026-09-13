@@ -20,6 +20,7 @@
 
   # vfkit on macOS uses vmnet-shared (192.168.64.0/24) with a host gateway.
   darwinGateway = "192.168.64.1";
+  darwinSubnet = "192.168.64.0/24";
 
   mkVmIP = id: "10.200.0.${toString id}";
 
@@ -69,6 +70,7 @@ in {
     ctnSubnet
     ctnHostIP
     darwinGateway
+    darwinSubnet
     mkVmIP
     mkVmIPNat
     mkCtnIP

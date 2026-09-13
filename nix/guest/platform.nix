@@ -31,12 +31,22 @@ in {
     vsockAvailable = isLinux && isVm;
     useVsock = vsockAvailable && !disableVsock;
 
+    # Darwin guests live on vfkit's vmnet-shared NAT, not the Linux trs
+    # bridges, so both the host address and the subnet differ from the
+    # kind-based defaults. Only the IP formula used to be Darwin-aware; the
+    # subnet was not, which made the "network" guest's Unbound ACL allow
+    # 10.200.0.0/24 while the host actually queried from 192.168.64.1
+    # (REFUSED).
     hostIP =
-      if isVm
+      if isDarwin
+      then ids.darwinGateway
+      else if isVm
       then ids.vmHostIP
       else ids.ctnHostIP;
     subnet =
-      if isVm
+      if isDarwin
+      then ids.darwinSubnet
+      else if isVm
       then ids.vmSubnet
       else ids.ctnSubnet;
 

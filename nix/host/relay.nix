@@ -11,6 +11,15 @@
 #
 # A relay to a privileged port (< 1024, e.g. DNS on 53) is emitted as a root
 # launch daemon; everything else is a user launch agent.
+#
+# TCP uses `TCP-LISTEN,...,fork`. UDP must use `UDP-RECVFROM,...,fork` rather
+# than `UDP-LISTEN,...,fork`: in LISTEN mode socat closes the listening socket
+# in the parent after forking a child, then re-binds a fresh one and dies with
+# EADDRINUSE because the child still holds the old socket (Linux tolerates the
+# rebind via SO_REUSEADDR; Darwin does not, so launchd crash-loops). In
+# RECVFROM mode the parent keeps its socket across forks and relays every
+# datagram. The listening socket is also bound to the specific gateway address,
+# which wins over macOS's mDNSResponder wildcard `*:53`, so DNS on `:53` works.
 {inputs}: {
   config,
   lib,
@@ -87,12 +96,18 @@
       if relay.host != null
       then relay.host
       else ids.darwinGateway;
-    proto =
+    # See the header: UDP must RECVFROM (not LISTEN) so the parent keeps its
+    # socket across forks instead of dying with EADDRINUSE on Darwin.
+    listen =
       if relay.protocol == "udp"
-      then "UDP4"
-      else "TCP4";
+      then "UDP4-RECVFROM:${toString relay.port},bind=${host},reuseaddr,fork"
+      else "TCP4-LISTEN:${toString relay.port},bind=${host},reuseaddr,fork";
+    target =
+      if relay.protocol == "udp"
+      then "UDP4:${g.ip}:${toString targetPort}"
+      else "TCP4:${g.ip}:${toString targetPort}";
     serviceName = "tartarus-relay-${name}-${relay.protocol}-${toString relay.port}";
-    command = "${pkgs.socat}/bin/socat ${proto}-LISTEN:${toString relay.port},bind=${host},reuseaddr,fork ${proto}:${g.ip}:${toString targetPort}";
+    command = "${pkgs.socat}/bin/socat ${listen} ${target}";
   in
     mkService {
       name = serviceName;

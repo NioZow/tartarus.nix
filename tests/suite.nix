@@ -906,7 +906,7 @@ in {
     # ---- Darwin host relays -------------------------------------------
     "relay/darwin-udp-privileged" =
       T
-      (hasInfix "UDP4-LISTEN:53,bind=192.168.64.1,reuseaddr,fork UDP4:192.168.64.62:53" (concatStringsSep " " hostDarwinRelays.config.launchd.daemons."tartarus-relay-x-udp-53".serviceConfig.ProgramArguments))
+      (hasInfix "UDP4-RECVFROM:53,bind=192.168.64.1,reuseaddr,fork UDP4:192.168.64.62:53" (concatStringsSep " " hostDarwinRelays.config.launchd.daemons."tartarus-relay-x-udp-53".serviceConfig.ProgramArguments))
       "Darwin privileged UDP relay args changed";
     "relay/darwin-tcp-privileged" =
       T (hostDarwinRelays.config.launchd.daemons ? "tartarus-relay-x-tcp-53") "privileged TCP relay is not a root launch daemon";
