@@ -77,9 +77,12 @@
   globalProxy = config.tartarus.proxy or {};
 
   # Resolve the proxy endpoint a guest should use. `location = "host"` (the
-  # default) means the guest-side host gateway; a guest name means that VM's
-  # trunk IP (Linux-only per the host assertions). Returns null for "host" so
-  # platform.nix supplies the host gateway.
+  # default) means the guest-side host gateway. A guest name means that VM's
+  # trunk IP on Linux. On Darwin it also means the host gateway: vfkit/vmnet
+  # shared mode marks the bridge ports PRIVATE, so guests cannot reach each
+  # other, and a guest-hosted proxy is reached through the host's socat relay
+  # (see host/proxy.nix). Returns null whenever the gateway is the answer, so
+  # platform.nix supplies it.
   proxyHostFor = let
     location = globalProxy.location or "host";
   in
@@ -100,7 +103,7 @@
       then
         (
           if lib.hasSuffix "-darwin" hostSystem
-          then ids.mkVmIPNat targetId
+          then null
           else ids.mkVmIP targetId
         )
       else ids.mkCtnIP targetId;

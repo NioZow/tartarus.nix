@@ -100,8 +100,10 @@ in
     } @ args: let
       inherit
         (lib)
+        concatMap
         map
         mkIf
+        mkMerge
         mkOption
         types
         unique
@@ -118,12 +120,40 @@ in
       # `instances.nix`. The Phase 1 assertion guarantees `internet = false` for
       # all of them and that the global proxy is enabled, so no further
       # filtering is needed here.
-      clients =
+      rawClients =
         map (g: {
           inherit (g) name kind ip;
           allowHosts = g.proxy.allowHosts;
         })
         instances.proxyClients;
+
+      proxyIsGuest = cfg.enable && cfg.location != "host";
+
+      # Darwin guests cannot reach each other (vfkit/vmnet bridge ports are
+      # PRIVATE), so a guest-hosted proxy is reached through the host's socat
+      # relay bound to the gateway. Squid therefore always sees the gateway as
+      # the client, and the per-guest ACLs collapse into one relay client; the
+      # unioned allowlist is intentional because the relay cannot distinguish
+      # guests.
+      clients =
+        if isDarwin && proxyIsGuest
+        then [
+          {
+            name = "relay";
+            kind = "vm";
+            ip = ids.darwinGateway;
+            allowHosts = unique (concatMap (c: c.allowHosts) rawClients);
+          }
+        ]
+        else rawClients;
+
+      # The guest named by `location`, whose trunk IP the relay forwards to.
+      proxyVmIp = let
+        g = instances.guests.${cfg.location} or null;
+      in
+        if g != null
+        then g.ip
+        else null;
 
       clientType = types.submodule {
         options = {
@@ -165,7 +195,6 @@ in
         listenAddresses = resolvedListenAddresses;
       };
 
-      proxyIsGuest = cfg.enable && cfg.location != "host";
       configFile = pkgs.writeText "tartarus-squid.conf" squidConfig;
 
       mkService = inputs.nix-service.lib.mkService {
@@ -197,15 +226,29 @@ in
         };
       };
 
-      # User scope: the proxy binds a non-privileged port and needs no root,
-      # matching the `bridge`/`nftables`/`CA`-only system-level boundary.
-      config = mkIf (cfg.enable && !proxyIsGuest) (mkService {
-        name = "tartarus-proxy";
-        description = "tartarus HTTP forward proxy (Squid)";
-        command = "${pkgs.squid}/bin/squid -N -f ${configFile}";
-        scope = "user";
-        after = ["network.target"];
-        restart = "on-failure";
-        extraSystemdServiceConfig.KillSignal = "SIGTERM";
-      });
+      config = mkMerge [
+        # Host-hosted proxy: Squid itself, in user scope (non-privileged port,
+        # no root), matching the `bridge`/`nftables`/`CA`-only system boundary.
+        (mkIf (cfg.enable && !proxyIsGuest) (mkService {
+          name = "tartarus-proxy";
+          description = "tartarus HTTP forward proxy (Squid)";
+          command = "${pkgs.squid}/bin/squid -N -f ${configFile}";
+          scope = "user";
+          after = ["network.target"];
+          restart = "on-failure";
+          extraSystemdServiceConfig.KillSignal = "SIGTERM";
+        }))
+
+        # Guest-hosted proxy on Darwin: the guests cannot reach the proxy VM
+        # directly, so relay the gateway port to it with socat. The proxy stays
+        # in its VM; the relay only forwards bytes.
+        (mkIf (isDarwin && proxyIsGuest) (mkService {
+          name = "tartarus-proxy-relay";
+          description = "tartarus guest-hosted proxy relay (socat)";
+          command = "${pkgs.socat}/bin/socat TCP-LISTEN:${toString cfg.port},bind=${ids.darwinGateway},reuseaddr,fork TCP:${proxyVmIp}:${toString cfg.port}";
+          scope = "user";
+          after = ["network.target"];
+          restart = "on-failure";
+        }))
+      ];
     }

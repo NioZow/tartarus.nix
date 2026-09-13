@@ -405,19 +405,27 @@ One **Squid** forward proxy. **No MITM.** It only ever sees host + CONNECT metad
 > (microvm `nixos-modules/microvm/asserts.nix`). It therefore **cannot** be used with
 > tartarus's Linux bridge networking, with `nixos-container`, or with vfkit on Darwin — so the
 > "bind on the host and forward to the proxy VM" idea is not available through it. It is
-> moot here anyway: the decided exposure method is direct routing, not host forwarding.
+> moot here anyway: Linux uses direct routing, and Darwin uses a socat relay on the gateway
+> (see below), not `forwardPorts`.
 
 **Exposure method: direct routing (decided).** Clients connect straight to the proxy VM's
 trunk IP. For same-kind clients no host involvement is needed; for cross-kind
 (container→VM) the host adds a route + a `forward` accept **and** an exception from the trs
 masquerade so the client's source IP survives. This keeps a **single `:3128`** and keeps the
 per-guest `src`-keyed ACLs valid. A host-side userspace forwarder (`socket-proxyd`/`socat`)
-would terminate the connection and hide the client IP, so it is **not** used.
+would terminate the connection and hide the client IP, so it is **not** used on Linux.
 
-**macOS vmnet-shared NAT.** vfkit's `--device virtio-net,nat` runs in vmnet shared mode,
-under which guests share `192.168.64.0/24` and can reach each other and the host. A
-guest-hosted proxy is therefore supported on Darwin too. Darwin egress is enforced by the
-in-guest nftables output policy (there is no host nftables on macOS).
+**Darwin exception: the host relay.** vfkit's `--device virtio-net,nat` runs in vmnet
+*shared* mode, and every `vmenet` port on the host bridge carries the `PRIVATE` flag, so
+guests can reach the host/gateway but **not each other** (verified: ARP between two guests
+stays `INCOMPLETE`). Direct routing is therefore impossible on macOS, and `forwardPorts` is
+unavailable too (above). Instead the host runs a userspace relay — `socat
+TCP-LISTEN:3128,bind=192.168.64.1,reuseaddr,fork TCP:<proxy-vm-ip>:3128` — and clients use
+the gateway `192.168.64.1:3128`. The relay terminates the connection, so Squid sees the
+gateway as the client and the per-guest `src` ACLs collapse into a single relay client whose
+allowlist is the **union** of the guests'. Darwin egress is still enforced by the in-guest
+nftables output policy (there is no host nftables on macOS), and DNS goes to the host
+resolver on `192.168.64.1:53`.
 
 **Guest-side env (automatic)**
 
@@ -445,9 +453,11 @@ Guests are **full NixOS systems**, never home-manager-only.
 - **Linux host:** QEMU/KVM, `trs0`/`trs1` bridges with static IPs, VSOCK available (services
   default to VSOCK), host nftables.
 - **Darwin host (nix-darwin):** vfkit, **vmnet-shared NAT** (`192.168.64.0/24`, host at
-  `.1`), **no VSOCK** (all cross-boundary services forced to TCP), no host nftables. Guests
-  reach the host only via the vmnet gateway, so the proxy binds `192.168.64.1`, and
-  `tartarus proxy-ip` resolves the guest via the host ARP table (deterministic MAC).
+  `.1`), **no VSOCK** (all cross-boundary services forced to TCP), no host nftables. The
+  vmnet bridge ports are `PRIVATE`, so guests reach the host only — never each other. A
+  guest-hosted proxy is therefore exposed through a host socat relay on `192.168.64.1:3128`,
+  clients target the gateway, and DNS uses the host resolver on `.1:53`. `tartarus proxy-ip`
+  resolves the guest via the host ARP table (deterministic MAC).
 
 `nix/guest/platform.nix` encodes these differences in one place; `disableVsock`, proxy bind
 address, `NO_PROXY`, and service transports are all derived from it.

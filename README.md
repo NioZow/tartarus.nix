@@ -267,12 +267,19 @@ macOS. The guest halves are wired automatically when a guest sets the matching
 
 - vfkit guests on `vmnet-shared` NAT (`192.168.64.0/24`, gateway
   `192.168.64.1`). No host bridge, no VSOCK, no host nftables.
+- The bridge's `vmenet` ports are flagged `PRIVATE`: guests reach the host but
+  **not each other**, so a guest-hosted proxy is exposed through a host
+  `socat` relay on `192.168.64.1:3128` (clients target the gateway). The relay
+  terminates the connection, so Squid sees the gateway as the client and the
+  per-guest ACLs collapse into one relay client with a unioned allowlist.
+  DNS uses the host resolver on `.1:53`.
 - Guests get deterministic static addresses (`192.168.64.<id + 42>`); DHCP is
   broken under vfkit.
 - All host/guest services use TCP. `tartarus proxy-ip` resolves the guest from
-  the host ARP table via its deterministic MAC.
-- The proxy must run on the host and binds `192.168.64.1`; a guest can opt into
-  an in-guest nftables firewall (a practical policy, not a hard boundary).
+  the host ARP table via its deterministic MAC (falling back to the
+  deterministic address), since guests send no gratuitous ARP.
+- A guest can opt into an in-guest nftables firewall (a practical policy, not a
+  hard boundary).
 - Building Linux guests needs `nix.linux-builder` (tartarus enables it by
   default on Darwin); see nixcfg's `docs/linux-builder.md`.
 
