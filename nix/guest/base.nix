@@ -113,8 +113,12 @@ in {
           # macOS guests are forced into a system user (host uid 501 < 1000),
           # whose NixOS-default shell is `pkgs.shadow` -> nologin. Pin an
           # interactive shell so `ssh <guest>` works on Darwin too. Low
-          # priority so guest content (systemConfig) can pick e.g. zsh.
-          shell = mkDefault pkgs.bashInteractive;
+          # priority so guest content (systemConfig) can pick e.g. zsh. Only
+          # needed for system users: nixpkgs already sets
+          # `users.defaultUserShell` for normal users, and defining it here
+          # again produces a duplicate `mkDefault` (which trips `nix flake
+          # check`, where TARTARUS_HOST_UID is unset so `lowHostUid` is false).
+          shell = mkIf g.lowHostUid (mkDefault pkgs.bashInteractive);
           extraGroups = ["wheel"];
           openssh.authorizedKeys.keys =
             optionals (builtins.pathExists pubKeyFile) [(builtins.readFile pubKeyFile)];
