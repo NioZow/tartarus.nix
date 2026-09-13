@@ -40,6 +40,7 @@
   ids = import ../nix/lib/ids.nix {inherit lib;};
   names = import ../nix/lib/names.nix {inherit lib;};
   platform = import ../nix/guest/platform.nix {inherit lib;};
+  sharePolicy = import ../nix/lib/shares.nix {inherit lib;};
   renderSquid = import ../nix/host/proxy.nix {mode = "squidConfig";};
 
   # ==== test-record helpers ==============================================
@@ -717,6 +718,25 @@
     r = builtins.tryEval (builtins.seq hm.config.home.activationPackage.drvPath true);
   in
     r.success && r.value;
+
+  # ---- nix/lib/shares.nix fixtures -------------------------------------
+  darwin = platform.mk {
+    hostSystem = "aarch64-darwin";
+    kind = "vm";
+    id = 3;
+  };
+  linux = platform.mk {
+    hostSystem = "x86_64-linux";
+    kind = "vm";
+    id = 3;
+  };
+  vmReadOnlyShare = {
+    tag = "zsh";
+    source = "/home/user/.config/zsh";
+    mountPoint = "/home/user/.config/zsh";
+    proto = "virtiofs";
+    readOnly = true;
+  };
 in {
   tests = {
     # ---- ids.nix: stable assignment ------------------------------------
@@ -861,6 +881,35 @@ in {
       in
         !p.vsockAvailable && !p.useVsock && p.guestIP == "10.201.0.4" && p.hypervisor == "qemu")
       "containers must never select VSOCK";
+
+    # ---- nix/lib/shares.nix: macOS read-only snapshot policy ------------
+    # Darwin needs a store snapshot for read-only shares (vfkit ignores
+    # `readOnly`); Linux does not (the hypervisor enforces it); secrets and
+    # the store itself are never copied.
+    "shares/darwin-ro-snapshots" =
+      T
+      (sharePolicy.needsStoreSnapshot darwin vmReadOnlyShare)
+      "a read-only Darwin share was not snapshotted";
+    "shares/darwin-writable-not-snapshotted" =
+      T
+      (!sharePolicy.needsStoreSnapshot darwin (vmReadOnlyShare // {readOnly = false;}))
+      "a writable Darwin share was snapshotted";
+    "shares/linux-ro-not-snapshotted" =
+      T
+      (!sharePolicy.needsStoreSnapshot linux vmReadOnlyShare)
+      "a Linux read-only share was snapshotted (hypervisor enforces it)";
+    "shares/opt-out" =
+      T
+      (!sharePolicy.needsStoreSnapshot darwin (vmReadOnlyShare // {snapshot = false;}))
+      "the `snapshot = false` opt-out was ignored";
+    "shares/run-never-snapshotted" =
+      T
+      (!sharePolicy.needsStoreSnapshot darwin (vmReadOnlyShare // {source = "/run/agenix/tartarus-dev";}))
+      "a /run source was copied into the store";
+    "shares/store-never-snapshotted" =
+      T
+      (!sharePolicy.needsStoreSnapshot darwin (vmReadOnlyShare // {source = "/nix/store";}))
+      "the Nix store was copied into itself";
 
     # ---- host assertions ------------------------------------------------
     "assertions/good-host-passes" =

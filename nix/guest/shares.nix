@@ -9,6 +9,12 @@
 # Ad-hoc `vm start --mount` shares arrive through MICROVM_EXTRA_SHARES.
 # Containers do not use shares: the host bind-mounts the same directories
 # directly, so this only pre-creates their mount points.
+#
+# Read-only shares are genuinely read-only on Linux (the hypervisor honours
+# `readOnly`) but *not* on macOS/vfkit, which ignores it. There, every
+# read-only share is re-sourced from a read-only Nix store snapshot so the guest
+# cannot write the host's live files. See `nix/lib/shares.nix` for the policy
+# and the `snapshot = false` opt-out.
 {
   lib,
   pkgs,
@@ -30,6 +36,7 @@
   g = tartarusGuest;
   p = g.platform;
   user = g.user.name;
+  sharePolicy = import ../lib/shares.nix {inherit lib;};
 
   kindDir =
     if g.isVm
@@ -50,6 +57,8 @@
         mountPoint = "/nix/.ro-store";
         proto = p.shareProto;
         readOnly = true;
+        # Already immutable; never copy the whole store.
+        snapshot = false;
       }
     ]
     ++ optional g.sharedFolder {
@@ -70,6 +79,8 @@
         mountPoint = "/etc/tartarus/ssh";
         proto = p.shareProto;
         readOnly = true;
+        # Private host keys: never copy into the world-readable store.
+        snapshot = false;
       }
       {
         tag = "tartarus-x509";
@@ -77,6 +88,8 @@
         mountPoint = "/etc/tartarus/x509";
         proto = p.shareProto;
         readOnly = true;
+        # Private client keys: never copy into the world-readable store.
+        snapshot = false;
       }
     ]
     ++ extraShares;
@@ -86,14 +99,26 @@
   # 9p's default securityModel ("none") always reports files to the guest as
   # owned by 0:0. "mapped" stores guest-visible ownership as host-side xattrs
   # instead, seeded once by fixup-share-perms. Only writable shares need it.
-  shares =
+  #
+  # On macOS/vfkit `readOnly` is a no-op (see ../lib/shares.nix), so every
+  # read-only share is additionally re-sourced from a read-only Nix store
+  # snapshot there. `snapshot` is tartarus-internal and stripped before the
+  # shares reach `microvm.shares`.
+  shares = map (s: builtins.removeAttrs s ["snapshot"]) (
     map (
       s:
-        if isWritableNinePShare s
-        then s // {securityModel = s.securityModel or "mapped";}
+        if sharePolicy.needsStoreSnapshot p s
+        then s // {source = sharePolicy.storeSnapshot s.tag s.source;}
         else s
     )
-    rawShares;
+    (map (
+        s:
+          if isWritableNinePShare s
+          then s // {securityModel = s.securityModel or "mapped";}
+          else s
+      )
+      rawShares)
+  );
 
   writableShareMountPoints = map (s: s.mountPoint) (filter isWritableNinePShare shares);
 

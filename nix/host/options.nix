@@ -94,6 +94,14 @@ in {
             and `mountPoint`; `proto` is normalized to the host platform by the
             engine, and writable Linux 9p shares automatically get the `mapped`
             security model plus an ownership fixup.
+
+            `readOnly = true` makes the share read-only for the guest. On Linux
+            the hypervisor enforces this; on macOS/vfkit, which ignores it, the
+            engine instead copies `source` into the Nix store and shares that,
+            since store paths are root-owned and non-writable (see
+            `docs/shares.md`). Because that copy is world-readable, set
+            `snapshot = false` on a read-only share that contains secrets;
+            sources under `/nix/store` and `/run` are never copied.
           '';
         };
 

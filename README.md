@@ -122,7 +122,7 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `graphical` | bool | `false` | Graphical remote display via the `wprs` transport. |
 | `internet` | bool | `true` | Direct NAT egress. Mutually exclusive with `proxy.enable`. |
 | `sharedFolder` | bool | `false` | Mount a per-guest host directory at `~/shared`. |
-| `shares` | list | `[]` | Extra host/guest directory shares (passed to `microvm.shares`; `proto` is normalized per platform). |
+| `shares` | list | `[]` | Extra host/guest directory shares (passed to `microvm.shares`; `proto` is normalized per platform). A `readOnly = true` share is enforced by the hypervisor on Linux and by a read-only Nix store snapshot on macOS/vfkit (which ignores the flag); see [Shares and read-only enforcement](docs/shares.md). |
 | `apps` | list | `[]` | Host `.desktop` launchers for apps running in the guest. |
 | `autostart` | bool | `false` | Start on login via a tartarus user service. |
 | `requires` | list | `[]` | Names of other enabled guests that must be started before this one. `tartarus start` auto-starts dependencies first. The graph must be acyclic. |
@@ -284,6 +284,11 @@ macOS. The guest halves are wired automatically when a guest sets the matching
   deterministic address), since guests send no gratuitous ARP.
 - A guest can opt into an in-guest nftables firewall (a practical policy, not a
   hard boundary).
+- **Read-only shares are enforced host-side.** vfkit ignores a share's
+  `readOnly` flag and microvm.nix adds no `ro` mount option, so the engine
+  copies a read-only `source` into the read-only Nix store and exports that
+  instead. See [Shares and read-only enforcement](docs/shares.md) (including
+  the `snapshot = false` opt-out for secret-bearing shares).
 - Building Linux guests needs `nix.linux-builder` (tartarus enables it by
   default on Darwin); see nixcfg's `docs/linux-builder.md`.
 
