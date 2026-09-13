@@ -137,6 +137,7 @@ in {
       (import ./ca.nix {inherit inputs;})
       (import ./firewall.nix {})
       (import ./proxy.nix {inherit inputs;})
+      (import ./relay.nix {inherit inputs;})
       (import ./launcher.nix {inherit inputs tartarusPkg;})
       (import ./ssh.nix {inherit inputs;})
       (import ./autostart.nix {inherit inputs tartarusPkg;})

@@ -126,6 +126,7 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `apps` | list | `[]` | Host `.desktop` launchers for apps running in the guest. |
 | `autostart` | bool | `false` | Start on login via a tartarus user service. |
 | `requires` | list | `[]` | Names of other enabled guests that must be started before this one. `tartarus start` auto-starts dependencies first. The graph must be acyclic. |
+| `relays` | list | `[]` | Darwin-only host port forwards into this guest, exposed on the vmnet gateway (`{ port; targetPort; protocol; host; }`; `targetPort` defaults to `port`, `protocol` is `"tcp"`/`"udp"`). Privileged ports (< 1024) run as root services. Ignored on Linux, where direct routing already reaches the guest. |
 | `services.clipboardBridge` | bool | `false` | Clipboard bridge (guest client + host server, mTLS). |
 | `services.sshAuthProxy` | bool | `false` | Forward the host ssh-agent into the guest. |
 | `services.sudoAuthProxy` | bool | `false` | PAM sudo authentication proxy. |
@@ -268,11 +269,14 @@ macOS. The guest halves are wired automatically when a guest sets the matching
 - vfkit guests on `vmnet-shared` NAT (`192.168.64.0/24`, gateway
   `192.168.64.1`). No host bridge, no VSOCK, no host nftables.
 - The bridge's `vmenet` ports are flagged `PRIVATE`: guests reach the host but
-  **not each other**, so a guest-hosted proxy is exposed through a host
-  `socat` relay on `192.168.64.1:3128` (clients target the gateway). The relay
-  terminates the connection, so Squid sees the gateway as the client and the
-  per-guest ACLs collapse into one relay client with a unioned allowlist.
-  DNS uses the host resolver on `.1:53`.
+  **not each other**, so anything a guest exposes is reached through a host
+  `socat` relay bound to the gateway (`192.168.64.1`). `tartarus.guests.<name>.relays`
+  declares these forwards for any VM (`{ port; targetPort; protocol; }`); the
+  guest-hosted proxy's `:3128` relay is added automatically from
+  `tartarus.proxy.location`, and a privileged port such as DNS `:53` becomes a
+  root launch daemon. The proxy relay terminates the connection, so Squid sees
+  the gateway as the client and the per-guest ACLs collapse into one relay
+  client with a unioned allowlist.
 - Guests get deterministic static addresses (`192.168.64.<id + 42>`); DHCP is
   broken under vfkit.
 - All host/guest services use TCP. `tartarus proxy-ip` resolves the guest from

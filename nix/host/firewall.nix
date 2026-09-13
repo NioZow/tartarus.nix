@@ -372,6 +372,7 @@
     inherit
       (lib)
       concatMapStringsSep
+      concatStringsSep
       mkIf
       optionalString
       ;
@@ -394,6 +395,20 @@
     proxyTcpDnsRule =
       optionalString (proxy.enable or false)
       "ip daddr ${proxy.host} tcp dport 53 counter accept comment \"proxy-dns\"";
+    # The host's user services (ssh-agent-proxy, sudo-auth-proxy,
+    # clipboard-bridge) are reached at the gateway on their fixed ports. On
+    # Darwin the gateway is outside the trs subnets accepted below, so a guest
+    # that opts into a firewall and uses one of these services would otherwise
+    # drop its own connections to the host. VSOCK bypasses IP filtering, so
+    # these only matter for TCP (Darwin, containers, disableVsock).
+    hostServiceRule = svc: port:
+      optionalString (g.services.${svc} or false)
+      "ip daddr ${p.gateway} tcp dport ${toString port} counter accept comment \"${svc}\"";
+    hostServiceRules = concatStringsSep "\n" [
+      (hostServiceRule "sudoAuthProxy" 65001)
+      (hostServiceRule "sshAuthProxy" 65000)
+      (hostServiceRule "clipboardBridge" 27795)
+    ];
     allowEntry = a:
       if lib.hasInfix " " a
       then a
@@ -421,6 +436,7 @@
             ${proxyTcpRule}
             ${proxyUdpDnsRule}
             ${proxyTcpDnsRule}
+            ${hostServiceRules}
             ${allowRules}
 
             ip daddr ${ids.vmSubnet} counter accept

@@ -109,6 +109,35 @@ in {
     };
   };
 
+  # A host-side port forward into a guest. On Darwin vfkit's vmnet-shared mode
+  # makes guests unable to reach each other and the host cannot route to a
+  # guest's service at the gateway, so a userspace relay exposes the guest port
+  # on the gateway (`192.168.64.1`). On Linux direct routing already reaches the
+  # guest, so relays are a Darwin-only concept and are ignored elsewhere.
+  relay = types.submodule {
+    options = {
+      port = mkOption {
+        type = types.port;
+        description = "Host-side (gateway) port the relay listens on.";
+      };
+      targetPort = mkOption {
+        type = types.nullOr types.port;
+        default = null;
+        description = "Guest-side port to forward to. Defaults to `port`.";
+      };
+      protocol = mkOption {
+        type = types.enum ["tcp" "udp"];
+        default = "tcp";
+        description = "Transport protocol of the relay.";
+      };
+      host = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Host address to bind. Defaults to the vmnet gateway on Darwin.";
+      };
+    };
+  };
+
   firewall = types.submodule {
     options = {
       enable = mkOption {

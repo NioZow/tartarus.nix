@@ -115,6 +115,19 @@ in {
           description = "Names of other enabled guests that must be started before this one. tartarus start/spawn/autostart start them first; the graph must be acyclic.";
         };
 
+        relays = mkOption {
+          type = types.listOf shared.relay;
+          default = [];
+          description = ''
+            Host-side port forwards into this guest, exposed on the vmnet
+            gateway. Darwin-only: vfkit's vmnet-shared mode gives guests no
+            path to each other and the host cannot route to a guest service
+            through the gateway, so a userspace relay (socat) is needed. On
+            Linux direct routing already reaches the guest, so these are
+            ignored. Ports below 1024 are run as a root service.
+          '';
+        };
+
         services = mkOption {
           type = shared.serviceFlags;
           default = {};

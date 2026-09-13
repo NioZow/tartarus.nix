@@ -106,6 +106,7 @@
     services = g.services;
     firewall = g.firewall;
     proxy = g.proxy;
+    relays = g.relays;
     requires = g.requires;
   };
 

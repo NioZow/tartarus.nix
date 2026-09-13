@@ -147,14 +147,6 @@ in
         ]
         else rawClients;
 
-      # The guest named by `location`, whose trunk IP the relay forwards to.
-      proxyVmIp = let
-        g = instances.guests.${cfg.location} or null;
-      in
-        if g != null
-        then g.ip
-        else null;
-
       clientType = types.submodule {
         options = {
           name = mkOption {type = types.str;};
@@ -237,18 +229,6 @@ in
           after = ["network.target"];
           restart = "on-failure";
           extraSystemdServiceConfig.KillSignal = "SIGTERM";
-        }))
-
-        # Guest-hosted proxy on Darwin: the guests cannot reach the proxy VM
-        # directly, so relay the gateway port to it with socat. The proxy stays
-        # in its VM; the relay only forwards bytes.
-        (mkIf (isDarwin && proxyIsGuest) (mkService {
-          name = "tartarus-proxy-relay";
-          description = "tartarus guest-hosted proxy relay (socat)";
-          command = "${pkgs.socat}/bin/socat TCP-LISTEN:${toString cfg.port},bind=${ids.darwinGateway},reuseaddr,fork TCP:${proxyVmIp}:${toString cfg.port}";
-          scope = "user";
-          after = ["network.target"];
-          restart = "on-failure";
         }))
       ];
     }

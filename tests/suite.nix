@@ -22,6 +22,7 @@
     (lib)
     all
     attrNames
+    concatStringsSep
     filter
     hasInfix
     hasPrefix
@@ -233,6 +234,10 @@
       type = lib.types.attrsOf lib.types.unspecified;
       default = {};
     };
+    options.launchd.daemons = lib.mkOption {
+      type = lib.types.attrsOf lib.types.unspecified;
+      default = {};
+    };
   };
   mkDarwinHost = guests:
     lib.nixosSystem {
@@ -328,6 +333,30 @@
         };
       }
     ];
+  };
+
+  # Darwin relays: a privileged port (53) becomes a root launch daemon, the
+  # rest user launch agents.
+  hostDarwinRelays = mkDarwinHost {
+    x = {
+      enable = true;
+      kind = "vm";
+      id = 20;
+      internet = true;
+      relays = [
+        {
+          port = 53;
+          protocol = "udp";
+        }
+        {
+          port = 53;
+          protocol = "tcp";
+        }
+        {
+          port = 3128;
+        }
+      ];
+    };
   };
 
   hostBadInternetProxy = mkHost {
@@ -587,6 +616,30 @@
   };
   envDarwin = envText envDarwinGuests "vault";
 
+  # A Darwin guest with a firewall and all three host services: the in-guest
+  # nftables output chain must accept the service ports at the vmnet gateway.
+  fwDarwinGuests = mkGuests {
+    hostSystem = "aarch64-darwin";
+    globalProxy = fullProxy;
+    guests.svc = {
+      enable = true;
+      kind = "vm";
+      id = 20;
+      internet = false;
+      proxy.enable = true;
+      firewall = {
+        enable = true;
+        location = "guest";
+      };
+      services = {
+        sudoAuthProxy = true;
+        sshAuthProxy = true;
+        clipboardBridge = true;
+      };
+    };
+  };
+  fwDarwinNft = fwDarwinGuests.nixosConfigurations."vm-svc".config.networking.nftables.tables.tartarus.content;
+
   namesGuests = mkGuests {
     globalProxy.enable = false;
     guests = {
@@ -840,6 +893,27 @@ in {
       T (!assertionsPass hostRequiresMissing) "requires naming a disabled/missing guest was accepted";
     "assertions/requires-cycle-rejected" =
       T (!assertionsPass hostRequiresCycle) "requires cycle was accepted";
+
+    # ---- Darwin guest firewall: host-service allowances ----------------
+    # A proxy-only guest that opts into an in-guest firewall must still reach
+    # the host's user services (their ports are outside the trs subnets on
+    # Darwin).
+    "guest-fw/host-services" =
+      T
+      (all (p: hasInfix "ip daddr 192.168.64.1 tcp dport ${p} counter accept" fwDarwinNft) ["65001" "65000" "27795"])
+      "a firewalled guest did not allow the host service ports at the gateway";
+
+    # ---- Darwin host relays -------------------------------------------
+    "relay/darwin-udp-privileged" =
+      T
+      (hasInfix "UDP4-LISTEN:53,bind=192.168.64.1,reuseaddr,fork UDP4:192.168.64.62:53" (concatStringsSep " " hostDarwinRelays.config.launchd.daemons."tartarus-relay-x-udp-53".serviceConfig.ProgramArguments))
+      "Darwin privileged UDP relay args changed";
+    "relay/darwin-tcp-privileged" =
+      T (hostDarwinRelays.config.launchd.daemons ? "tartarus-relay-x-tcp-53") "privileged TCP relay is not a root launch daemon";
+    "relay/darwin-user-agent" =
+      T (hostDarwinRelays.config.launchd.agents ? "tartarus-relay-x-tcp-3128") "non-privileged relay is not a user launch agent";
+    "relay/darwin-proxy-auto" =
+      T (hostDarwinGuestProxyOk.config.launchd.agents ? "tartarus-relay-proxyvm-tcp-3128") "the guest-hosted proxy relay was not generated automatically";
 
     # ---- rendered Squid config -----------------------------------------
     "squid/src-acl" = inStr "acl g_vault src 10.200.0.3/32" squidDefault;
