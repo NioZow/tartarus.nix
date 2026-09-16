@@ -91,6 +91,16 @@ class GuestProxy:
 
 
 @dataclass(frozen=True)
+class GuestRelay:
+    """One host-side relay into a guest (Darwin-only)."""
+
+    port: int
+    target_port: int | None = None
+    protocol: str = "tcp"
+    host: str | None = None
+
+
+@dataclass(frozen=True)
 class Guest:
     """One enabled guest, as recorded in ``config.toml``."""
 
@@ -102,6 +112,7 @@ class Guest:
     autostart: bool = False
     shared_folder: bool = False
     requires: list[str] = field(default_factory=list)
+    relays: list[GuestRelay] = field(default_factory=list)
     proxy: GuestProxy = field(default_factory=GuestProxy)
 
 
@@ -282,28 +293,44 @@ def _parse_guests(raw: Any) -> list[Guest]:
             if isinstance(guest_id, bool) or not isinstance(guest_id, int) or guest_id <= 0:
                 raise TartarusError(f"guest '{name}': `id` must be a positive integer, got {guest_id!r}")
 
-        proxy_raw = item.get("proxy", {})
-        if proxy_raw is None:
-            proxy_raw = {}
-        if not isinstance(proxy_raw, dict):
-            raise TartarusError(f"guest '{name}': `proxy` must be a table")
+            proxy_raw = item.get("proxy", {})
+            if proxy_raw is None:
+                proxy_raw = {}
+            if not isinstance(proxy_raw, dict):
+                raise TartarusError(f"guest '{name}': `proxy` must be a table")
 
-        guests.append(
-            Guest(
-                name=name,
-                kind=kind,
-                id=guest_id,
-                internet=_as_bool(item.get("internet", True), f"guest '{name}'.internet"),
-                graphical=_as_bool(item.get("graphical", False), f"guest '{name}'.graphical"),
-                autostart=_as_bool(item.get("autostart", False), f"guest '{name}'.autostart"),
-                shared_folder=_as_bool(item.get("shared_folder", False), f"guest '{name}'.shared_folder"),
-                requires=_as_list(item.get("requires"), f"guest '{name}'.requires"),
-                proxy=GuestProxy(
-                    enable=_as_bool(proxy_raw.get("enable", False), f"guest '{name}'.proxy.enable"),
-                    allow_hosts=_as_list(proxy_raw.get("allow_hosts"), f"guest '{name}'.proxy.allow_hosts"),
-                ),
+            relays_raw = item.get("relays", [])
+            if relays_raw is None:
+                relays_raw = []
+            if not isinstance(relays_raw, list):
+                raise TartarusError(f"guest '{name}': `relays` must be an array of tables")
+
+            guests.append(
+                Guest(
+                    name=name,
+                    kind=kind,
+                    id=guest_id,
+                    internet=_as_bool(item.get("internet", True), f"guest '{name}'.internet"),
+                    graphical=_as_bool(item.get("graphical", False), f"guest '{name}'.graphical"),
+                    autostart=_as_bool(item.get("autostart", False), f"guest '{name}'.autostart"),
+                    shared_folder=_as_bool(item.get("shared_folder", False), f"guest '{name}'.shared_folder"),
+                    requires=_as_list(item.get("requires"), f"guest '{name}'.requires"),
+                    relays=[
+                        GuestRelay(
+                            port=_as_int(r.get("port"), f"guest '{name}'.relays[].port"),
+                            target_port=r.get("target_port") if r.get("target_port") is not None else None,
+                            protocol=str(r.get("protocol", "tcp")),
+                            host=str(r.get("host")) if r.get("host") is not None else None,
+                        )
+                        for r in relays_raw
+                        if isinstance(r, dict)
+                    ],
+                    proxy=GuestProxy(
+                        enable=_as_bool(proxy_raw.get("enable", False), f"guest '{name}'.proxy.enable"),
+                        allow_hosts=_as_list(proxy_raw.get("allow_hosts"), f"guest '{name}'.proxy.allow_hosts"),
+                    ),
+                )
             )
-        )
     return guests
 
 

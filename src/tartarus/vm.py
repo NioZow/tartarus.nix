@@ -28,6 +28,72 @@ from .process import run_quiet
 # Guards infinite recursion when a dependency cycle exists at runtime.
 _STARTING: set[str] = set()
 
+# ---------------------------------------------------------------------------
+# Darwin relay lifecycle (launchctl glue)
+# ---------------------------------------------------------------------------
+
+def _darwin() -> bool:
+    return platform.system() == "Darwin"
+
+def _launchctl_cmd(subcmd: str, label: str, *, prefer_user: bool = True) -> None:
+    """Run launchctl subcmd on a label, trying both user and system domains.
+
+    * ``subcmd`` is one of ``"start"``, ``"stop"``, ``"kickstart"``.
+    * ``prefer_user`` selects which domain to try first (``gui/<uid>`` vs
+      ``system/``). The other domain is tried as a fallback.
+
+    No-ops silently on non-Darwin.
+    """
+    if not _darwin():
+        return
+    domains = [f"gui/{os.getuid()}", "system"]
+    if not prefer_user:
+        domains.reverse()
+    for domain in domains:
+        cmd = ["/bin/launchctl", subcmd, f"{domain}/{label}"]
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            return  # success on this domain
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode().strip()
+            if "Could not find service" in stderr:
+                continue  # try next domain
+            if "already loaded" in stderr:
+                return
+            warn(f"launchctl {subcmd} {domain}/{label}: {stderr}")
+            return
+
+def _relay_label(name: str, relay) -> str:
+    """Build the launchd label from a GuestRelay object."""
+    return f"tartarus-relay-{name}-{relay.protocol}-{relay.port}"
+
+def _start_relays(config: Config, name: str) -> None:
+    """Start any launchd relay agents/daemons for this guest."""
+    if not _darwin():
+        return
+    guest = config.guest(name, "vm")
+    if guest is None:
+        return
+    for relay in guest.relays:
+        label = _relay_label(name, relay)
+        _launchctl_cmd("kickstart", label, prefer_user=relay.port >= 1024)
+
+def _stop_relays(config: Config, name: str) -> None:
+    """Stop the launchd relay agents/daemons for this guest.
+
+    Uses ``launchctl stop`` which is deprecated but still functional on modern
+    macOS for jobs loaded via ``launchd.plist(5)``.  A warning is printed only
+    when the command itself fails with an unexpected error.
+    """
+    if not _darwin():
+        return
+    guest = config.guest(name, "vm")
+    if guest is None:
+        return
+    for relay in guest.relays:
+        label = _relay_label(name, relay)
+        _launchctl_cmd("stop", label, prefer_user=relay.port >= 1024)
+
 
 def _ensure_dependencies(config: Config, name: str) -> None:
     """Start any `requires` dependencies before ``name``."""
@@ -258,6 +324,8 @@ def action_start(config: Config, name: str, mounts: list[str]) -> None:
     console_log.close()
     (state / "microvm.pid").write_text(f"{proc.pid}\n")
 
+    _start_relays(config, name)
+
     ok(f"'{name}' started (pid {proc.pid}, cid {cid}). Console: {state / 'console.log'}")
 
 
@@ -303,6 +371,8 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
         except ProcessLookupError:
             pass
         ok(f"'{name}' stopped.")
+
+    _stop_relays(config, name)
 
     if purge:
         shutil.rmtree(state, ignore_errors=True)

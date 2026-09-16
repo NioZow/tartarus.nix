@@ -119,6 +119,7 @@
         then "system"
         else "user";
       after = ["network.target"];
+      restart = "on-failure";
     };
 in {
   # Assign the fragments to their concrete launchd namespace (rather than a

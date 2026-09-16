@@ -47,6 +47,12 @@
     description = "Autostart tartarus ${g.kind} ${g.name}";
     command = "${tartarus}/bin/tartarus ${optionalString (g.kind == "container") "--container "}start ${g.name}";
     after = ["network.target"];
+    # `tartarus start` is a one-shot command (starts the VM background process
+    # then exits).  Without this, launchd's default `KeepAlive = true` restarts
+    # the agent continuously in a loop.
+    extraLaunchdConfig = {
+      KeepAlive = false;
+    };
   };
 in {
   config =

@@ -27,6 +27,7 @@
     mapAttrsToList
     mkIf
     mkOption
+    optionalString
     replaceStrings
     types
     ;
@@ -85,6 +86,16 @@
   tArr = xs: "[${concatMapStringsSep ", " tStr xs}]";
   tInline = attrs: "{ ${concatStringsSep ", " (mapAttrsToList (k: v: "${k} = ${v}") attrs)} }";
 
+  relayBlock = r: let
+    targetPortLine = optionalString (r.targetPort != null) "    target_port = ${tInt r.targetPort}\n";
+    hostLine = optionalString (r.host != null) "    host = ${tStr r.host}\n";
+  in
+    "    [[guests.relays]]\n"
+    + "    port = ${tInt r.port}\n"
+    + targetPortLine
+    + "    protocol = ${tStr r.protocol}\n"
+    + hostLine;
+
   guestBlock = g: ''
     [[guests]]
     name = ${tStr g.name}
@@ -95,7 +106,7 @@
     autostart = ${tBool g.autostart}
     shared_folder = ${tBool g.sharedFolder}
     requires = ${tArr g.requires}
-    proxy = ${tInline {
+    ${optionalString ((g.relays or []) != []) (concatStringsSep "" (map relayBlock g.relays))}proxy = ${tInline {
       enable = tBool g.proxy.enable;
       allow_hosts = tArr g.proxy.allowHosts;
     }}
