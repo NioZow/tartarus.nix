@@ -67,6 +67,72 @@ def _relay_label(name: str, relay) -> str:
     """Build the launchd label from a GuestRelay object."""
     return f"tartarus-relay-{name}-{relay.protocol}-{relay.port}"
 
+def _reap_stale_vfkits(config: Config, name: str) -> int:
+    """Kill any vfkit processes for ``name`` that are *not* in ``microvm.pid``.
+
+    Returns the number of stale processes reaped.  Prints a warning per
+    process so the user knows a cleanup happened.
+    """
+    killed = 0
+    for pid in _stale_vfkit_pids(config, name):
+        warn(f"cleaning up stale vfkit process for '{name}' (pid {pid})")
+        try:
+            os.kill(pid, signal.SIGTERM)
+            # Give it a moment to exit
+            for _ in range(20):
+                os.kill(pid, 0)
+                time.sleep(0.1)
+            # Still alive – SIGKILL
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        killed += 1
+    return killed
+
+
+def _stale_vfkit_pids(config: Config, name: str) -> list[int]:
+    """Find vfkit processes that reference ``name``'s state dir but aren't the
+    currently-tracked one.  These can be left behind when a previous start
+    crashes after writing the pidfile, or when the hypervisor is killed
+    uncleanly and the pidfile is later removed or overwritten by a subsequent
+    (failed) start attempt.
+    """
+    state = config.state_dir(name)
+    state_str = str(state)
+    tracked: int | None = None
+    pid_file = state / "microvm.pid"
+    if pid_file.exists():
+        try:
+            tracked = int(pid_file.read_text().strip())
+        except ValueError:
+            pass
+
+    stale: list[int] = []
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-a", "vfkit"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return stale
+
+    for line in proc.stdout.strip().splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if tracked is not None and pid == tracked:
+            continue
+        if state_str in parts[1]:
+            stale.append(pid)
+    return stale
+
+
 def _start_relays(config: Config, name: str) -> None:
     """Start any launchd relay agents/daemons for this guest."""
     if not _darwin():
@@ -267,6 +333,8 @@ def action_start(config: Config, name: str, mounts: list[str]) -> None:
 
     ca.ensure_vm_certs(config, base)
 
+    _reap_stale_vfkits(config, name)
+
     if ssh.is_running(config, name):
         pid = (config.state_dir(name) / "microvm.pid").read_text().strip()
         warn(f"'{name}' is already running (pid {pid}).")
@@ -339,6 +407,8 @@ def action_spawn(config: Config, template: str, name_override: str | None, mount
 def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> None:
     flake.require_template(config, "vm", flake.base_name(config, "vm", name))
     state = config.state_dir(name)
+
+    _reap_stale_vfkits(config, name)
 
     if not ssh.is_running(config, name):
         warn(f"'{name}' is not running.")
