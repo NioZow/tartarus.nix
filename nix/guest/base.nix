@@ -20,6 +20,7 @@
     mkMerge
     optional
     optionals
+    optionalAttrs
     ;
   g = tartarusGuest;
 
@@ -139,10 +140,19 @@ in {
 
       services.openssh = {
         enable = true;
-        settings = {
-          PermitRootLogin = "no";
-          PasswordAuthentication = false;
-        };
+        settings =
+          {
+            PermitRootLogin = "no";
+            PasswordAuthentication = false;
+          }
+          // optionalAttrs (g.services.gpgAgentProxy or false) {
+            # Accept the host-forwarded GPG agent socket. GnuPG's socketdir on
+            # a systemd guest is $XDG_RUNTIME_DIR/gnupg, so sshd binds the
+            # forwarded socket there and must be allowed to replace a stale one
+            # left by a previous session or a locally auto-launched agent.
+            AllowStreamLocalForwarding = "yes";
+            StreamLocalBindUnlink = "yes";
+          };
         hostKeys = [
           {
             path = hostKeyPath;

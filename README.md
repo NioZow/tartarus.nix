@@ -128,7 +128,7 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `requires` | list | `[]` | Names of other enabled guests that must be started before this one. `tartarus start` auto-starts dependencies first. The graph must be acyclic. |
 | `relays` | list | `[]` | Darwin-only host port forwards into this guest, exposed on the vmnet gateway (`{ port; targetPort; protocol; host; }`; `targetPort` defaults to `port`, `protocol` is `"tcp"`/`"udp"`). Privileged ports (< 1024) run as root services. Ignored on Linux, where direct routing already reaches the guest. |
 | `services.clipboardBridge` | bool | `false` | Clipboard bridge (guest client + host server, mTLS). |
-| `services.sshAuthProxy` | bool | `false` | Forward the host ssh-agent into the guest. |
+| `services.sshAgentProxy` | bool | `false` | Forward the host ssh-agent into the guest. |
 | `services.sudoAuthProxy` | bool | `false` | PAM sudo authentication proxy. |
 | `services.disableVsock` | bool | `false` | Force TCP instead of VSOCK (no-op where VSOCK is unavailable). |
 | `vm.vcpu` / `vm.mem` | int / int | `1` / `768` | VM only. |

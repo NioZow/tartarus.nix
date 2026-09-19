@@ -48,7 +48,7 @@
   requesting = name: filterAttrs (_: g: svc name g) enabled;
 
   sudoReq = requesting "sudoAuthProxy";
-  sshReq = requesting "sshAuthProxy";
+  sshReq = requesting "sshAgentProxy";
   clipReq = requesting "clipboardBridge";
 
   needsSudo = sudoReq != {};

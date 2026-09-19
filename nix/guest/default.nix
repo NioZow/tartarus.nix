@@ -32,7 +32,7 @@
   user = g.user.name;
 
   sudoAuthProxy = import ../packages/sudo-auth-proxy.nix {inherit inputs;};
-  sshAgentProxy = import ../packages/ssh-agent-proxy.nix {inherit inputs;};
+  sshAgentProxyPkg = import ../packages/ssh-agent-proxy.nix {inherit inputs;};
   clipboardBridge = import ../packages/clipboard-bridge.nix {inherit inputs;};
 
   # Common mTLS client block; the OIDs differ per service.
@@ -85,16 +85,16 @@ in {
       };
     })
 
-    (mkIf (services.sshAuthProxy || services.clipboardBridge) {
+    (mkIf (services.sshAgentProxy || services.clipboardBridge) {
       home-manager.users.${user} = mkMerge [
         {
           imports = [
-            sshAgentProxy.homeManagerModule
+            sshAgentProxyPkg.homeManagerModule
             clipboardBridge.homeManagerModule
           ];
         }
 
-        (mkIf services.sshAuthProxy {
+        (mkIf services.sshAgentProxy {
           tartarus.ssh-agent-proxy = {
             # Guest -> host proxy bridge.
             bridge = {
@@ -132,6 +132,31 @@ in {
           };
         })
       ];
+    })
+
+    # GPG agent forwarding is done entirely by the SSH client/server (a
+    # RemoteForward of the host's agent socket), so the guest only needs to
+    # make sure sshd can bind the forwarded socket under the runtime dir
+    # GnuPG uses for its agent (`$XDG_RUNTIME_DIR/gnupg`). The sshd side lives
+    # in base.nix; here we pre-create that directory (sshd binds the socket but
+    # not its parent) via a lingering user service.
+    (mkIf services.gpgAgentProxy {
+      home-manager.users.${user} = {
+        systemd.user.services.tartarus-gpg-agent-socketdir = {
+          Unit = {
+            Description = "Create the gpg-agent runtime socket directory (tartarus GPG forwarding)";
+          };
+          Service = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+            RuntimeDirectory = "gnupg";
+            RuntimeDirectoryMode = "0700";
+            RuntimeDirectoryPreserve = "yes";
+            ExecStart = "${pkgs.coreutils}/bin/true";
+          };
+          Install.WantedBy = ["default.target"];
+        };
+      };
     })
   ];
 }

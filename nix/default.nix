@@ -7,7 +7,7 @@
   forAllSystems = lib.genAttrs systems;
 
   sudoAuthProxy = import ./packages/sudo-auth-proxy.nix {inherit inputs;};
-  sshAgentProxy = import ./packages/ssh-agent-proxy.nix {inherit inputs;};
+  sshAgentProxyPkg = import ./packages/ssh-agent-proxy.nix {inherit inputs;};
   clipboardBridge = import ./packages/clipboard-bridge.nix {inherit inputs;};
 
   # Eval-level test suite (shared across systems; evaluation is platform
@@ -31,13 +31,13 @@ in {
     # standalone consumer can request just the PAM wiring by name. Same
     # module as `"sudo-auth-proxy"` (see nix/packages/sudo-auth-proxy.nix).
     "sudo-auth-proxy-pam" = sudoAuthProxy.pamNixosModule;
-    "ssh-agent-proxy" = sshAgentProxy.nixosModule;
+    "ssh-agent-proxy" = sshAgentProxyPkg.nixosModule;
     "clipboard-bridge" = clipboardBridge.nixosModule;
   };
 
   homeManagerModules = {
     "sudo-auth-proxy" = sudoAuthProxy.homeManagerModule;
-    "ssh-agent-proxy" = sshAgentProxy.homeManagerModule;
+    "ssh-agent-proxy" = sshAgentProxyPkg.homeManagerModule;
     "clipboard-bridge" = clipboardBridge.homeManagerModule;
   };
 

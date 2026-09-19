@@ -634,7 +634,7 @@
       };
       services = {
         sudoAuthProxy = true;
-        sshAuthProxy = true;
+        sshAgentProxy = true;
         clipboardBridge = true;
       };
     };

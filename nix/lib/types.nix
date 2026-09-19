@@ -50,8 +50,9 @@ in {
   serviceFlags = types.submodule {
     options = {
       clipboardBridge = mkEnableOption "the clipboard-bridge client in the guest and server on the host (mTLS)";
-      sshAuthProxy = mkEnableOption "the ssh-agent host in the guest and ssh-agent-proxy on the host (mTLS)";
+      sshAgentProxy = mkEnableOption "the ssh-agent host in the guest and ssh-agent-proxy on the host (mTLS)";
       sudoAuthProxy = mkEnableOption "the PAM sudo-auth-proxy client in the guest and server on the host (mTLS)";
+      gpgAgentProxy = mkEnableOption "GPG agent forwarding over SSH: the guest's gpg-agent socket is RemoteForward-ed to the host's gpg-agent, and the guest sshd accepts the stream-local bind";
       disableVsock = mkEnableOption "forcing TCP instead of VSOCK for the guest/host services (no-op where VSOCK is unavailable)";
     };
   };

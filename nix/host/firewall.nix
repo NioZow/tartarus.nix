@@ -143,7 +143,7 @@
       # fall back to TCP and need the matching host-service ports opened.
       isTcp = g: kind == "container" || g.services.disableVsock;
       needsClip = any (g: g.services.clipboardBridge && isTcp g) (attrValues enabledInst);
-      needsSsh = any (g: g.services.sshAuthProxy && isTcp g) (attrValues enabledInst);
+      needsSsh = any (g: g.services.sshAgentProxy && isTcp g) (attrValues enabledInst);
       needsSudo = any (g: g.services.sudoAuthProxy && isTcp g) (attrValues enabledInst);
 
       tcpRules = concatStringsSep "\n" (
@@ -406,7 +406,7 @@
       "ip daddr ${p.gateway} tcp dport ${toString port} counter accept comment \"${svc}\"";
     hostServiceRules = concatStringsSep "\n" [
       (hostServiceRule "sudoAuthProxy" 65001)
-      (hostServiceRule "sshAuthProxy" 65000)
+      (hostServiceRule "sshAgentProxy" 65000)
       (hostServiceRule "clipboardBridge" 27795)
     ];
     allowEntry = a:

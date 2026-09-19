@@ -148,8 +148,9 @@
     services =
       {
         clipboardBridge = false;
-        sshAuthProxy = false;
+        sshAgentProxy = false;
         sudoAuthProxy = false;
+        gpgAgentProxy = false;
         disableVsock = false;
       }
       // (cfg.services or {});
