@@ -70,6 +70,15 @@ in {
       # container.
       (mkIf (!g.isVm) {boot.isNspawnContainer = true;})
     ]
+    # The scripted initrd is deprecated and removed in NixOS 26.11; the guest
+    # must boot the systemd initrd. microvm.nix only defaults that on for
+    # qemu/cloud-hypervisor/firecracker/stratovirt, so a vfkit guest (macOS)
+    # still gets the scripted one and emits the deprecation warning. Set it
+    # explicitly for every VM -- tartarus's own store-overlay/register-nix-
+    # closure machinery already assumes a systemd initrd. Normal priority so it
+    # overrides microvm's `mkDefault false` without conflicting with its
+    # `mkDefault true` on the hypervisors it does cover.
+    ++ optional g.isVm {boot.initrd.systemd.enable = true;}
     ++ optional g.isVm (mkServiceSystem {
       name = "microvm-ssh-hostkey-stage";
       description = "Stage MicroVM CA-signed SSH host key with correct permissions";
