@@ -102,11 +102,14 @@ DEFAULT_CONFIG_PATH = "~/.config/ssh-agent-proxy/config.toml"
 MAX_AGENT_MSG_LEN = 256 * 1024
 # Bound slowloris / hung upstream: recv() gives up after this many seconds.
 SOCKET_TIMEOUT = 300
-# In --merge mode, a single hung upstream (e.g. Apple's ssh-agent waiting on a
-# keychain-unlock prompt, or a stale gpg-agent socket) must not block the whole
-# merged agent for SOCKET_TIMEOUT seconds. Use a short per-upstream timeout so
-# an unresponsive socket is skipped quickly instead of making `ssh-add -l`
-# appear to hang.
+# In --merge mode, identity enumeration probes every upstream; a short
+# per-upstream timeout lets a hung upstream (e.g. Apple's ssh-agent waiting on
+# a keychain-unlock prompt, or a stale gpg-agent socket) be skipped quickly
+# instead of making `ssh-add -l` appear to hang. Forwarded requests are NOT
+# bounded by this: a sign request may legitimately block on user interaction
+# (an authorization dialog on a host proxy, or a YubiKey PIN/touch prompt via
+# gpg-agent) and uses SOCKET_TIMEOUT instead. This is the same handler on the
+# host and in guests, so the long timeout must hold at every hop in the chain.
 MERGE_UPSTREAM_TIMEOUT = 5
 # SSH public key algorithms accepted in config (user keys + destination host keys).
 _ACCEPTED_KEY_TYPES = {
@@ -1489,10 +1492,15 @@ class MergeHandler(AgentIO, BaseRequestHandler):
         for path in self.upstream_sockets:
             try:
                 sock = Socket(AF_UNIX, SOCK_STREAM)
-                # Short per-upstream timeout so a hung upstream is dropped
-                # quickly rather than blocking the client for SOCKET_TIMEOUT.
+                # Short timeout only for connect(): a hung/dead upstream is
+                # dropped quickly there. Data reads default to the long
+                # timeout -- _handle_identities narrows it per call, while
+                # sign/forward requests must be allowed to block on user
+                # interaction (guard applies to both host- and guest-side
+                # merge proxies, which share this handler).
                 sock.settimeout(MERGE_UPSTREAM_TIMEOUT)
                 sock.connect(path)
+                sock.settimeout(SOCKET_TIMEOUT)
                 real_agents[path] = sock
                 log.debug(f"merge: connected to upstream agent at {path}")
             except Exception as e:
@@ -1516,15 +1524,40 @@ class MergeHandler(AgentIO, BaseRequestHandler):
             client.close()
             log.debug("merge: client connection closed")
 
+    @staticmethod
+    def _drop(real_agents: dict[str, socket], path: str) -> None:
+        """Retire an upstream whose reply was lost (timeout or EOF). A partial
+        read may have left the stream desynced, so it must not be reused."""
+        sock = real_agents.pop(path, None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def _handle_identities(
         self, client: socket, raw_msg: bytes, real_agents: dict[str, socket]
     ) -> None:
         aggregated_identities: list[tuple[bytes, bytes]] = []
         seen: set[bytes] = set()
-        for path, sock in real_agents.items():
-            self._send_msg(sock, raw_msg)
-            resp = self._recv_msg(sock)
-            if not resp or resp[0] != AgentMsg.IDENTITIES_ANSWER:
+        for path in list(real_agents):
+            sock = real_agents[path]
+            try:
+                # Identity enumeration is the one request we bound tightly: a
+                # hung upstream must not make `ssh-add -l` block for the full
+                # SOCKET_TIMEOUT.
+                sock.settimeout(MERGE_UPSTREAM_TIMEOUT)
+                self._send_msg(sock, raw_msg)
+                resp = self._recv_msg(sock)
+                sock.settimeout(SOCKET_TIMEOUT)
+            except OSError:
+                self._drop(real_agents, path)
+                continue
+            if resp is None:
+                # Hung or closed upstream: skip and retire it.
+                self._drop(real_agents, path)
+                continue
+            if resp[0] != AgentMsg.IDENTITIES_ANSWER:
                 continue
 
             buf = SSHBuffer(resp)
@@ -1554,10 +1587,27 @@ class MergeHandler(AgentIO, BaseRequestHandler):
         # turn and relay the first response that isn't a FAILURE. This
         # correctly handles sign requests (only the agent holding the private
         # key will answer with SIGN_RESPONSE) and any other request type.
-        for sock in real_agents.values():
-            self._send_msg(sock, raw_msg)
+        #
+        # The per-socket timeout here is the long SOCKET_TIMEOUT (set when the
+        # upstream connected), NOT MERGE_UPSTREAM_TIMEOUT: a sign request can
+        # legitimately take a long time while the user answers an authorization
+        # dialog or touches their YubiKey. Applying the 5s identity timeout here
+        # made those prompts appear to "time out" and surfaced as "agent
+        # refused operation".
+        for path in list(real_agents):
+            sock = real_agents[path]
+            try:
+                self._send_msg(sock, raw_msg)
+            except OSError:
+                self._drop(real_agents, path)
+                continue
             resp = self._recv_msg(sock)
-            if resp is not None and (len(resp) == 0 or resp[0] != AgentMsg.FAILURE):
+            if resp is None:
+                # No reply within SOCKET_TIMEOUT (or EOF): the upstream is
+                # genuinely hung. Retire it and try the next one.
+                self._drop(real_agents, path)
+                continue
+            if len(resp) == 0 or resp[0] != AgentMsg.FAILURE:
                 self._send_msg(client, resp)
                 return
         self._send_msg(client, bytes([AgentMsg.FAILURE]))
