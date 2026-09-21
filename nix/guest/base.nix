@@ -154,13 +154,19 @@ in {
             PermitRootLogin = "no";
             PasswordAuthentication = false;
           }
-          // optionalAttrs (g.services.gpgAgentProxy or false) {
-            # Accept the host-forwarded GPG agent socket. GnuPG's socketdir on
-            # a systemd guest is $XDG_RUNTIME_DIR/gnupg, so sshd binds the
-            # forwarded socket there and must be allowed to replace a stale one
-            # left by a previous session or a locally auto-launched agent.
+          // optionalAttrs ((g.services.gpgAgentProxy or false) || (g.services.sudoAuthProxy or false)) {
+            # Accept host-forwarded stream-local sockets. GnuPG's socketdir on
+            # a systemd guest is $XDG_RUNTIME_DIR/gnupg, and sudo-auth-proxy
+            # binds under /run/sudo-auth-proxy; sshd must be allowed to create
+            # the forward and to replace a stale socket left by a previous
+            # session or a locally auto-launched agent.
             AllowStreamLocalForwarding = "yes";
             StreamLocalBindUnlink = "yes";
+          }
+          // optionalAttrs (g.services.sudoAuthProxy or false) {
+            # The per-session selector and the recursion guard, delivered by
+            # the host ssh's `SetEnv` (doc §4.3, §10.4).
+            AcceptEnv = ["SUDO_AUTH_PROXY_SOCK" "SUDO_AUTH_PROXY_ACTIVE"];
           };
         hostKeys = [
           {
@@ -170,6 +176,30 @@ in {
         ];
         extraConfig = "HostCertificate ${hostKeyPath}-cert.pub";
       };
+
+      # Guest bind directory for the sudo-auth-proxy SSH RemoteForward (doc
+      # §4.3, §9.2; review log S14). The bind is done by this guest's sshd
+      # *as the guest login user*, so the directory must be owned by that user
+      # and be `0700` -- a root-owned 0755 (or root-owned 0700) directory makes
+      # every `RemoteForward` fail, loudly, because the host sets
+      # `ExitOnForwardFailure=yes`. Only created for guests that request the
+      # client.
+      systemd.tmpfiles.rules =
+        optional (g.services.sudoAuthProxy or false)
+        "d /run/sudo-auth-proxy 0700 ${g.user.name} ${g.user.name} -";
+
+      # `security.sudo.extraConfig` is appended as the *tail* of the generated
+      # `/etc/sudoers` (this nixpkgs emits no `@includedir`; verified in
+      # nixos/modules/security/sudo.nix, where `configFile` is the concatenation
+      # ending with `extraConfig` and is written to `/etc/sudoers`). Deploying
+      # here means a later `/etc/sudoers.d` fragment cannot negate these
+      # `env_keep` entries. Without them sudo's default `env_reset` strips the
+      # selector and the recursion guard before the `pam_exec` helper runs
+      # (doc §4.3, §10.4; review logs C1/B2).
+      security.sudo.extraConfig = mkIf (g.services.sudoAuthProxy or false) ''
+        Defaults env_keep += "SUDO_AUTH_PROXY_SOCK"
+        Defaults env_keep += "SUDO_AUTH_PROXY_ACTIVE"
+      '';
 
       # Ad-hoc guests are for interactive/debugging use -- surface service
       # failures on the serial console. home-manager-user.service also has no

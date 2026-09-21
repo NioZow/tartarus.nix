@@ -24,12 +24,27 @@
     mkIf
     mkMerge
     optional
+    optionalAttrs
     ;
   g = tartarusGuest;
   p = g.platform;
   services = g.services;
   x509 = "/etc/tartarus/x509";
   user = g.user.name;
+
+  # Per-guest sudo-auth-proxy transport marker (audit A1). `unix` selects the
+  # host→guest SSH-forwarded Unix socket instead of the callback transports; it
+  # is served with `transport_encryption = "none"` and `client_auth = "x509"`,
+  # not mTLS (the SSH tunnel already protects the channel).
+  sapUnix = (services.sudoAuthProxyTransport or "vsock") == "unix";
+
+  # `server_auth = "signature"` trust root for the `unix` client. The host
+  # server signs with its tartarus SSH identity (`~/.ssh/tartarus`, see
+  # `nix/host/services.nix`); the guest already reads that public key impurely
+  # for `authorized_keys` (see `base.nix`). An empty list fails closed.
+  hostSshPub = "${g.hostHome}/.ssh/tartarus.pub";
+  sapTrustedServerKeys =
+    optional (builtins.pathExists hostSshPub) (builtins.readFile hostSshPub);
 
   sudoAuthProxy = import ../packages/sudo-auth-proxy.nix {inherit inputs;};
   sshAgentProxyPkg = import ../packages/ssh-agent-proxy.nix {inherit inputs;};
@@ -76,12 +91,39 @@ in {
     (mkIf services.sudoAuthProxy {
       tartarus.sudo-auth-proxy = {
         enable = true;
-        transport = connection.transport;
+        # `unix` is the host→guest SSH RemoteForward path; vsock/tcp keep the
+        # platform's callback transport (doc §3; audit A1).
+        transport = if sapUnix then "unix" else connection.transport;
         host = connection.host;
         cid = connection.cid;
         port = 65001;
-        mtls = clientMtls "1.3.6.1.4.1.99999.1.2" "1.3.6.1.4.1.99999.1.1";
-        proxy.enable = true;
+        # The PAM helper runs as the invoking (guest login) user, so give the
+        # config directory to that user's group instead of the world (doc §9.2;
+        # mode stays 0750). The guest account is always "user" (build.nix), whose
+        # group is also "user".
+        configDirGroup = user;
+        # Timeouts: the first frame is the immediate `auth_pending` ack, bounded
+        # by recvTimeout (short, so a stale socket still fast-fails); the human
+        # decision is bounded by decisionTimeout (audit A2).
+        recvTimeout = 0.5;
+        decisionTimeout = 120;
+        # `unix`: SSH already protects the channel, the guest presents its
+        # tartarus X.509 client certificate (x509), and the host signs its
+        # response (signature) with the key the guest trusts from
+        # `trustedServerKeys`. Do NOT force mTLS here.
+        security = optionalAttrs sapUnix {
+          transportEncryption = "none";
+          serverAuth = "signature";
+          clientAuth = "x509";
+          clientCert = "${x509}/client.crt";
+          clientKey = "${x509}/client.key";
+          trustedServerKeys = sapTrustedServerKeys;
+        };
+        # vsock/tcp keep the existing mTLS behaviour (all three client OIDs on
+        # the shared tartarus client cert; doc §7.6).
+        mtls = optionalAttrs (!sapUnix) (
+          clientMtls "1.3.6.1.4.1.99999.1.2" "1.3.6.1.4.1.99999.1.1"
+        );
       };
     })
 

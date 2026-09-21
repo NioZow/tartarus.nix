@@ -55,7 +55,16 @@ X509_CERT_DAYS = "365"
 X509_RSA_BITS = "4096"
 X509_LEAF_RSA_BITS = "2048"
 
-# Extended Key Usage OIDs (private enterprise number 99999), per service.
+# Extended Key Usage OIDs (private enterprise number 99999), nominally per
+# service. NOTE (audit A4): the names are aspirational only. This CA mints the
+# host certificate with **all three server OIDs** and a guest client
+# certificate with **all three client OIDs** (see `_ensure_x509_host_cert` /
+# `_ensure_x509_client_cert`), so an OID check distinguishes the *server* from
+# the *client* role but does **not** isolate one service from another. In
+# particular, under `acl.mode = "ca"` any guest's client certificate is valid
+# for sudo-auth-proxy (and for the other tartarus services). Per-service
+# isolation is future work; the threat model documents this shared-identity
+# reality rather than the isolation the OID names suggest.
 OID_CLIPBOARD_SERVER = "1.3.6.1.4.1.99999.3.1"
 OID_CLIPBOARD_CLIENT = "1.3.6.1.4.1.99999.3.2"
 OID_SSHAGENT_SERVER = "1.3.6.1.4.1.99999.2.1"
@@ -132,25 +141,26 @@ def _ensure_ssh_ca(config: Config) -> Path:
     ca_pub = ssh_ca_pub(config)
     ca_key.parent.mkdir(parents=True, exist_ok=True)
 
-    if ca_key.exists():
-        return ca_key
-
-    info(f"Generating shared guest SSH CA key: {ca_key}")
-    _run(
-        [
-            "ssh-keygen",
-            "-t",
-            "ed25519",
-            "-f",
-            str(ca_key),
-            "-N",
-            "",
-            "-C",
-            SSH_CA_COMMENT,
-        ]
-    )
+    if not ca_key.exists():
+        info(f"Generating shared guest SSH CA key: {ca_key}")
+        _run(
+            [
+                "ssh-keygen",
+                "-t",
+                "ed25519",
+                "-f",
+                str(ca_key),
+                "-N",
+                "",
+                "-C",
+                SSH_CA_COMMENT,
+            ]
+        )
+        ca_pub.chmod(0o644)
+    # Re-apply the mode on *every* call, not only when generating: a private key
+    # that predates the fix (or was loosened) must be tightened on the next
+    # `ensure` (audit A11).
     ca_key.chmod(0o600)
-    ca_pub.chmod(0o644)
     return ca_key
 
 
@@ -224,7 +234,11 @@ def _ensure_x509_ca(config: Config) -> None:
     if not ca_key.exists():
         info("Generating X509 root CA...")
         _run(["openssl", "genrsa", "-out", str(ca_key), X509_RSA_BITS])
-        ca_key.chmod(0o600)
+
+    # Re-apply the mode on every call: a pre-existing 0644 CA key left by an
+    # older version must be remediated, not only newly generated keys (audit
+    # A11). This runs before the certificate step, which needs the key anyway.
+    ca_key.chmod(0o600)
 
     if not ca_crt.exists():
         info("Generating X509 root CA certificate...")
@@ -263,6 +277,10 @@ def _ensure_x509_host_cert(config: Config) -> None:
     host_crt = _x509_host_crt(config)
 
     if host_key.exists():
+        # The key already exists; still tighten it so an upgrade from a version
+        # that left it 0644 (or an operator loosening it) is remediated (audit
+        # A11). Nothing else to do: the certificate is left as-is.
+        host_key.chmod(0o600)
         return
 
     info("Generating host server certificate...")
@@ -329,9 +347,6 @@ def _ensure_x509_client_cert(config: Config, kind: str, name: str) -> None:
     if not client_key.exists():
         info(f"Generating client key for {name} ({kind})...")
         _run(["openssl", "genrsa", "-out", str(client_key), X509_LEAF_RSA_BITS])
-        # World-readable: exposed read-only to the guest, whose unprivileged
-        # user must read it (mTLS trusts the CA, not root<->user).
-        client_key.chmod(0o644)
 
         csr = guest_dir / "client.csr"
         _run(
@@ -382,6 +397,14 @@ def _ensure_x509_client_cert(config: Config, kind: str, name: str) -> None:
         info(f"Client cert generated for {name}: {client_crt}")
     else:
         info(f"Client cert already exists for {name}.")
+
+    # Private key: `0600`, never `0644` (doc §9.2; review log F12; audit A11).
+    # Applied unconditionally, not only when the key is newly generated, so a
+    # pre-existing 0644 key is remediated on the next ensure. This process runs
+    # as the invoking host user, and the guest uid equals the host uid, so the
+    # guest's own user can still read the key over the share while no other
+    # local user can. The matching *certificate* stays `0644` (it is public).
+    client_key.chmod(0o600)
 
     # Copy (not symlink) the CA cert into the machine directory: the directory
     # is the guest's filesystem root over 9p, so a symlink outside it cannot

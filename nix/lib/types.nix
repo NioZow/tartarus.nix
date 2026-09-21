@@ -54,6 +54,27 @@ in {
       sudoAuthProxy = mkEnableOption "the PAM sudo-auth-proxy client in the guest and server on the host (mTLS)";
       gpgAgentProxy = mkEnableOption "GPG agent forwarding over SSH: the guest's gpg-agent socket is RemoteForward-ed to the host's gpg-agent, and the guest sshd accepts the stream-local bind";
       disableVsock = mkEnableOption "forcing TCP instead of VSOCK for the guest/host services (no-op where VSOCK is unavailable)";
+      # Transport for the sudo-auth-proxy service specifically. This is the
+      # per-guest marker the host SSH wrapper and the host server transport
+      # selection read (audit A1); `services.sudoAuthProxyTransport` was
+      # referenced by `modules/programs/user/ssh.nix` but never defined, so the
+      # `unix` transport could not be requested through the module graph.
+      # `vsock`/`tcp` keep the platform's existing callback behaviour; `unix`
+      # selects the host→guest SSH-forwarded Unix socket and is served with
+      # transport_encryption = "none" + client_auth = "x509" (the guest's
+      # tartarus X.509 client cert), not mTLS.
+      sudoAuthProxyTransport = mkOption {
+        type = types.enum ["vsock" "tcp" "unix"];
+        default = "vsock";
+        description = ''
+          Transport the sudo-auth-proxy integration uses for this guest. `unix`
+          requests the SSH-forwarded host→guest Unix socket (no network port);
+          `vsock`/`tcp` keep the platform's normal callback transport. At most
+          one transport per host user is supported: the host server exposes a
+          single socket, so mixing `unix` with a callback transport across the
+          guests of one host is an evaluation error.
+        '';
+      };
     };
   };
 

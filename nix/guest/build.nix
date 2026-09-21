@@ -150,6 +150,11 @@
         clipboardBridge = false;
         sshAgentProxy = false;
         sudoAuthProxy = false;
+        # The per-guest sudo-auth-proxy transport marker (audit A1). Normalized
+        # here so a hand-written sample config that predates the option still
+        # resolves; a fully evaluated `tartarus.guests.<name>.services` already
+        # carries the option default.
+        sudoAuthProxyTransport = "vsock";
         gpgAgentProxy = false;
         disableVsock = false;
       }
