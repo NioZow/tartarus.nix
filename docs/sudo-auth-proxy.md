@@ -1844,6 +1844,63 @@ guarantee** for any third-party client, and a peer is not trusted merely because
 it speaks the wire format — trust comes from the credential it proves and the ACL
 (§5, §8). Any third-party client requires a design review against this document.
 
+### 14.7 Unauthenticated transports (`client_auth = "none"`)
+
+A new `client_auth = "none"` mode disables **requester authentication and
+authorization** for a transport that is private by construction (VSOCK, an SSH
+`RemoteForward` tunnel, a local Unix socket). It is deliberately awkward to
+enable and fails closed:
+
+- `client_auth = "none"` is rejected when `transport_encryption = "mtls"` (mTLS
+  already forces `client_auth = "transport"`) and emits a warning that any
+  process able to reach the socket may trigger a prompt.
+- The client sends `client_auth = {"method": "none"}` and proves nothing.
+- The server requires the matching `[acl] mode = "none"` (an explicit
+  allow-any); `mode = "none"` refuses to carry any trust material
+  (`trusted_keys`, `trusted_fingerprints`, `ca_file`, `required_oid`).
+- The Python enforces the **XOR** between the two knobs: `client_auth = "none"`
+  with a non-`none` ACL raises, and `acl.mode = "none"` with a non-`none`
+  `client_auth` raises. Disabling auth is therefore always a conscious choice on
+  both sides.
+
+The shipped tartarus guest/host default for the callback transport
+(`vsock`/`tcp`) is now `transport_encryption = "none"`, `client_auth = "none"`,
+`server_auth = "none"`, `[acl] mode = "none"`: the MicroVM channel is private by
+construction and runs with no crypto. `server_auth = "none"` was already
+supported and warns accordingly.
+
+### 14.8 SSH-agent requester signing (`client_auth = "ssh"`)
+
+With `client_auth = "ssh"` the requester may sign the canonical request through
+a running SSH agent instead of a private-key file. Under `[security]`:
+
+- `ssh_agent = true` selects agent signing (`ssh_signing_key` still wins when
+  both are set).
+- `ssh_agent_socket` overrides the agent path; otherwise `$SSH_AUTH_SOCK` is
+  used, and if neither is present the client refuses to start.
+- `ssh_key` (required in agent mode) is the OpenSSH **public** key naming the
+  identity to use; the agent identity is selected by that key's `SHA256:`
+  fingerprint, so a different loaded key can never be substituted.
+
+RSA identities are asked for `rsa-sha2-256`; an agent answering with the SHA-1
+`ssh-rsa` algorithm is refused. The private key never enters the client process.
+On the host-side PAM client the agent socket is reached through the
+`SSH_AUTH_SOCK` kept by `security.sudo.extraConfig` (see §15.1).
+
+### 14.9 A second server instance (`extraServer`)
+
+A host can run one additional, independent server alongside the legacy
+`server`. The home-manager option
+`tartarus.sudo-auth-proxy.extraServer` has its own `transport`, `security`,
+`acl`, `mtls`, settings and `name`; it runs as the unit
+`sudo-auth-proxy-<name>` with the config file
+`~/.config/sudo-auth-proxy/<name>.toml` (and its own runtime directory). This is
+what lets one host serve its tartarus guests on the callback transport **and** a
+remote host over the SSH-forwarded `unix` transport in a single home-manager
+configuration. (It is modelled as a plain nested option set, not an
+`attrsOf (submodule)`: reading the latter inside the same module graph forces
+the root config and recurses.)
+
 ---
 
 ## 15. Operations guide (setting it up)

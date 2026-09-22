@@ -3688,3 +3688,509 @@ def test_ca_reapplies_0600_to_preexisting_keys(tmp_path: Path) -> None:
 
     for key in keys:
         assert stat.S_IMODE(os.lstat(key).st_mode) == 0o600, key
+
+
+# --- client_auth = "none" / acl.mode = "none" -------------------------------
+#
+# Disabling requester authentication is an explicit two-knob decision: every
+# server must pair `client_auth = "none"` with `acl.mode = "none"` (and vice
+# versa). These tests pin the resolution, the warned fail-open behaviour, the
+# fixed sentinel identity, and every mismatch the XOR rejects.
+
+
+def _none_client_config() -> dict:
+    """A client that deliberately sends no requester credential."""
+    return {
+        "transport": "unix",
+        "security": {
+            "transport_encryption": "none",
+            "client_auth": "none",
+            "server_auth": "none",
+        },
+    }
+
+
+def _none_server_config() -> dict:
+    """A server that accepts unauthenticated requests through `acl.mode = "none"`."""
+    return {
+        "transport": "unix",
+        "security": {
+            "transport_encryption": "none",
+            "client_auth": "none",
+            "server_auth": "none",
+        },
+        "acl": {"mode": "none"},
+    }
+
+
+def test_client_auth_none_validate_accepts(sap: types.ModuleType) -> None:
+    resolved = sap.validate_security_config(_none_client_config())
+
+    assert resolved == {
+        "transport_encryption": "none",
+        "client_auth": "none",
+        "server_auth": "none",
+    }
+
+
+def test_client_auth_none_warns_loudly_on_tcp(
+    sap: types.ModuleType, capsys: pytest.CaptureFixture
+) -> None:
+    sap.validate_security_config(
+        {
+            "transport": "tcp",
+            "security": {
+                "transport_encryption": "none",
+                "client_auth": "none",
+                "server_auth": "signature",
+            },
+        }
+    )
+    err = capsys.readouterr().err
+
+    assert "client_auth = 'none'" in err
+    assert "does NOT authenticate" in err
+    assert "strongly discouraged on tcp" in err
+
+
+def test_client_auth_none_rejected_under_mtls(sap: types.ModuleType) -> None:
+    # mTLS already forces client_auth = "transport"; "none" must not be a way
+    # to opt out of the certificate that authenticates the channel.
+    with pytest.raises(sap.SecurityConfigError, match="client_auth = 'none'"):
+        sap.validate_security_config(
+            {
+                "transport": "tcp",
+                "security": {
+                    "transport_encryption": "mtls",
+                    "client_auth": "none",
+                    "server_auth": "transport",
+                },
+            }
+        )
+
+
+def test_client_auth_none_end_to_end(sap: types.ModuleType) -> None:
+    client = sap.build_security(_none_client_config(), "client")
+    request = _request_obj(sap)
+    sap.attach_client_auth(request, client)
+
+    assert request["client_auth"] == {"method": "none"}
+    assert client.client_signing_key is None
+
+    server = sap.build_security(_none_server_config(), "server")
+    verified = sap.authenticate_request(request, server)
+
+    assert verified == sap.NONE_IDENTITY == "none"
+    assert sap.authorize_request(request, server, verified) == "none"
+    # an unauthenticated ACL always "allows" (it is the explicit opt-in)
+    assert sap.acl_allows_any(server.acl) is True
+
+
+def test_build_security_none_requires_none_acl(sap: types.ModuleType) -> None:
+    config = _none_server_config()
+    config["acl"] = {"mode": "list", "trusted_keys": [_UNLISTED_FINGERPRINT]}
+
+    with pytest.raises(sap.SecurityConfigError, match="requires acl.mode = 'none'"):
+        sap.build_security(config, "server")
+
+
+def test_build_security_none_acl_requires_none_client_auth(
+    sap: types.ModuleType, keymaterial: Any
+) -> None:
+    # The mirror image: an unauthenticated ACL may not be paired with a
+    # credential the server would otherwise authenticate.
+    config = {
+        "transport": "unix",
+        "security": _server_security(keymaterial),
+        "acl": {"mode": "none"},
+    }
+
+    with pytest.raises(sap.SecurityConfigError, match="requires client_auth = 'none'"):
+        sap.build_security(config, "server")
+
+
+def test_load_acl_none_rejects_trust_material(sap: types.ModuleType) -> None:
+    with pytest.raises(sap.SecurityConfigError, match="must not set trusted_keys"):
+        sap.load_acl_config(
+            {"acl": {"mode": "none", "trusted_keys": [_UNLISTED_FINGERPRINT]}}
+        )
+
+
+def test_authorize_none_requires_none_acl(sap: types.ModuleType) -> None:
+    # A hand-built (or mutated) config that pairs "none" auth with a list ACL
+    # must still refuse rather than treat the sentinel as a listed fingerprint.
+    server = sap.build_security(_none_server_config(), "server")
+    server.acl = sap.AclConfig(mode="list")
+    request = _request_obj(sap)
+    sap.attach_client_auth(
+        request, sap.build_security(_none_client_config(), "client")
+    )
+
+    with pytest.raises(sap.AuthError, match="requires acl.mode = 'none'"):
+        sap.authorize_request(request, server, sap.NONE_IDENTITY)
+
+
+def test_authorize_none_acl_requires_none_client_auth(sap: types.ModuleType) -> None:
+    server = sap.build_security(_none_server_config(), "server")
+    server.client_auth = "ssh"
+
+    with pytest.raises(sap.AuthError, match="requires client_auth = 'none'"):
+        sap.authorize_request(_request_obj(sap), server, sap.NONE_IDENTITY)
+
+
+# --- client_auth = "ssh" signed through the SSH agent -----------------------
+#
+# A minimal in-test agent speaks the length-prefixed protocol over a temporary
+# Unix socket and signs with a real `cryptography` key. The wire constants are
+# spelled out locally (not read from the module under test) so the test checks
+# the protocol independently. `ssh_agent`/`ssh_agent_socket`/`ssh_key` are the
+# new `[security]` keys; no private key file is ever read by the client.
+
+# SSH agent protocol (draft-miller-ssh-agent)
+_AGENT_FAILURE = 5
+_AGENTC_REQUEST_IDENTITIES = 11
+_AGENT_IDENTITIES_ANSWER = 12
+_AGENTC_SIGN_REQUEST = 13
+_AGENT_SIGN_RESPONSE = 14
+_AGENT_RSA_SHA2_256 = 2
+
+
+class _FakeSshAgent:
+    """A minimal SSH agent over AF_UNIX for the client's agent-signing path.
+
+    ``identities`` maps an SSH wire key blob to its private key. ``fail`` makes
+    every request answer ``SSH_AGENT_FAILURE`` so the fail-closed path is
+    exercised; ``omit`` returns an empty identity list so the configured key
+    cannot be found. Each request is one connection, matching the client.
+    """
+
+    def __init__(
+        self,
+        socket_path: Path,
+        identities: dict,
+        *,
+        fail: bool = False,
+        omit: bool = False,
+    ) -> None:
+        self.socket_path = Path(socket_path)
+        self.identities = identities
+        self.fail = fail
+        self.omit = omit
+        self.sign_flags: Any = None
+        self._stop = threading.Event()
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._listener.bind(str(self.socket_path))
+        self._listener.listen(4)
+        self._listener.settimeout(0.2)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def __enter__(self) -> "_FakeSshAgent":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        self._listener.close()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with connection:
+                try:
+                    self._handle(connection)
+                except (OSError, KeyError, ValueError):
+                    pass
+
+    @staticmethod
+    def _read_exact(connection: Any, count: int) -> bytes:
+        buffer = bytearray()
+        while len(buffer) < count:
+            chunk = connection.recv(count - len(buffer))
+            if not chunk:
+                raise ValueError("client closed early")
+            buffer += chunk
+        return bytes(buffer)
+
+    @classmethod
+    def _read_string(cls, payload: bytes, offset: int):
+        (length,) = struct.unpack(">I", payload[offset : offset + 4])
+        offset += 4
+        return payload[offset : offset + length], offset + length
+
+    @staticmethod
+    def _string(data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + data
+
+    def _send(self, connection: Any, payload: bytes) -> None:
+        connection.sendall(struct.pack(">I", len(payload)) + payload)
+
+    def _handle(self, connection: Any) -> None:
+        (length,) = struct.unpack(">I", self._read_exact(connection, 4))
+        payload = self._read_exact(connection, length)
+        if self.fail:
+            self._send(connection, bytes([_AGENT_FAILURE]))
+            return
+        kind = payload[0]
+        if kind == _AGENTC_REQUEST_IDENTITIES:
+            blobs = [] if self.omit else list(self.identities)
+            body = bytes([_AGENT_IDENTITIES_ANSWER]) + struct.pack(">I", len(blobs))
+            body += b"".join(self._string(blob) + self._string(b"test") for blob in blobs)
+            self._send(connection, body)
+        elif kind == _AGENTC_SIGN_REQUEST:
+            key_blob, offset = self._read_string(payload, 1)
+            data, offset = self._read_string(payload, offset)
+            (self.sign_flags,) = struct.unpack(">I", payload[offset : offset + 4])
+            signature_blob = self._sign(self.identities[key_blob], data, self.sign_flags)
+            self._send(
+                connection,
+                bytes([_AGENT_SIGN_RESPONSE]) + self._string(signature_blob),
+            )
+        else:
+            self._send(connection, bytes([_AGENT_FAILURE]))
+
+    @staticmethod
+    def _sign(private_key: Any, data: bytes, flags: int) -> bytes:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
+
+        if isinstance(private_key, ed25519.Ed25519PrivateKey):
+            return _FakeSshAgent._string(b"ssh-ed25519") + _FakeSshAgent._string(
+                private_key.sign(data)
+            )
+        if isinstance(private_key, rsa.RSAPrivateKey):
+            # the client must request SHA-256 through the agent flag
+            assert flags == _AGENT_RSA_SHA2_256, flags
+            signature = private_key.sign(data, padding.PKCS1v15(), hashes.SHA256())
+            return _FakeSshAgent._string(b"rsa-sha2-256") + _FakeSshAgent._string(
+                signature
+            )
+        raise ValueError("unsupported test key")
+
+
+def _agent_client_config(socket_path: Path, ssh_key: str, **overrides: Any) -> dict:
+    """A client `[security]` block signing `ssh` through the agent at `socket_path`."""
+    security: dict[str, Any] = {
+        "transport_encryption": "none",
+        "client_auth": "ssh",
+        "server_auth": "none",
+        "ssh_agent": True,
+        "ssh_agent_socket": str(socket_path),
+        "ssh_key": ssh_key,
+    }
+    security.update(overrides)
+    return {"transport": "unix", "security": security}
+
+
+def _assert_agent_block_verifies(
+    sap: types.ModuleType, request: dict, public_key: Any, *, key_id: str
+) -> None:
+    """Verify an agent-signed block exactly like the server does."""
+    block = request["client_auth"]
+    assert block["method"] == "ssh"
+    assert block["key_id"] == key_id
+    assert block["public_key"] == base64.b64encode(
+        sap.ssh_public_blob(public_key)
+    ).decode()
+    sap.verify_bytes(
+        public_key,
+        block["alg"],
+        sap.signing_payload(request, "client_auth"),
+        base64.b64decode(block["signature"]),
+    )
+
+
+def test_ssh_agent_ed25519_signs_and_verifies(
+    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path, keymaterial: Any
+) -> None:
+    private_key = sap.load_private_key_file(keymaterial.client_private)
+    blob = sap.ssh_public_blob(private_key.public_key())
+    key_id = sap.ssh_fingerprint(private_key.public_key())
+    socket_path = tmp_path / "agent.sock"
+
+    with _FakeSshAgent(socket_path, {blob: private_key}) as agent:
+        client = sap.build_security(
+            _agent_client_config(socket_path, keymaterial.client_public), "client"
+        )
+        assert client.client_signing_key is None
+        assert client.client_signing_agent_socket == str(socket_path)
+        request = _request_obj(sap)
+        sap.attach_client_auth(request, client)
+
+    assert request["client_auth"]["alg"] == "ssh-ed25519"
+    _assert_agent_block_verifies(sap, request, private_key.public_key(), key_id=key_id)
+    assert agent.sign_flags == 0
+
+    # the server verifies and authorizes the agent-signed request unchanged
+    server = sap.build_security(
+        {
+            "transport": "unix",
+            "security": {
+                "transport_encryption": "none",
+                "client_auth": "ssh",
+                "server_auth": "none",
+                "trusted_keys": [keymaterial.client_public],
+            },
+            "acl": {"mode": "list", "trusted_keys": [key_id]},
+        },
+        "server",
+    )
+    assert sap.authenticate_request(request, server) == key_id
+    assert sap.authorize_request(request, server, key_id) == key_id
+
+
+def test_ssh_agent_rsa_requests_sha256(
+    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path
+) -> None:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_line = private_key.public_key().public_bytes(
+        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
+    ).decode()
+    blob = sap.ssh_public_blob(private_key.public_key())
+    key_id = sap.ssh_fingerprint(private_key.public_key())
+    socket_path = tmp_path / "agent.sock"
+
+    with _FakeSshAgent(socket_path, {blob: private_key}) as agent:
+        client = sap.build_security(
+            _agent_client_config(socket_path, public_line), "client"
+        )
+        request = _request_obj(sap)
+        sap.attach_client_auth(request, client)
+
+    assert request["client_auth"]["alg"] == "rsa-sha2-256"
+    assert agent.sign_flags == _AGENT_RSA_SHA2_256
+    _assert_agent_block_verifies(sap, request, private_key.public_key(), key_id=key_id)
+
+
+def test_ssh_agent_uses_ssh_auth_sock_default(
+    sap: types.ModuleType,
+    crypto: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    private_key = ed25519.Ed25519PrivateKey.generate()
+    public_line = private_key.public_key().public_bytes(
+        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
+    ).decode()
+    socket_path = tmp_path / "agent.sock"
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(socket_path))
+
+    with _FakeSshAgent(socket_path, {sap.ssh_public_blob(private_key.public_key()): private_key}):
+        client = sap.build_security(
+            _agent_client_config(socket_path, public_line, ssh_agent_socket=None),
+            "client",
+        )
+
+    # `ssh_agent = true` with no explicit socket falls back to $SSH_AUTH_SOCK.
+    assert client.client_signing_agent_socket == str(socket_path)
+
+
+def test_ssh_agent_missing_key_in_agent_fails_closed(
+    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path, keymaterial: Any
+) -> None:
+    other = sap.load_private_key_file(keymaterial.server_private)
+    socket_path = tmp_path / "agent.sock"
+
+    with _FakeSshAgent(
+        socket_path, {sap.ssh_public_blob(other.public_key()): other}
+    ):
+        client = sap.build_security(
+            _agent_client_config(socket_path, keymaterial.client_public), "client"
+        )
+        request = _request_obj(sap)
+
+        with pytest.raises(sap.AuthError, match="does not hold the configured key"):
+            sap.attach_client_auth(request, client)
+
+
+def test_ssh_agent_unset_socket_fails_closed(
+    sap: types.ModuleType,
+    crypto: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    keymaterial: Any,
+) -> None:
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    config = _agent_client_config(Path("/nonexistent/agent.sock"), keymaterial.client_public)
+    del config["security"]["ssh_agent_socket"]
+
+    with pytest.raises(sap.SecurityConfigError, match="SSH_AUTH_SOCK"):
+        sap.build_security(config, "client")
+
+
+def test_ssh_agent_unreachable_socket_fails_closed(
+    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path, keymaterial: Any
+) -> None:
+    # A configured socket that does not exist is a runtime failure at signing
+    # time (build_security only records the path), and must fail closed.
+    client = sap.build_security(
+        _agent_client_config(tmp_path / "missing.sock", keymaterial.client_public),
+        "client",
+    )
+    request = _request_obj(sap)
+
+    with pytest.raises(sap.AuthError, match="cannot talk to the SSH agent"):
+        sap.attach_client_auth(request, client)
+
+
+def test_ssh_agent_failure_response_fails_closed(
+    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path, keymaterial: Any
+) -> None:
+    private_key = sap.load_private_key_file(keymaterial.client_private)
+    socket_path = tmp_path / "agent.sock"
+
+    with _FakeSshAgent(
+        socket_path, {sap.ssh_public_blob(private_key.public_key()): private_key}, fail=True
+    ):
+        client = sap.build_security(
+            _agent_client_config(socket_path, keymaterial.client_public), "client"
+        )
+        request = _request_obj(sap)
+
+        with pytest.raises(sap.AuthError, match="refused to list"):
+            sap.attach_client_auth(request, client)
+
+
+def test_ssh_agent_requires_ssh_key(sap: types.ModuleType, tmp_path: Path) -> None:
+    config = _agent_client_config(tmp_path / "agent.sock", "")
+    del config["security"]["ssh_key"]
+
+    with pytest.raises(sap.SecurityConfigError, match="ssh_key"):
+        sap.build_security(config, "client")
+
+
+def test_load_config_resolves_ssh_agent_paths(sap: types.ModuleType, tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        '[security]\nssh_key = "keys/id.pub"\nssh_agent_socket = "run/agent.sock"\n'
+    )
+
+    loaded = sap.load_config(str(config_path))
+
+    assert loaded["security"]["ssh_key"] == str(tmp_path / "keys" / "id.pub")
+    assert loaded["security"]["ssh_agent_socket"] == str(tmp_path / "run" / "agent.sock")
+
+
+def test_load_config_leaves_inline_ssh_key_untouched(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    inline = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexampleexampleexampleexample comment"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f'[security]\nssh_key = "{inline}"\n')
+
+    loaded = sap.load_config(str(config_path))
+
+    assert loaded["security"]["ssh_key"] == inline

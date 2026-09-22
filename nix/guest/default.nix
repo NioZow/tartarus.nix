@@ -24,7 +24,6 @@
     mkIf
     mkMerge
     optional
-    optionalAttrs
     ;
   g = tartarusGuest;
   p = g.platform;
@@ -111,19 +110,28 @@ in {
         # tartarus X.509 client certificate (x509), and the host signs its
         # response (signature) with the key the guest trusts from
         # `trustedServerKeys`. Do NOT force mTLS here.
-        security = optionalAttrs sapUnix {
-          transportEncryption = "none";
-          serverAuth = "signature";
-          clientAuth = "x509";
-          clientCert = "${x509}/client.crt";
-          clientKey = "${x509}/client.key";
-          trustedServerKeys = sapTrustedServerKeys;
-        };
-        # vsock/tcp keep the existing mTLS behaviour (all three client OIDs on
-        # the shared tartarus client cert; doc §7.6).
-        mtls = optionalAttrs (!sapUnix) (
-          clientMtls "1.3.6.1.4.1.99999.1.2" "1.3.6.1.4.1.99999.1.1"
-        );
+        #
+        # Callback transports (vsock/tcp): the tartarus-internal channel is
+        # private by construction, so use it unencrypted and unauthenticated --
+        # stated explicitly on all three knobs. The Python warns about `none`,
+        # and fail-closed only accepts `client_auth = "none"` when the host's
+        # server pairs it with `acl.mode = "none"`. No mTLS, no message
+        # signatures, no X.509 material.
+        security =
+          if sapUnix
+          then {
+            transportEncryption = "none";
+            serverAuth = "signature";
+            clientAuth = "x509";
+            clientCert = "${x509}/client.crt";
+            clientKey = "${x509}/client.key";
+            trustedServerKeys = sapTrustedServerKeys;
+          }
+          else {
+            transportEncryption = "none";
+            serverAuth = "none";
+            clientAuth = "none";
+          };
       };
     })
 

@@ -126,23 +126,51 @@ DOMAIN_LABEL = b"tartarus/sudo-auth-proxy/v1"
 
 # The three explicit security knobs (doc §7.2-§7.5; review log S13). Exactly one
 # value each; `transport_encryption = "mtls"` forces both auths to "transport"
-# and no message signatures are layered on top.
+# and no message signatures are layered on top. `"none"` disables requester
+# authentication entirely and is only meaningful paired with `acl.mode = "none"`
+# (see `build_security`/`validate_security_config`): it exists so a fully
+# unauthenticated deployment is an explicit, warned, conscious choice instead of
+# an accident.
 TRANSPORT_ENCRYPTIONS = ("none", "mtls")
-CLIENT_AUTH_METHODS = ("ssh", "x509", "transport")
+CLIENT_AUTH_METHODS = ("ssh", "x509", "transport", "none")
 SERVER_AUTH_METHODS = ("signature", "transport", "none")
 
 # Authorization (`[acl]`) modes (doc §8.1; redesign Phase 4). Exactly one mode:
 # `"list"` pins credential fingerprints; `"ca"` accepts any credential that
 # chains to a configured CA and carries the service EKU. There is deliberately
 # no `ca`+`list` combination and no wildcard: an empty trust list denies all
-# (doc §8.3).
-ACL_MODES = ("list", "ca")
+# (doc §8.3). `"none"` authorizes every request because there is no credential
+# to authorize; it is rejected unless `client_auth = "none"` (XOR).
+ACL_MODES = ("list", "ca", "none")
+
+# The fixed identity returned by `authenticate_request` when requester
+# authentication is deliberately disabled (`client_auth = "none"`). It is a
+# non-credential sentinel: it names "no authenticated requester" and can never
+# collide with a real `SHA256:` fingerprint or an X.509/mTLS SPKI.
+NONE_IDENTITY = "none"
 
 # Signature algorithm allow-lists (doc §7.7, review log NF1). SSH covers
 # Ed25519 and RSA with SHA-256/512 (never SHA-1 `ssh-rsa`); X.509 uses the plain
 # algorithm names. An unknown or absent `alg` is rejected, never guessed.
 SSH_SIGNATURE_ALGS = ("ssh-ed25519", "rsa-sha2-256", "rsa-sha2-512")
 X509_SIGNATURE_ALGS = ("ed25519", "rsa-sha2-256", "rsa-sha2-512")
+
+# SSH agent protocol (draft-miller-ssh-agent; doc §7.9). Used only when
+# `client_auth = "ssh"` signs through the running agent rather than a key file:
+# `ssh_agent = true` with `ssh_key` selecting the loaded identity. The client
+# opens a short-lived AF_UNIX connection per request, lists identities to find
+# the configured fingerprint, then asks the agent to sign the domain-separated
+# transcript. The response cap bounds a hostile/broken agent (it may not force
+# an unbounded allocation) and the timeout bounds a hung one.
+SSH_AGENT_FAILURE = 5
+SSH_AGENTC_REQUEST_IDENTITIES = 11
+SSH_AGENT_IDENTITIES_ANSWER = 12
+SSH_AGENTC_SIGN_REQUEST = 13
+SSH_AGENT_SIGN_RESPONSE = 14
+SSH_AGENT_RSA_SHA2_256 = 2
+SSH_AGENT_RSA_SHA2_512 = 4
+SSH_AGENT_MAX_RESPONSE = 1024 * 1024
+SSH_AGENT_TIMEOUT = 5.0
 
 # Response freshness (doc §6.6). A response is valid from `issued_at` to
 # `expires_at`, with a small clock-skew allowance in both directions. The
@@ -564,6 +592,7 @@ def load_config(path: str) -> dict:
     if isinstance(security, dict):
         for key in (
             "ssh_signing_key",
+            "ssh_agent_socket",
             "server_signing_key",
             "client_cert",
             "client_key",
@@ -571,6 +600,14 @@ def load_config(path: str) -> dict:
         ):
             if security.get(key):
                 security[key] = resolve(security[key])
+        # `ssh_key` may be an inline OpenSSH public-key line; like a keyring
+        # entry, a value containing a space is left untouched and only a bare
+        # path is resolved. `ssh_agent_socket` is resolved above like any other
+        # path; `$SSH_AUTH_SOCK` is an environment-variable *name*, never
+        # expanded here (the default comes from the environment at build time).
+        ssh_key = security.get("ssh_key")
+        if isinstance(ssh_key, str) and ssh_key and " " not in ssh_key:
+            security["ssh_key"] = resolve(ssh_key)
         for key in ("trusted_keys", "trusted_server_keys"):
             entries = security.get(key)
             if isinstance(entries, list):
@@ -654,6 +691,14 @@ class SecurityConfig:
     # resolved x509 request material (client)
     client_cert_b64: Optional[str] = None
     client_key_id: Optional[str] = None
+    # resolved ssh-agent signing material (client): the agent socket, the
+    # selected identity's SSH wire blob (sent as `public_key`), its `SHA256:`
+    # fingerprint (`client_signing_agent_key_id`, also used to pick the identity
+    # out of the agent) and the signing algorithm (shared `client_signing_alg`).
+    # `client_signing_key` stays None in this mode.
+    client_signing_agent_socket: Optional[str] = None
+    client_signing_agent_key_blob: Optional[bytes] = None
+    client_signing_agent_key_id: Optional[str] = None
 
 
 def validate_security_config(config: dict) -> dict:
@@ -667,7 +712,10 @@ def validate_security_config(config: dict) -> dict:
     - Under `mtls`, **both** `client_auth` and `server_auth` are `"transport"`;
       anything else (including an SSH/ssh-agent signature) is rejected.
     - `client_auth = "transport"` / `server_auth = "transport"` require mTLS.
-    - `client_auth` is exactly one of `ssh`/`x509`/`transport` (never both).
+    - `client_auth` is exactly one of `ssh`/`x509`/`transport`/`none` (never
+      both). `"none"` disables requester authentication, is rejected under
+      `mtls`, and is warned about loudly; pairing it with `acl.mode = "none"` is
+      enforced by `build_security`.
     - `tcp` + `"none"` is permitted but warned as insecure; `server_auth =
       "none"` is permitted but warned as not recommended.
 
@@ -727,6 +775,11 @@ def validate_security_config(config: dict) -> dict:
         raise SecurityConfigError(f"unknown server_auth {server_auth!r}")
 
     if transport_encryption == "mtls":
+        if client_auth == "none":
+            raise SecurityConfigError(
+                "client_auth = 'none' cannot be combined with "
+                "transport_encryption = 'mtls' (mTLS forces client_auth = 'transport')"
+            )
         if client_auth != "transport":
             raise SecurityConfigError(
                 "under transport_encryption = 'mtls', client_auth must be "
@@ -755,6 +808,14 @@ def validate_security_config(config: dict) -> dict:
         print(
             f"sudo-auth-proxy: WARNING: server_auth = 'none' is not recommended{extra}; "
             "the client cannot tell a genuine response from an injected one",
+            file=sys.stderr,
+        )
+    if client_auth == "none":
+        extra = " and is strongly discouraged on tcp" if transport == "tcp" else ""
+        print(
+            f"sudo-auth-proxy: WARNING: client_auth = 'none' does NOT authenticate "
+            f"the requester{extra}; any process that can reach the socket may trigger "
+            "a prompt",
             file=sys.stderr,
         )
 
@@ -809,9 +870,12 @@ def load_acl_config(config: dict) -> AclConfig:
 
     Fail-closed defaults: no `[acl]` table at all is a valid deny-all `"list"`
     policy, so a server never starts open by accident. `mode` is exactly one of
-    `"list"`/`"ca"`; mixing the two (a `"ca"` mode with `trusted_keys`, or a
-    `"list"` mode with `ca_file`/`required_oid`) is rejected rather than
-    guessed. In `"ca"` mode the CA must be readable at load time.
+    `"list"`/`"ca"`/`"none"`; mixing the modes (a `"ca"` mode with
+    `trusted_keys`, a `"list"` mode with `ca_file`/`required_oid`, or a `"none"`
+    mode with any trust material) is rejected rather than guessed. `"none"` is
+    only reachable because `client_auth = "none"` needs an explicit ACL that
+    deliberately authorizes unauthenticated requests (`build_security` enforces
+    the pairing). In `"ca"` mode the CA must be readable at load time.
     """
     raw = config.get("acl")
     if raw is None:
@@ -831,6 +895,28 @@ def load_acl_config(config: dict) -> AclConfig:
     )
     ca_file = raw.get("ca_file")
     required_oid = raw.get("required_oid")
+
+    if mode == "none":
+        # There is no credential to authorize, so any trust material is a
+        # contradiction (and almost certainly a copy-paste mistake): reject it
+        # rather than silently ignore a pin the operator believes is enforced.
+        forbidden = [
+            name
+            for name, present in (
+                ("trusted_keys", bool(trusted_keys)),
+                ("trusted_fingerprints", bool(trusted_fingerprints)),
+                ("ca_file", bool(ca_file)),
+                ("required_oid", bool(required_oid)),
+            )
+            if present
+        ]
+        if forbidden:
+            raise SecurityConfigError(
+                "acl.mode = 'none' must not set "
+                + ", ".join(forbidden)
+                + " (there is no credential to authorize)"
+            )
+        return AclConfig(mode="none")
 
     raw_labels = raw.get("labels") or {}
     if not isinstance(raw_labels, dict) or any(
@@ -878,6 +964,10 @@ def acl_allows_any(acl: Optional[AclConfig]) -> bool:
     """
     if acl is None:
         return False
+    if acl.mode == "none":
+        # An unauthenticated ACL authorizes every request: there is no
+        # credential to match, so it never reaches the deny-all default.
+        return True
     if acl.mode == "ca":
         return bool(acl.ca_file and acl.required_oid)
     return bool(acl.trusted_keys or acl.trusted_fingerprints)
@@ -899,10 +989,34 @@ def authorize_request(
     never inspected, so no self-reported value can influence the decision
     (review log S11). Returns the display label when one is configured, else
     the verified fingerprint; raises `AuthError` (fail closed) otherwise.
+
+    `acl.mode = "none"` is the one mode that inspects no credential at all: it
+    authorizes every request because `client_auth = "none"` leaves nothing to
+    verify. It is accepted only when the configured `client_auth` is also
+    `"none"`, so an unauthenticated ACL can never be paired with a credential
+    the rest of the server would authenticate.
     """
     acl = security.acl
     if acl is None:
         raise AuthError("no [acl] authorization policy is configured")
+
+    if security.client_auth == "none":
+        # Unauthenticated mode: there is no credential to inspect. The pairing
+        # with `acl.mode = "none"` is enforced by `build_security`; a caller
+        # that assembles the config by hand still fails closed here.
+        if acl.mode != "none":
+            raise AuthError(
+                "client_auth = 'none' requires acl.mode = 'none' "
+                "(an unauthenticated request has no credential to authorize)"
+            )
+        return acl.labels.get(verified_identity, verified_identity)
+    if acl.mode == "none":
+        # The mirror image: an unauthenticated ACL may never be attached to a
+        # credential the rest of the server would authenticate.
+        raise AuthError(
+            "acl.mode = 'none' requires client_auth = 'none' "
+            "(an unauthenticated ACL cannot authorize a credential)"
+        )
 
     block = request.get("client_auth")
     method = block.get("method") if isinstance(block, dict) else None
@@ -992,12 +1106,60 @@ def _load_ssh_keyring(entries) -> dict:
     return keyring
 
 
+def _load_agent_public_key(entry: str) -> tuple:
+    """Load the single OpenSSH public key selected by `[security] ssh_key`.
+
+    `ssh_key` names the agent identity the client must use. The shared keyring
+    parser is reused (so `~` and inline OpenSSH lines work like elsewhere), but
+    unlike a keyring this must resolve to **exactly one** key: a directory or a
+    multi-key file is ambiguous and rejected rather than guessed.
+    """
+    if isinstance(entry, str) and " " not in entry and Path(entry).is_dir():
+        raise SecurityConfigError(
+            f"[security] ssh_key must name one public key, not the directory {entry!r}"
+        )
+    lines = list(_keyring_lines(entry))
+    if not lines:
+        raise SecurityConfigError(f"[security] ssh_key {entry!r} contains no public key")
+    if len(lines) > 1:
+        raise SecurityConfigError(
+            f"[security] ssh_key {entry!r} must name exactly one public key"
+        )
+    return parse_openssh_public_key(lines[0])
+
+
+def _resolve_ssh_agent_socket(raw: dict) -> str:
+    """Resolve the AF_UNIX path of the SSH agent (doc §7.9).
+
+    Precedence is the explicit `[security] ssh_agent_socket`, then the
+    `SSH_AUTH_SOCK` environment variable (the agent's own default). Missing both
+    is a fatal configuration error: silently signing nothing would leave the
+    request unauthenticated, which is never acceptable for `ssh`.
+    """
+    configured = raw.get("ssh_agent_socket")
+    if configured is not None and not isinstance(configured, str):
+        raise SecurityConfigError("[security] ssh_agent_socket must be a string path")
+    if configured:
+        return configured
+    env_socket = os.environ.get("SSH_AUTH_SOCK")
+    if env_socket:
+        return env_socket
+    raise SecurityConfigError(
+        "ssh_agent = true requires [security] ssh_agent_socket or the "
+        "SSH_AUTH_SOCK environment variable"
+    )
+
+
 def build_security(config: dict, role: str) -> SecurityConfig:
     """Validate the config and load the keys needed for `role` (`client`/`server`).
 
     Loaded lazily per process and cached on the config dict. A missing or
     unreadable key is a fatal configuration error, never a "run unauthenticated"
-    path: the caller turns `SecurityConfigError` into a non-zero exit.
+    path: the caller turns `SecurityConfigError` into a non-zero exit. The one
+    exception is the explicit `client_auth = "none"` / `acl.mode = "none"`
+    pairing, which the server refuses unless *both* knobs agree. For a client
+    `client_auth = "ssh"` may sign through the SSH agent (doc §7.9) instead of a
+    private key file; only the selected public key is read.
     """
     cached = config.get("_security")
     if isinstance(cached, SecurityConfig):
@@ -1019,6 +1181,21 @@ def build_security(config: dict, role: str) -> SecurityConfig:
         # to deny-all `"list"`; the authentication code below only proves the
         # credential, it never decides who may use the mechanism.
         security.acl = load_acl_config(config)
+        # Disabling requester authentication must be an explicit, conscious
+        # choice on *both* knobs: `client_auth = "none"` is meaningless (and
+        # dangerous) without an ACL that deliberately authorizes it, and an
+        # unauthenticated ACL must never be attached to an authenticated
+        # credential. Require exactly one of the two, i.e. their XOR.
+        if security.client_auth == "none" and security.acl.mode != "none":
+            raise SecurityConfigError(
+                "client_auth = 'none' requires acl.mode = 'none' "
+                "(unauthenticated requests need an explicit unauthenticated ACL)"
+            )
+        if security.acl.mode == "none" and security.client_auth != "none":
+            raise SecurityConfigError(
+                "acl.mode = 'none' requires client_auth = 'none' "
+                "(an unauthenticated ACL cannot authorize a credential)"
+            )
         if security.acl.mode == "ca" and security.client_auth == "ssh":
             raise SecurityConfigError(
                 "acl.mode = 'ca' cannot authorize client_auth = 'ssh' "
@@ -1048,12 +1225,39 @@ def build_security(config: dict, role: str) -> SecurityConfig:
     else:
         if security.client_auth == "ssh":
             path = raw.get("ssh_signing_key")
-            if not path:
+            ssh_agent = raw.get("ssh_agent", False)
+            if not isinstance(ssh_agent, bool):
+                raise SecurityConfigError("[security] ssh_agent must be a boolean")
+            agent_socket_configured = raw.get("ssh_agent_socket")
+            if path:
+                # File-based signing (unchanged): an explicit key file wins.
+                security.client_signing_key = load_private_key_file(path)
+                security.client_signing_alg = alg_for_key(security.client_signing_key, ssh=True)
+            elif ssh_agent or agent_socket_configured:
+                # ssh-agent signing (doc §7.9): no private key material touches
+                # the client. Resolve the agent and the *public* key naming the
+                # identity; the agent produces the signature at send time
+                # (`attach_client_auth`), which also discovers the identity and
+                # fails closed if it is not loaded.
+                security.client_signing_agent_socket = _resolve_ssh_agent_socket(raw)
+                key_entry = raw.get("ssh_key")
+                if not key_entry:
+                    raise SecurityConfigError(
+                        "client_auth = 'ssh' with ssh_agent = true requires "
+                        "[security] ssh_key (an OpenSSH public-key file or inline "
+                        "line selecting the agent identity)"
+                    )
+                if not isinstance(key_entry, str):
+                    raise SecurityConfigError("[security] ssh_key must be a string")
+                agent_public_key, agent_key_id = _load_agent_public_key(key_entry)
+                security.client_signing_agent_key_blob = ssh_public_blob(agent_public_key)
+                security.client_signing_agent_key_id = agent_key_id
+                security.client_signing_alg = alg_for_key(agent_public_key, ssh=True)
+            else:
                 raise SecurityConfigError(
-                    "client_auth = 'ssh' requires [security] ssh_signing_key"
+                    "client_auth = 'ssh' requires [security] ssh_signing_key, or "
+                    "ssh_agent = true with ssh_key"
                 )
-            security.client_signing_key = load_private_key_file(path)
-            security.client_signing_alg = alg_for_key(security.client_signing_key, ssh=True)
         elif security.client_auth == "x509":
             cert_path = raw.get("client_cert")
             key_path = raw.get("client_key")
@@ -1102,18 +1306,35 @@ def attach_client_auth(request: dict, security: SecurityConfig) -> dict:
     the fingerprint and verify the signature with the presented key (§8.2). The
     key material is inside the signed transcript, so it cannot be swapped for
     another key after signing.
+
+    With `ssh_agent` (doc §7.9) the same block is built from the configured
+    public key, but the signature is produced by the running agent over the
+    identical `signing_payload` transcript; the private key never enters this
+    process. Under `client_auth = "none"` the block is just `{"method": "none"}`
+    and no credential is carried.
     """
     method = security.client_auth
     if method == "transport":
         request["client_auth"] = {"method": "transport"}
         return request
+    if method == "none":
+        request["client_auth"] = {"method": "none"}
+        return request
     if method == "ssh":
-        block = {
-            "method": "ssh",
-            "alg": security.client_signing_alg,
-            "key_id": ssh_fingerprint(security.client_signing_key.public_key()),
-            "public_key": _b64e(ssh_public_blob(security.client_signing_key.public_key())),
-        }
+        if security.client_signing_agent_socket:
+            block = {
+                "method": "ssh",
+                "alg": security.client_signing_alg,
+                "key_id": security.client_signing_agent_key_id,
+                "public_key": _b64e(security.client_signing_agent_key_blob),
+            }
+        else:
+            block = {
+                "method": "ssh",
+                "alg": security.client_signing_alg,
+                "key_id": ssh_fingerprint(security.client_signing_key.public_key()),
+                "public_key": _b64e(ssh_public_blob(security.client_signing_key.public_key())),
+            }
     elif method == "x509":
         block = {
             "method": "x509",
@@ -1124,9 +1345,23 @@ def attach_client_auth(request: dict, security: SecurityConfig) -> dict:
     else:  # pragma: no cover - validate_security_config guarantees the enum
         raise AuthError(f"unknown client_auth method {method!r}")
     request["client_auth"] = block
-    block["signature"] = _b64e(
-        sign_bytes(security.client_signing_key, block["alg"], signing_payload(request, "client_auth"))
-    )
+    payload = signing_payload(request, "client_auth")
+    if method == "ssh" and security.client_signing_agent_socket:
+        agent_alg, signature = ssh_agent_sign(
+            security.client_signing_agent_socket,
+            security.client_signing_agent_key_id,
+            block["alg"],
+            payload,
+        )
+        if agent_alg != block["alg"]:
+            raise AuthError(
+                f"the SSH agent signed with {agent_alg!r}, expected {block['alg']!r}"
+            )
+        block["signature"] = _b64e(signature)
+    else:
+        block["signature"] = _b64e(
+            sign_bytes(security.client_signing_key, block["alg"], payload)
+        )
     return request
 
 
@@ -1173,7 +1408,10 @@ def authenticate_request(
     the server no longer needs a keyring to authenticate. For `transport` the
     mTLS handshake already verified the chain; when the peer certificate is
     available its leaf SPKI fingerprint is returned so `mode = "list"` can pin
-    it (review log NF6).
+    it (review log NF6). For `none` there is no credential to check: the method
+    can only match when `security.client_auth == "none"` (enforced just below),
+    and the fixed `NONE_IDENTITY` sentinel is returned. The ACL still runs and
+    must be the matching `"none"` mode.
     """
     block = request.get("client_auth")
     if not isinstance(block, dict):
@@ -1183,6 +1421,11 @@ def authenticate_request(
         raise AuthError(
             f"client_auth method {method!r} does not match the configured {security.client_auth!r}"
         )
+    if method == "none":
+        # Only reachable when the configured method is "none"; there is nothing
+        # to verify. The pairing with `acl.mode = "none"` is enforced by
+        # `build_security` (and again by `authorize_request`).
+        return NONE_IDENTITY
     if method == "transport":
         if security.transport_encryption != "mtls":
             raise AuthError("client_auth = 'transport' requires transport_encryption = 'mtls'")
@@ -1651,6 +1894,150 @@ def verify_bytes(public_key, alg: str, data: bytes, signature: bytes) -> None:
             raise AuthError("signature verification failed") from error
         return
     raise AuthError(f"unknown signature algorithm {alg!r}")
+
+
+# --- SSH agent signing (doc §7.9) -----------------------------------------
+#
+# `client_auth = "ssh"` may delegate signing to a running SSH agent instead of
+# reading a private key file. The protocol is the standard length-prefixed agent
+# framing over AF_UNIX; every read is bounded (`SSH_AGENT_MAX_RESPONSE`) and the
+# socket carries `SSH_AGENT_TIMEOUT`, so a hostile or hung agent fails closed
+# rather than stalling `sudo` or exhausting memory.
+
+
+def _ssh_agent_recv_exact(sock, count: int) -> bytes:
+    """Read exactly `count` bytes from `sock`, failing closed on early EOF."""
+    buffer = bytearray()
+    while len(buffer) < count:
+        chunk = sock.recv(count - len(buffer))
+        if not chunk:
+            raise AuthError("SSH agent closed the connection before replying")
+        buffer += chunk
+    return bytes(buffer)
+
+
+def _ssh_agent_exchange(socket_path: str, payload: bytes) -> bytes:
+    """Send one length-prefixed SSH agent message and return the response body.
+
+    The agent protocol frames every message as a `uint32` big-endian length plus
+    that many payload bytes. The declared response length is checked *before*
+    the body is read, so a broken/hostile agent cannot force an unbounded
+    allocation; the socket timeout bounds a hung one. Any `OSError` (including
+    `socket.timeout` and a refused/missing socket) is turned into `AuthError`.
+    """
+    request = struct.pack(">I", len(payload)) + payload
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(SSH_AGENT_TIMEOUT)
+            sock.connect(socket_path)
+            sock.sendall(request)
+            (length,) = struct.unpack(">I", _ssh_agent_recv_exact(sock, 4))
+            if length > SSH_AGENT_MAX_RESPONSE:
+                raise AuthError(
+                    f"SSH agent response of {length} bytes exceeds the "
+                    f"{SSH_AGENT_MAX_RESPONSE}-byte limit"
+                )
+            return _ssh_agent_recv_exact(sock, length)
+    except AuthError:
+        raise
+    except OSError as error:
+        raise AuthError(
+            f"cannot talk to the SSH agent at {socket_path}: {error}"
+        ) from error
+
+
+def _ssh_agent_read_string(payload: bytes, offset: int) -> tuple:
+    """Read one SSH wire `string` from `payload` at `offset` (bounds-checked)."""
+    if offset + 4 > len(payload):
+        raise AuthError("truncated SSH agent message")
+    (length,) = struct.unpack(">I", payload[offset : offset + 4])
+    offset += 4
+    if length > len(payload) - offset:
+        raise AuthError("truncated SSH agent string")
+    return payload[offset : offset + length], offset + length
+
+
+def _ssh_agent_signature_alg(agent_alg: str) -> str:
+    """Map the agent's signature algorithm to a verifier wire value (doc §7.7).
+
+    Only the non-SHA-1 names the server accepts are allowed. An agent that
+    answers with `ssh-rsa` (SHA-1) is rejected explicitly rather than accepted
+    as a downgrade.
+    """
+    if agent_alg in SSH_SIGNATURE_ALGS:
+        return agent_alg
+    if agent_alg == "ssh-rsa":
+        raise AuthError("the SSH agent returned a SHA-1 ('ssh-rsa') signature; refusing")
+    raise AuthError(f"unsupported SSH agent signature algorithm {agent_alg!r}")
+
+
+def _ssh_agent_find_key(socket_path: str, expected_key_id: str) -> bytes:
+    """Return the loaded agent identity whose fingerprint is `expected_key_id`.
+
+    Lists the agent's identities and matches the configured `SHA256:`
+    fingerprint. An agent that refuses, answers with an unexpected type, or does
+    not hold the configured key raises `AuthError` (fail closed): the client
+    must never silently fall back to another identity.
+    """
+    answer = _ssh_agent_exchange(socket_path, bytes([SSH_AGENTC_REQUEST_IDENTITIES]))
+    if not answer:
+        raise AuthError("empty SSH agent identities answer")
+    if answer[0] == SSH_AGENT_FAILURE:
+        raise AuthError("the SSH agent refused to list its identities")
+    if answer[0] != SSH_AGENT_IDENTITIES_ANSWER:
+        raise AuthError(
+            f"unexpected SSH agent response {answer[0]} to a list-identities request"
+        )
+    if len(answer) < 5:
+        raise AuthError("truncated SSH agent identities answer")
+    (count,) = struct.unpack(">I", answer[1:5])
+    offset = 5
+    for _ in range(count):
+        key_blob, offset = _ssh_agent_read_string(answer, offset)
+        _comment, offset = _ssh_agent_read_string(answer, offset)
+        try:
+            fingerprint = ssh_fingerprint(load_ssh_public_key_blob(key_blob))
+        except AuthError:
+            continue
+        if secure_equals(fingerprint, expected_key_id):
+            return key_blob
+    raise AuthError(f"the SSH agent does not hold the configured key {expected_key_id}")
+
+
+def ssh_agent_sign(
+    socket_path: str, expected_key_id: str, alg: str, data: bytes
+) -> tuple:
+    """Sign `data` with the SSH agent identity matching `expected_key_id`.
+
+    Returns `(wire_alg, signature)`, where `wire_alg` is the verifier's name for
+    the algorithm the agent used. `data` is the domain-separated
+    `signing_payload` transcript. RSA is asked for SHA-256
+    (`SSH_AGENT_RSA_SHA2_256`), matching the file-based path; Ed25519 needs no
+    flag. A refusal, a malformed answer, or a SHA-1 signature raises `AuthError`.
+    """
+    key_blob = _ssh_agent_find_key(socket_path, expected_key_id)
+    flags = SSH_AGENT_RSA_SHA2_256 if alg in ("rsa-sha2-256", "rsa-sha2-512") else 0
+    request = (
+        bytes([SSH_AGENTC_SIGN_REQUEST])
+        + _ssh_string(key_blob)
+        + _ssh_string(data)
+        + struct.pack(">I", flags)
+    )
+    answer = _ssh_agent_exchange(socket_path, request)
+    if not answer:
+        raise AuthError("empty SSH agent sign response")
+    if answer[0] == SSH_AGENT_FAILURE:
+        raise AuthError("the SSH agent refused to sign the request")
+    if answer[0] != SSH_AGENT_SIGN_RESPONSE:
+        raise AuthError(f"unexpected SSH agent response {answer[0]} to a sign request")
+    signature_blob, _ = _ssh_agent_read_string(answer, 1)
+    agent_alg, offset = _ssh_agent_read_string(signature_blob, 0)
+    signature, _ = _ssh_agent_read_string(signature_blob, offset)
+    try:
+        agent_alg_text = agent_alg.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise AuthError("SSH agent signature algorithm is not ASCII") from error
+    return _ssh_agent_signature_alg(agent_alg_text), signature
 
 
 def _cert_is_ca(cert) -> bool:

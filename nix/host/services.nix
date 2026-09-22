@@ -195,21 +195,32 @@ in {
         tartarus.sudo-auth-proxy = {
           # The server emitter reads the *top-level* `security` group (not
           # `server.security`) for the resolved knobs, so they are set here.
-          # `acl.mode = "ca"` makes the shipped ACL authorize the guests instead
-          # of denying everyone (audit A1). If an operator switches to
-          # `client_auth = "ssh"`, they must also set `server.acl.mode = "list"`
-          # and `server.acl.trustedKeys` (SHA256 fingerprints); the Python
-          # layer then rejects the inconsistent ca+ssh combination loudly
-          # rather than silently denying.
+          #
+          # `unix` (audit A1): the SSH tunnel protects the channel, the guest
+          # presents its tartarus CA-chained client certificate, and the host
+          # signs its responses -- `client_auth = "x509"`, `server_auth =
+          # "signature"`, `acl.mode = "ca"` with the CA + client OID, and no
+          # mTLS. If an operator switches to `client_auth = "ssh"`, they must
+          # also set `server.acl.mode = "list"` + `server.acl.trustedKeys`
+          # (SHA256 fingerprints); the Python rejects the inconsistent ca+ssh
+          # combination rather than silently denying.
+          #
+          # Callback transports (`vsock`/`tcp`): the tartarus-internal channel
+          # is private by construction, so it runs with no crypto and no
+          # authentication -- `transportEncryption = "none"`,
+          # `serverAuth = "none"`, `clientAuth = "none"` and the fail-closed
+          # matching `acl.mode = "none"`. The Python warns about `none` and
+          # refuses a `client_auth`/`acl.mode` mismatch. No CA material, no
+          # signing key, no mTLS.
           security =
             {
-              transportEncryption = mkDefault (if sudoIsUnix then "none" else "mtls");
-              serverAuth = mkDefault (if sudoIsUnix then "signature" else "transport");
-              clientAuth = mkDefault (if sudoIsUnix then "x509" else "transport");
-              caFile = mkDefault x509Ca;
-              clientRequiredOid = mkDefault sudoClientOid;
+              transportEncryption = mkDefault "none";
+              serverAuth = mkDefault (if sudoIsUnix then "signature" else "none");
+              clientAuth = mkDefault (if sudoIsUnix then "x509" else "none");
             }
             // lib.optionalAttrs sudoIsUnix {
+              caFile = mkDefault x509Ca;
+              clientRequiredOid = mkDefault sudoClientOid;
               serverSigningKey = mkDefault hostSshIdentity;
             };
           server = {
@@ -225,12 +236,16 @@ in {
             # decisionTimeout. Keep the server values in the same shape.
             recvTimeout = mkDefault 0.5;
             decisionTimeout = mkDefault 120;
-            # Usable, default-secure ACL. `caFile`/`requiredOid` fall back to
-            # the `security` values above; emitted as `[acl]` because mode is
-            # `"ca"`. Operators can override with `mode = "list"` + pins.
-            acl.mode = mkDefault "ca";
+            # Usable, default-secure ACL: `ca` authorizes the CA-chained guests
+            # on the `unix` path; `none` deliberately authorizes the
+            # unauthenticated callback path and is only accepted because
+            # `client_auth = "none"` above. Operators can override with
+            # `mode = "list"` + pins.
+            acl.mode = mkDefault (if sudoIsUnix then "ca" else "none");
+            # mTLS stays off on both shipped paths: the `unix` channel is the
+            # SSH tunnel and the callback channel is unauthenticated by design.
             mtls = {
-              enable = mkDefault (!sudoIsUnix);
+              enable = mkDefault false;
               caFile = mkDefault x509Ca;
               certFile = mkDefault x509HostCert;
               keyFile = mkDefault x509HostKey;
