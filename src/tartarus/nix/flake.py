@@ -13,7 +13,10 @@ This module never points at the tartarus repo itself.
 
 from __future__ import annotations
 
+import hashlib
 import re
+import subprocess
+from pathlib import Path
 
 from ..config import Config
 from ..output import die
@@ -85,6 +88,45 @@ def base_name(config: Config, kind: str, name: str) -> str:
     if match and match.group(1) in list_templates(config, kind):
         return match.group(1)
     return name
+
+
+def build_fingerprint(flake_path: Path) -> str | None:
+    """Identify the working-tree revision a build was made from.
+
+    Combines the git ``HEAD`` commit, whether tracked files are dirty, and a
+    hash of ``flake.lock`` into one stable token. The dirty flag only affects
+    the update *notice* the CLI prints when reusing a build -- it never
+    triggers an automatic rebuild. Returns ``None`` when the revision cannot
+    be determined (not a git checkout, git missing, etc.).
+    """
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(flake_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if head.returncode != 0:
+        return None
+
+    try:
+        status = subprocess.run(
+            ["git", "-C", str(flake_path), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    dirty = "1" if status.stdout.strip() else "0"
+
+    lock = flake_path / "flake.lock"
+    try:
+        lock_hash = hashlib.sha256(lock.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        lock_hash = "nolock"
+
+    return f"{head.stdout.strip()}:{dirty}:{lock_hash}"
 
 
 def guest_id(config: Config, kind: str, name: str) -> int:

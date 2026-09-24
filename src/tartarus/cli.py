@@ -37,6 +37,12 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         metavar="HOST_PATH:GUEST_PATH",
         help="ad-hoc 9p share chosen at launch time (repeatable; MicroVMs only)",
     )
+    p.add_argument(
+        "-u",
+        "--upgrade",
+        action="store_true",
+        help="rebuild from the current flake instead of reusing the existing build",
+    )
 
     p = sub.add_parser("build", help="build (if needed) a guest without starting it")
     p.add_argument("name", help="template name (canonical instance) or an existing instance name")
@@ -48,6 +54,12 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         type=vm.mount_type,
         metavar="HOST_PATH:GUEST_PATH",
         help="ad-hoc 9p share chosen at launch time (repeatable; MicroVMs only)",
+    )
+    p.add_argument(
+        "-u",
+        "--upgrade",
+        action="store_true",
+        help="rebuild from the current flake instead of reusing the existing build",
     )
 
     p = sub.add_parser("spawn", help="start an additional, independent instance of a template")
@@ -61,6 +73,12 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         type=vm.mount_type,
         metavar="HOST_PATH:GUEST_PATH",
         help="ad-hoc 9p share chosen at launch time (repeatable; MicroVMs only)",
+    )
+    p.add_argument(
+        "-u",
+        "--upgrade",
+        action="store_true",
+        help="rebuild from the current flake instead of reusing the existing build",
     )
 
     p = sub.add_parser("stop", help="gracefully shut a running guest down")
@@ -85,6 +103,12 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         "--debug",
         action="store_true",
         help="show the shutdown command's raw output instead of just the final status line",
+    )
+    p.add_argument(
+        "-u",
+        "--upgrade",
+        action="store_true",
+        help="rebuild from the current flake instead of reusing the existing build",
     )
 
     p = sub.add_parser("logs", help="tail the guest's log (MicroVM: console log; container: systemd journal)")

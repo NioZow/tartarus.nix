@@ -170,11 +170,11 @@ trust (`tartarus.ssh.*`), and the generated CLI config
 ```
 tartarus list                     # every guest and whether it is running
 tartarus status [name]            # detailed status
-tartarus start <name>             # build (if needed) and launch in the background
-tartarus build <name>             # build (if needed) without starting
-tartarus spawn <template>         # an extra, independent instance
+tartarus start <name> [-u]        # reuse/build and launch in the background
+tartarus build <name> [-u]        # build without starting (reuses an existing build)
+tartarus spawn <template> [-u]    # an extra, independent instance
 tartarus stop <name> [--purge]    # shut down (optionally delete state)
-tartarus restart <name>
+tartarus restart <name> [-u]      # stop, then start
 tartarus logs <name>              # console log / journal
 tartarus ssh <name> [-s|--start]  # start it first if it isn't running
 tartarus cid <name>               # MicroVM VSOCK CID
@@ -182,6 +182,15 @@ tartarus ip <name>                # host-reachable IP (Darwin: via ARP)
 tartarus proxy <name>             # ProxyCommand helper (VSOCK)
 tartarus proxy-ip <name>          # ProxyCommand helper (vmnet IP)
 ```
+
+`start`, `restart`, `spawn` and `build` treat a guest's build as a cache: they
+reuse the existing `state/result` when it is valid, without re-evaluating or
+re-realising the flake. Pass `-u`/`--upgrade` to force a fresh `nix build`;
+supplying `--mount` (which changes the generated derivation) also forces one, as
+does a missing or garbage-collected result. When a reuse finds the flake changed
+since the build — its git `HEAD`, its dirty tracked files, or `flake.lock` —
+tartarus prints a single line suggesting `--upgrade`, and otherwise stays
+silent.
 
 The CLI is `packages.<system>.tartarus`, run with
 `nix run .#tartarus -- <args>` or installed on the host.

@@ -285,7 +285,52 @@ def next_instance_name(config: Config, base: str) -> str:
     die(f"no free instance number for '{base}'")
 
 
-def _build_runner(config: Config, name: str, mounts: list[str]) -> tuple[Path, int | None]:
+def _result_valid(result: Path) -> bool:
+    """Whether ``result`` is a live out-link to a built runner.
+
+    ``resolve(strict=True)`` follows the out-link and raises if the store path
+    was garbage-collected; ``RuntimeError`` covers symlink loops.
+    """
+    try:
+        target = result.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError):
+        return False
+    return (target / "bin" / "microvm-run").exists()
+
+
+def _read_build_info(state: Path) -> dict:
+    """Parse ``state/build-info.json``; ``{}`` when missing or malformed."""
+    try:
+        data = json.loads((state / "build-info.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _maybe_notify_update(config: Config, name: str, state: Path) -> None:
+    """Print one line if the flake changed since this build, else nothing."""
+    stored = _read_build_info(state).get("fingerprint")
+    current = flake.build_fingerprint(config.flake_path)
+    if stored is not None and current is not None and stored != current:
+        info(f"'{name}' has an update available (the flake changed since it was built); rebuild with --upgrade.")
+
+
+def _should_reuse(config: Config, name: str, mounts: list[str], upgrade: bool) -> bool:
+    """Whether an existing build matches this request and can be reused.
+
+    Reuse requires a live result and the exact same ad-hoc mounts as the build
+    that produced it (a missing/empty record means no mounts), so a prior
+    ``--mount`` never leaks into a later plain ``start`` and vice versa.
+    """
+    if upgrade:
+        return False
+    state = config.state_dir(name)
+    if not _result_valid(state / "result"):
+        return False
+    return mounts == _read_build_info(state).get("mounts", [])
+
+
+def _build_runner(config: Config, name: str, mounts: list[str], *, upgrade: bool = False) -> tuple[Path, int | None]:
     base = flake.base_name(config, "vm", name)
     state = config.state_dir(name)
     state.mkdir(parents=True, exist_ok=True)
@@ -296,18 +341,34 @@ def _build_runner(config: Config, name: str, mounts: list[str]) -> tuple[Path, i
     # such source directory for its share.
     config.shared_dir(name).mkdir(parents=True, exist_ok=True)
 
+    result = state / "result"
+    cid: int | None = None
+    if name != base:
+        # Numbered instance: pin its hostname suffix and CID explicitly so
+        # this eval of `base` produces an independent, uniquely-addressed VM.
+        # The cid is persisted so later reuses and rebuilds keep the same
+        # baked-in MICROVM_ID_OVERRIDE identity.
+        cid_file = state / "cid"
+        if cid_file.exists():
+            cid = int(cid_file.read_text().strip())
+        else:
+            cid = ssh.alloc_cid(config)
+
+    if _should_reuse(config, name, mounts, upgrade):
+        # Reuse the existing build: no nix eval, no build, no download.
+        if cid is not None:
+            (state / "cid").write_text(f"{cid}\n")
+        _maybe_notify_update(config, name, state)
+        return result, cid
+
     env = dict(os.environ)
     env["MICROVM_EXTRA_SHARES"] = build_mounts_json(mounts)
     # Pin the guest's `user` uid to the invoking user's so virtiofs ownership
     # matches transparently on both sides.
     env["TARTARUS_HOST_UID"] = str(os.getuid())
 
-    cid: int | None = None
     if name != base:
-        # Numbered instance: pin its hostname suffix and CID explicitly so
-        # this eval of `base` produces an independent, uniquely-addressed VM.
         env["MICROVM_INSTANCE_SUFFIX"] = name[len(base) + 1 :]
-        cid = ssh.alloc_cid(config)
         env["MICROVM_ID_OVERRIDE"] = str(cid)
     else:
         env.pop("MICROVM_INSTANCE_SUFFIX", None)
@@ -317,17 +378,35 @@ def _build_runner(config: Config, name: str, mounts: list[str]) -> tuple[Path, i
 
     info(f"Building '{name}'...")
     nix_eval.build(flake.flake_ref(config), attr, state / "result", env=env)
-    return state / "result", cid
+
+    if cid is not None:
+        (state / "cid").write_text(f"{cid}\n")
+
+    (state / "build-info.json").write_text(
+        json.dumps(
+            {
+                "fingerprint": flake.build_fingerprint(config.flake_path),
+                "result": str(result.resolve()),
+                "built_at": int(time.time()),
+                "mounts": mounts,
+            }
+        )
+    )
+    return result, cid
 
 
-def action_build(config: Config, name: str, mounts: list[str]) -> None:
+def action_build(config: Config, name: str, mounts: list[str], upgrade: bool = False) -> None:
     base = flake.base_name(config, "vm", name)
     flake.require_template(config, "vm", base)
-    result, _cid = _build_runner(config, name, mounts)
-    ok(f"'{name}' built. Result: {result}")
+    reused = _should_reuse(config, name, mounts, upgrade)
+    result, _cid = _build_runner(config, name, mounts, upgrade=upgrade)
+    if reused:
+        ok(f"'{name}' already built. Result: {result}")
+    else:
+        ok(f"'{name}' built. Result: {result}")
 
 
-def action_start(config: Config, name: str, mounts: list[str]) -> None:
+def action_start(config: Config, name: str, mounts: list[str], upgrade: bool = False) -> None:
     base = flake.base_name(config, "vm", name)
     flake.require_template(config, "vm", base)
 
@@ -346,7 +425,7 @@ def action_start(config: Config, name: str, mounts: list[str]) -> None:
     finally:
         _STARTING.discard(name)
 
-    result, cid = _build_runner(config, name, mounts)
+    result, cid = _build_runner(config, name, mounts, upgrade=upgrade)
     state = result.parent
 
     # Clear stale bookkeeping from a previous run before launching (only safe
@@ -397,11 +476,13 @@ def action_start(config: Config, name: str, mounts: list[str]) -> None:
     ok(f"'{name}' started (pid {proc.pid}, cid {cid}). Console: {state / 'console.log'}")
 
 
-def action_spawn(config: Config, template: str, name_override: str | None, mounts: list[str]) -> None:
+def action_spawn(
+    config: Config, template: str, name_override: str | None, mounts: list[str], upgrade: bool = False
+) -> None:
     flake.require_template(config, "vm", template)
     name = name_override or next_instance_name(config, template)
     info(f"Spawning new '{template}' instance: {name}")
-    action_start(config, name, mounts)
+    action_start(config, name, mounts, upgrade=upgrade)
 
 
 def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> None:
@@ -453,9 +534,9 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
             sock.unlink(missing_ok=True)
 
 
-def action_restart(config: Config, name: str, debug: bool = False) -> None:
+def action_restart(config: Config, name: str, debug: bool = False, upgrade: bool = False) -> None:
     action_stop(config, name, purge=False, debug=debug)
-    action_start(config, name, mounts=[])
+    action_start(config, name, mounts=[], upgrade=upgrade)
 
 
 def action_logs(config: Config, name: str) -> None:
@@ -478,15 +559,15 @@ def dispatch(config: Config, args) -> None:
     elif args.command == "status":
         action_status(config, args.name)
     elif args.command == "start":
-        action_start(config, args.name, args.mounts)
+        action_start(config, args.name, args.mounts, upgrade=args.upgrade)
     elif args.command == "build":
-        action_build(config, args.name, args.mounts)
+        action_build(config, args.name, args.mounts, upgrade=args.upgrade)
     elif args.command == "spawn":
-        action_spawn(config, args.template, args.name, args.mounts)
+        action_spawn(config, args.template, args.name, args.mounts, upgrade=args.upgrade)
     elif args.command == "stop":
         action_stop(config, args.name, args.purge, args.debug)
     elif args.command == "restart":
-        action_restart(config, args.name, args.debug)
+        action_restart(config, args.name, args.debug, upgrade=args.upgrade)
     elif args.command == "logs":
         action_logs(config, args.name)
     elif args.command == "ssh":
