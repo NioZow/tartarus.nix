@@ -119,6 +119,7 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `enable` | bool | `false` | Whether this guest *exists* on this host: gates the `vm-`/`ctn-<name>` flake outputs, the host-side CA cert, firewall rules, proxy entries and autostart. It does not force an eager build — builds stay lazy, on `tartarus start` / `nix build`. Disabled guests are absent from the generated `config.toml`. |
 | `kind` | `"vm"` \| `"container"` | `"vm"` | Guest kind. |
 | `id` | null or int | `null` | Static id 3-100 (determines IP/MAC/CID); auto-assigned from 101 when null. |
+| `host` | null or str | `null` | For a `kind = "container"` guest, run it nested inside the named container-host VM (`kind = "vm"` with `vm.containerHost.enable = true`). Required on Darwin; `null` keeps the native host-kernel nspawn path on Linux. |
 | `graphical` | bool | `false` | Graphical remote display via the `wprs` transport. |
 | `internet` | bool | `true` | Direct NAT egress. Mutually exclusive with `proxy.enable`. |
 | `sharedFolder` | bool | `false` | Mount a per-guest host directory at `~/shared`. |
@@ -131,9 +132,12 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `services.sshAgentProxy` | bool | `false` | Forward the host ssh-agent into the guest. |
 | `services.sudoAuthProxy` | bool | `false` | PAM sudo authentication proxy. |
 | `services.disableVsock` | bool | `false` | Force TCP instead of VSOCK (no-op where VSOCK is unavailable). |
-| `vm.vcpu` / `vm.mem` | int / int | `1` / `768` | VM only. |
+| `vm.vcpu` / `vm.mem` | int / null / `"host"` | `1` / `768` | VM only. A positive integer, `null` to omit the flag (microvm.nix default: 1 vCPU / 512 MiB), or `"host"` to cap at `tartarus.hostCores` / `tartarus.hostMemoryMiB`. |
 | `vm.persistentHome.enable` / `.size` | bool / int | `false` / `5120` | VM only, writable home disk image (MiB). |
 | `vm.nixStoreOverlay.size` | int | `2048` | VM only, writable `/nix/store` overlay (MiB). |
+| `vm.containerHost.enable` | bool | `false` | VM only. Host nested `systemd-nspawn` containers inside this VM (macOS-first container-host model). |
+| `vm.containerHost.stateVolume.size` | int | `10240` | VM only. MiB backing `/var/lib/nixos-containers` inside the host VM (survives VM restarts and rebuilds). |
+| `vm.containerHost.network.bridge` / `.hostIP` / `.subnet` | str | `"trs2"` / `"10.202.0.1"` / `"10.202.0.0/24"` | VM-local inner bridge for nested containers. |
 | `firewall.enable` | bool | `false` | Enable a tartarus-managed firewall. |
 | `firewall.location` | `"host"` \| `"guest"` | `"guest"` | `"host"` is Linux-only; `"guest"` runs nftables inside the guest. |
 | `firewall.allow` | list | `[]` | Extra host-service allowances (not an egress backdoor). |
@@ -152,9 +156,10 @@ disabled or unknown name is refused before any build, state-dir creation or SSH
 (see [CLI](#cli)).
 
 Tartarus also exposes host options for the CA (`tartarus.ca.*`), system SSH
-trust (`tartarus.ssh.*`), and the generated CLI config
+trust (`tartarus.ssh.*`), the generated CLI config
 (`tartarus.flakePath`, `tartarus.stateRoot`, `tartarus.sshDir`,
-`tartarus.system`, `tartarus.log`).
+`tartarus.system`, `tartarus.log`), and the host resource ceilings that resolve
+`vm.mem` / `vm.vcpu = "host"` (`tartarus.hostMemoryMiB`, `tartarus.hostCores`).
 
 ### Assertions (evaluation errors)
 
@@ -164,6 +169,15 @@ trust (`tartarus.ssh.*`), and the generated CLI config
   with `internet = true` (both Linux and Darwin).
 - `firewall.location = "host"` is Linux-only.
 - Static ids must be unique within a kind and in 3-100 (auto ids start at 101).
+- `host` must name an enabled `kind = "vm"` guest with
+  `vm.containerHost.enable = true`; `host` is container-only and
+  `vm.containerHost.enable` is VM-only.
+- A `kind = "container"` guest on Darwin with no `host` is rejected
+  (containers need a Linux kernel).
+- A nested container (any `host != null`) may not set `relays`, enable a host
+  service integration (`clipboardBridge` / `sshAgentProxy` / `sudoAuthProxy` /
+  `gpgAgentProxy`), or set `proxy.enable` — host-side wiring for nested
+  containers is not implemented yet.
 
 ## CLI
 
@@ -300,6 +314,52 @@ macOS. The guest halves are wired automatically when a guest sets the matching
   the `snapshot = false` opt-out for secret-bearing shares).
 - Building Linux guests needs `nix.linux-builder` (tartarus enables it by
   default on Darwin); see nixcfg's `docs/linux-builder.md`.
+
+### Container-host VMs (macOS)
+
+A **container host** is a `kind = "vm"` guest with
+`vm.containerHost.enable = true`. It runs many nested `systemd-nspawn`
+containers that share its kernel — the OrbStack-style density model, and the
+macOS counterpart to Linux's native `kind = "container"` (which shares the
+*host* kernel). Nested containers stay `kind = "container"`, linked by
+`host = "<vm name>"`. Linux native containers (`host = null`) are unchanged; on
+Darwin a `kind = "container"` *without* `host` is an evaluation error. The
+feature is **opt-in and off by default**.
+
+```nix
+tartarus.guests = {
+  workbench = {
+    enable = true;
+    kind = "vm";
+    internet = true;
+    vm.containerHost.enable = true;   # this VM hosts nested containers
+    vm.mem = "host";                   # optional host-sized cap
+  };
+  toolbox = {
+    enable = true;
+    kind = "container";
+    host = "workbench";                # runs nested inside `workbench`
+    systemConfig = { /* ... */ };
+  };
+};
+```
+
+- Inner containers get addresses `10.202.0.<id>` on a VM-local `trs2` bridge
+  with NAT and dnsmasq inside the VM. Their `/var/lib/nixos-containers` state
+  is backed by a persistent volume (`vm.containerHost.stateVolume.size`,
+  default 10240 MiB) that survives VM restarts.
+- `tartarus --container ssh toolbox` jumps through the host VM
+  (`ssh -o ProxyJump=workbench.trs ...`). `cid`/`ip`/`proxy`/`proxy-ip` refuse
+  a nested container (it has no host-reachable address); `start`/`build`
+  delegate to the host VM; `stop`/`restart`/`logs`/`spawn` refuse with
+  guidance. A nested container's `autostart` starts its host VM.
+- Nested containers have no host-side bridge, nftables, `/etc/hosts`, relay,
+  service or proxy wiring; `relays`, a host `services.*` integration or
+  `proxy.enable` on one is a hard evaluation error for now.
+- **Runtime caveat (P0).** The runtime spike — nested nspawn under
+  microvm.nix (cgroup-v2 delegation), CA key readability over virtiofs, and
+  state across a VM restart — is a **manual gate and is not yet verified**. See
+  [Container-host VMs](docs/container-host.md) and `docs/smoke.md`.
 
 ## Tests
 

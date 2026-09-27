@@ -165,6 +165,54 @@ For a guest with `firewall.enable = true` and `firewall.location = "guest"`:
 - [ ] Rejected as designed: `tartarus.proxy.location` naming a guest must fail
       evaluation on Darwin; only `"host"` is accepted.
 
+### Container host (nested nspawn)
+
+The runtime pass for `vm.containerHost` (P0 was skipped, so this is the gate
+that proves it actually boots). Enable a container host `ch` (`kind = "vm"`,
+`vm.containerHost.enable = true`) with one nested container `inner`
+(`kind = "container"`, `host = "ch"`), and a plain VM `vault` alongside.
+
+- [ ] `tartarus start ch` builds (via `nix.linux-builder`) and boots;
+      `tartarus status ch` is running, and `tartarus list` marks it
+      `(container host)`.
+- [ ] The nested container starts with the VM (eager): after boot,
+      `tartarus --container status inner` reports it nested in `ch`.
+- [ ] `tartarus --container ssh inner` connects: `ssh -v` shows
+      `ProxyJump=ch.trs`, `HostName=inner`, `HostKeyAlias=inner.trs`, and the
+      CA-signed `inner.trs` host key validates with no fingerprint prompt.
+- [ ] Inside `inner`: `ip -brief addr` shows `10.202.0.<id>/24`; the default
+      route is via `10.202.0.1`; `cat /etc/resolv.conf` (or
+      `resolvectl status`) points at `10.202.0.1`.
+- [ ] DNS works through the VM's dnsmasq: `getent hosts example.com`, then
+      `curl -sS https://example.com >/dev/null` (the VM NATs the container out
+      through its own egress).
+- [ ] On the host VM (`tartarus ssh ch`): the `trs2` bridge exists with
+      `10.202.0.1/24`; `sudo nft list table inet tartarus_inner` shows the
+      `inner-masq` rule; `nspawn`/`machinectl` list `inner`; cgroup-v2
+      delegation works (`systemd-cgls` shows the container's cgroup).
+- [ ] State persists: inside `inner`, write a probe file under
+      `/var/lib/nixos-containers/` (or the container root), then
+      `tartarus restart ch`; after the VM is back,
+      `tartarus --container ssh inner` and confirm the file is still there.
+- [ ] The plain VM works alongside: `tartarus start vault`,
+      `tartarus ssh vault`, `tartarus ip vault` all behave exactly as before
+      (container-host support did not change the per-guest VM path).
+
+Negative checks:
+
+- [ ] `tartarus cid inner`, `tartarus ip inner`, `tartarus proxy inner` and
+      `tartarus proxy-ip inner` are refused with a message pointing at
+      `tartarus --container ssh inner` (no host-reachable address).
+- [ ] `tartarus --container stop inner` / `restart inner` / `logs inner` /
+      `spawn inner` are refused, pointing at the host VM (or at adding a
+      declarative container).
+- [ ] A nested container that sets `relays`, enables any host `services.*`
+      integration, or sets `proxy.enable = true` fails evaluation with the
+      dedicated assertion; a Darwin `kind = "container"` with no `host` is also
+      rejected.
+- [ ] `~/.config/tartarus/config.toml` has `schema = 2`, `container_host =
+      true` on the VM block, and `host = "ch"` on the nested container block.
+
 ## Standalone use of the services (no VM, no tartarus host module)
 
 Import each module directly and set its `tartarus.<service>.*` options; nothing

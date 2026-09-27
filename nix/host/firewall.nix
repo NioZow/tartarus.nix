@@ -61,8 +61,17 @@
     proxyClients = proxy.clients;
 
     hasVm = instances.vm.enabledNames != [];
-    hasCtn = instances.container.enabledNames != [];
+    # Only host-side containers have a host bridge/table. Nested containers are
+    # handled entirely inside their container-host VM (plan §5.3).
+    hasCtn = instances.container.hostSideNames != [];
     anyGuest = hasVm || hasCtn;
+
+    # Host-side names per kind. The VM set is the full enabled set; the
+    # container set excludes nested containers.
+    hostSideNames = kind:
+      if kind == "vm"
+      then instances.vm.enabledNames
+      else instances.container.hostSideNames;
 
     # The guest named by `proxy.location`, when it is a guest. Phase 1 asserts
     # it is an enabled linux VM with internet, so its id exists here.
@@ -101,7 +110,7 @@
           optionalString (fw.enable && fw.location == "host") (
             concatMapStringsSep "\n" (rule: "    ${allowEntry rule}") fw.allow
           )
-      ) (instances.${kind}.enabledNames);
+      ) (hostSideNames kind);
 
     mkKind = kind: let
       bridge =
@@ -117,8 +126,11 @@
         then ids.vmHostIP
         else ids.ctnHostIP;
       idByName = instances.${kind}.idByName;
-      enabledNames = instances.${kind}.enabledNames;
-      enabledInst = filterAttrs (_: g: g.enable && g.kind == kind) guests;
+      enabledNames = hostSideNames kind;
+      enabledInst =
+        filterAttrs
+        (_: g: g.enable && g.kind == kind && (kind == "vm" || (g.host or null) == null))
+        guests;
 
       mkIP = name: let
         id = idByName.${name};
@@ -328,7 +340,7 @@
             ++ map (
               n: nameValuePair (ids.mkCtnIP instances.container.idByName.${n}) [n "${n}.trs"]
             )
-            instances.container.enabledNames
+            instances.container.hostSideNames
           );
 
           boot.kernelModules = ["br_netfilter"];

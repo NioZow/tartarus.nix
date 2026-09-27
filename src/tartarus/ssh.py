@@ -20,6 +20,7 @@ from typing import NoReturn
 
 from . import system
 from .config import Config
+from .errors import TartarusError
 from .nix import flake
 from .output import die, info, note
 from .process import run_quiet
@@ -251,22 +252,48 @@ def resolve_running_ip(config: Config, name: str) -> str:
         time.sleep(ARP_POLL_INTERVAL)
 
 
+def refuse_nested_container(config: Config, name: str) -> None:
+    """Raise for a nested container name, which has no host-reachable address.
+
+    VMs (and native containers, which have their own IP) are left untouched.
+    This is the guard behind ``cid``/``ip``/``proxy``/``proxy-ip``: a nested
+    container lives on its host VM's inner bridge and is only reachable through
+    the VM, so ``tartarus --container ssh`` (ProxyJump) is the correct entry.
+    """
+    candidate = name[: -len(".trs")] if name.endswith(".trs") else name
+    guest = config.guest(candidate, "container")
+    if guest is None:
+        base = flake.base_name(config, "container", candidate)
+        if base != candidate:
+            guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        raise TartarusError(
+            f"'{candidate}' is a nested container inside container-host VM "
+            f"'{guest.host}'; it has no host-reachable CID/IP. Use "
+            f"`tartarus --container ssh {candidate}` instead."
+        )
+
+
 def action_cid(config: Config, name: str) -> None:
+    refuse_nested_container(config, name)
     print(resolve_cid(config, name))
 
 
 def action_ip(config: Config, name: str) -> None:
+    refuse_nested_container(config, name)
     print(resolve_running_ip(config, name))
 
 
 def action_proxy(config: Config, name: str) -> NoReturn:
     """Resolve ``name``'s VSOCK CID and exec socat (Linux ssh ProxyCommand)."""
+    refuse_nested_container(config, name)
     cid = resolve_cid(config, name)
     os.execvp("socat", ["socat", "-", f"VSOCK-CONNECT:{cid}:22"])
 
 
 def action_proxy_ip(config: Config, name: str) -> NoReturn:
     """Resolve ``name``'s host-reachable IP and proxy to port 22 (Darwin)."""
+    refuse_nested_container(config, name)
     ip = resolve_running_ip(config, name)
     os.execvp("nc", ["nc", ip, "22"])
 

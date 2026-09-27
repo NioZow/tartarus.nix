@@ -16,6 +16,12 @@ in {
     hostSystem,
     kind,
     id,
+    # True for a `kind = "container"` guest that runs *nested* inside a
+    # container-host VM (its `host` points at a VM). The inner container lives
+    # on the VM's own bridge/subnet, independently of the host platform, so it
+    # addresses itself as Linux-inner no matter whether the eval host is Darwin
+    # or Linux. Everything else keeps the plain-kind formulas.
+    inHostVm ? false,
     # Per-guest override from `services.disableVsock`; meaningless where VSOCK
     # does not exist (Darwin always, containers always).
     disableVsock ? false,
@@ -24,11 +30,13 @@ in {
     proxyHost ? null,
     proxyPort ? 3128,
   }: let
-    isDarwin = lib.hasSuffix "-darwin" hostSystem;
+    # An inner container never uses the host's Linux/Darwin split: it is always
+    # Linux-inner (no vsock, the VM-local bridge, nested addressing).
+    isDarwin = !inHostVm && lib.hasSuffix "-darwin" hostSystem;
     isLinux = !isDarwin;
     isVm = kind == "vm";
 
-    vsockAvailable = isLinux && isVm;
+    vsockAvailable = !inHostVm && isLinux && isVm;
     useVsock = vsockAvailable && !disableVsock;
 
     # Darwin guests live on vfkit's vmnet-shared NAT, not the Linux trs
@@ -38,22 +46,29 @@ in {
     # 10.200.0.0/24 while the host actually queried from 192.168.64.1
     # (REFUSED).
     hostIP =
-      if isDarwin
+      if inHostVm
+      then ids.innerHostIP
+      else if isDarwin
       then ids.darwinGateway
       else if isVm
       then ids.vmHostIP
       else ids.ctnHostIP;
     subnet =
-      if isDarwin
+      if inHostVm
+      then ids.innerSubnet
+      else if isDarwin
       then ids.darwinSubnet
       else if isVm
       then ids.vmSubnet
       else ids.ctnSubnet;
 
     # DHCP is broken under vfkit, so Darwin VMs get deterministic static
-    # addresses in the upper half of the vmnet-shared subnet (id + 42).
+    # addresses in the upper half of the vmnet-shared subnet (id + 42). An
+    # inner container gets its id-derived address on the VM's inner bridge.
     guestIP =
-      if isVm
+      if inHostVm
+      then ids.mkInnerIP id
+      else if isVm
       then
         (
           if isDarwin
@@ -63,47 +78,60 @@ in {
       else ids.mkCtnIP id;
 
     gateway =
-      if isDarwin
+      if inHostVm
+      then ids.innerHostIP
+      else if isDarwin
       then ids.darwinGateway
       else hostIP;
 
     # Guest -> host service address when falling back to TCP: VSOCK CID 2 when
     # VSOCK is in use, the vmnet gateway on Darwin (loopback is unreachable from
-    # a vmnet-shared guest), otherwise the bridge's host IP.
+    # a vmnet-shared guest), otherwise the bridge's host IP. For an inner
+    # container that is the container host's inner-bridge IP.
     serviceHost =
       if useVsock
       then "2"
+      else if inHostVm
+      then ids.innerHostIP
       else if isDarwin
       then "_gateway"
       else hostIP;
 
     # Where a guest sends proxy requests when the proxy runs on the host. On
-    # Darwin that is the vmnet gateway, never loopback.
+    # Darwin that is the vmnet gateway, never loopback. An inner container
+    # reaches a VM-hosted proxy at the inner bridge's host IP.
     hostProxyIP =
-      if isDarwin
+      if inHostVm
+      then ids.innerHostIP
+      else if isDarwin
       then ids.darwinGateway
       else hostIP;
 
     # Addresses the proxy may bind. Phase 5 consumes this; the proxy never
     # binds loopback.
     proxyBind =
-      if isDarwin
+      if inHostVm
+      then [ids.innerHostIP]
+      else if isDarwin
       then [ids.darwinGateway]
       else [ids.vmHostIP ids.ctnHostIP];
 
     # Internal host services and the proxy itself must bypass the proxy. The
     # subnets cover every kind even when only one is in use -- harmless, and it
-    # keeps the file identical across guests.
-    noProxy = [
-      ids.vmSubnet
-      ids.ctnSubnet
-      ids.vmHostIP
-      ids.ctnHostIP
-      ids.darwinGateway
-      "localhost"
-      "127.0.0.1"
-      ".trs"
-    ];
+    # keeps the file identical across guests. Inner containers additionally
+    # bypass the VM-local inner bridge/subnet.
+    noProxy =
+      [
+        ids.vmSubnet
+        ids.ctnSubnet
+        ids.vmHostIP
+        ids.ctnHostIP
+        ids.darwinGateway
+        "localhost"
+        "127.0.0.1"
+        ".trs"
+      ]
+      ++ lib.optionals inHostVm [ids.innerSubnet ids.innerHostIP];
   in {
     inherit
       isDarwin
@@ -127,7 +155,9 @@ in {
       then "vfkit"
       else "qemu";
     bridge =
-      if isVm
+      if inHostVm
+      then ids.innerBridge
+      else if isVm
       then ids.vmBridge
       else ids.ctnBridge;
     # VSOCK CID equal to the guest id; null when VSOCK is unavailable, which

@@ -69,6 +69,13 @@
 
   vmEnabled = enabledOfKind "vm";
   ctnEnabled = enabledOfKind "container";
+  # A container is host-side present only when it is *not* nested inside a
+  # container-host VM (`host == null`). Nested containers live on the VM-local
+  # `trs2` bridge and must get no host bridge, nftables table, `/etc/hosts`
+  # entry, relay or service wiring -- the invariant every host module filters
+  # on. `enabledNames`/`idByName` stay the full container set so id assignment
+  # and config.toml rendering still include nested containers.
+  ctnHostSide = filterAttrs (_: g: (g.host or null) == null) ctnEnabled;
   vmIds = ids.assignIds vmEnabled;
   ctnIds = ids.assignIds ctnEnabled;
 
@@ -85,6 +92,11 @@
         then ids.mkVmIPNat id
         else ids.mkVmIP id
       )
+    else if (g.host or null) != null
+    then
+      # Nested container: the address on its container-host VM's inner bridge
+      # (`trs2`), never the host container bridge (`trs1`).
+      ids.mkInnerIP id
     else ids.mkCtnIP id;
 
   # Plain (non-submodule) view of every enabled guest. Downstream modules read
@@ -108,18 +120,46 @@
     proxy = g.proxy;
     relays = g.relays;
     requires = g.requires;
+    host = g.host or null;
+    containerHost = g.vm.containerHost.enable or false;
   };
 
   details = lib.mapAttrs detail (vmEnabled // ctnEnabled);
+
+  # Autostart records. Starting a container-host VM starts its nested
+  # containers (P2 declares them with `autoStart = true` inside the VM), so a
+  # nested container's `autostart = true` becomes an autostart request for its
+  # *host VM*, never for the container itself. Dedupe by name (via the keyed
+  # attrset) so a host VM that also sets `autostart = true` yields exactly one
+  # unit, and sorting is preserved.
+  autostartOf = g:
+    if g.kind == "container" && (g.host or null) != null && details ? ${g.host}
+    then details.${g.host}
+    else g;
+  autostartRecords =
+    builtins.attrValues
+    (builtins.listToAttrs (builtins.map (g: {
+      name = g.name;
+      value = g;
+    }) (map autostartOf (builtins.filter (g: g.autostart) (builtins.attrValues details)))));
 in {
   options.tartarus.instances = {
     vm = mkKindOptions "vm";
-    container = mkKindOptions "container";
+    container =
+      mkKindOptions "container"
+      // {
+        hostSideNames = mkOption {
+          type = types.listOf types.str;
+          internal = true;
+          default = [];
+          description = "Names of enabled container guests with host-side presence (`host == null`), in stable (sorted) order. Nested containers run inside a container-host VM and are excluded.";
+        };
+      };
     enabledSubnets = mkOption {
       type = types.listOf types.str;
       internal = true;
       default = [];
-      description = "Subnets of the guest kinds that have at least one enabled guest.";
+      description = "Subnets of the guest kinds that have at least one host-side enabled guest.";
     };
     guests = mkOption {
       type = types.attrsOf types.unspecified;
@@ -131,7 +171,7 @@ in {
       type = types.listOf types.unspecified;
       internal = true;
       default = [];
-      description = "Enabled guests with `autostart = true`, as plain records.";
+      description = "Autostart records: guests with `autostart = true`, with each nested container replaced by its container-host VM (and deduped by name).";
     };
     proxyClients = mkOption {
       type = types.listOf types.unspecified;
@@ -149,13 +189,17 @@ in {
     container = {
       enabledNames = builtins.attrNames ctnEnabled;
       idByName = ctnIds;
+      hostSideNames = builtins.attrNames ctnHostSide;
     };
+    # The container subnet is a *host* bridge subnet: only advertise it when a
+    # host-side container actually sits on it. Nested containers use the VM's
+    # inner `trs2` subnet, which the host never routes.
     enabledSubnets =
       lib.optional (vmEnabled != {}) ids.vmSubnet
-      ++ lib.optional (ctnEnabled != {}) ids.ctnSubnet;
+      ++ lib.optional (ctnHostSide != {}) ids.ctnSubnet;
 
     guests = details;
-    autostart = builtins.filter (g: g.autostart) (builtins.attrValues details);
+    autostart = autostartRecords;
     proxyClients = builtins.filter (g: g.proxy.enable) (builtins.attrValues details);
   };
 }

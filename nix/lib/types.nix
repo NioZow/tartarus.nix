@@ -81,14 +81,41 @@ in {
   vmExtras = types.submodule {
     options = {
       vcpu = mkOption {
-        type = types.ints.positive;
+        type = types.nullOr (types.either (types.enum ["host"]) types.ints.positive);
         default = 1;
-        description = "Number of virtual CPUs for the guest (VM only).";
+        description = "Number of virtual CPUs for the guest (VM only): a positive integer, `null` for the hypervisor default, or `\"host\"` for a host-sized cap.";
       };
       mem = mkOption {
-        type = types.ints.positive;
+        type = types.nullOr (types.either (types.enum ["host"]) types.ints.positive);
         default = 768;
-        description = "Guest memory in MiB (VM only).";
+        description = "Guest memory in MiB (VM only): a positive integer, `null` for the hypervisor default, or `\"host\"` for a host-sized cap.";
+      };
+      containerHost = {
+        enable = mkEnableOption "hosting nested systemd-nspawn containers inside this VM";
+
+        stateVolume.size = mkOption {
+          type = types.ints.positive;
+          default = 10240;
+          description = "MiB backing /var/lib/nixos-containers.";
+        };
+
+        network = {
+          bridge = mkOption {
+            type = types.str;
+            default = "trs2";
+            description = "Inner bridge interface for nested containers.";
+          };
+          hostIP = mkOption {
+            type = types.str;
+            default = "10.202.0.1";
+            description = "Host IP on the inner bridge.";
+          };
+          subnet = mkOption {
+            type = types.str;
+            default = "10.202.0.0/24";
+            description = "Subnet for nested containers.";
+          };
+        };
       };
       persistentHome = {
         enable = mkEnableOption "a persistent /home backed by a writable disk image (VM only)";

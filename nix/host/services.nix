@@ -43,7 +43,11 @@
   instances = config.tartarus.instances;
 
   guests = config.tartarus.guests or {};
-  enabled = filterAttrs (_: g: g.enable) guests;
+  # Host-half services only apply to host-side guests. Nested containers are
+  # reached through their container-host VM's sshd/relays, so they must not be
+  # added to the host service entries (plan §5.3); the P3 assertions reject any
+  # nested container that requests one.
+  enabled = filterAttrs (_: g: g.enable && (g.host or null) == null) guests;
   svc = name: g: (g.services or {}).${name} or false;
   requesting = name: filterAttrs (_: g: svc name g) enabled;
 
@@ -215,8 +219,16 @@ in {
           security =
             {
               transportEncryption = mkDefault "none";
-              serverAuth = mkDefault (if sudoIsUnix then "signature" else "none");
-              clientAuth = mkDefault (if sudoIsUnix then "x509" else "none");
+              serverAuth = mkDefault (
+                if sudoIsUnix
+                then "signature"
+                else "none"
+              );
+              clientAuth = mkDefault (
+                if sudoIsUnix
+                then "x509"
+                else "none"
+              );
             }
             // lib.optionalAttrs sudoIsUnix {
               caFile = mkDefault x509Ca;
@@ -241,7 +253,11 @@ in {
             # unauthenticated callback path and is only accepted because
             # `client_auth = "none"` above. Operators can override with
             # `mode = "list"` + pins.
-            acl.mode = mkDefault (if sudoIsUnix then "ca" else "none");
+            acl.mode = mkDefault (
+              if sudoIsUnix
+              then "ca"
+              else "none"
+            );
             # mTLS stays off on both shipped paths: the `unix` channel is the
             # SSH tunnel and the callback channel is unauthenticated by design.
             mtls = {

@@ -101,6 +101,7 @@ in
       inherit
         (lib)
         concatMap
+        filter
         map
         mkIf
         mkMerge
@@ -116,16 +117,18 @@ in
       instances = config.tartarus.instances;
       cfg = config.tartarus.proxy;
 
-      # Every enabled guest that opted into the proxy, as plain records from
-      # `instances.nix`. The Phase 1 assertion guarantees `internet = false` for
-      # all of them and that the global proxy is enabled, so no further
-      # filtering is needed here.
+      # Every *host-side* enabled guest that opted into the proxy, as plain
+      # records from `instances.nix`. The Phase 1 assertion guarantees
+      # `internet = false` for all of them and that the global proxy is enabled,
+      # so no further filtering is needed here. Nested containers are excluded:
+      # they have no host-reachable address and their proxy routing is a
+      # not-yet-implemented feature (rejected by the P3 assertions anyway).
       rawClients =
         map (g: {
           inherit (g) name kind ip;
           allowHosts = g.proxy.allowHosts;
         })
-        instances.proxyClients;
+        (filter (g: (g.host or null) == null) instances.proxyClients);
 
       proxyIsGuest = cfg.enable && cfg.location != "host";
 

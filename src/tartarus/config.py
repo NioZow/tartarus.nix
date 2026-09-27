@@ -24,6 +24,8 @@ TOML schema -- ``$XDG_CONFIG_HOME/tartarus/config.toml`` (default
     x509_ca_dir = "/home/user/.local/share/tartarus/x509"
 
     log = false
+    # 1 (implicit, pre-marker) or 2 (adds container_host / host).
+    schema = 2
 
     # Proxy transport config only; filtering is per guest.
     [proxy]
@@ -44,6 +46,7 @@ TOML schema -- ``$XDG_CONFIG_HOME/tartarus/config.toml`` (default
     autostart = false
     shared_folder = false
     requires = []
+    container_host = false
     proxy = { enable = true, allow_hosts = ["example.com"] }
 
     [[guests]]
@@ -55,6 +58,7 @@ TOML schema -- ``$XDG_CONFIG_HOME/tartarus/config.toml`` (default
     autostart = false
     shared_folder = false
     requires = []
+    # `host = "<vm>"` marks a nested container; omitted for native containers.
     proxy = { enable = false, allow_hosts = [] }
 
 Precedence, highest first: **CLI flag > environment variable > config.toml >
@@ -114,6 +118,13 @@ class Guest:
     requires: list[str] = field(default_factory=list)
     relays: list[GuestRelay] = field(default_factory=list)
     proxy: GuestProxy = field(default_factory=GuestProxy)
+    # True for a `kind = "vm"` guest that hosts nested nspawn containers
+    # (`vm.containerHost.enable`). Absent from old config files -> False.
+    container_host: bool = False
+    # For a `kind = "container"` guest, the container-host VM it runs nested
+    # inside; `None` means a native host-kernel container. Absent from old
+    # config files -> None.
+    host: str | None = None
 
 
 @dataclass
@@ -142,6 +153,9 @@ class Config:
     enabled_guests: list[Guest] = field(default_factory=list)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     log: bool = False
+    # config.toml schema version written by the host module (`schema = N`).
+    # Files predating the marker default to 1.
+    schema: int = 1
     config_path: Path | None = None
 
     def guest(self, name: str, kind: str | None = None) -> Guest | None:
@@ -150,6 +164,21 @@ class Config:
             if guest.name == name and (kind is None or guest.kind == kind):
                 return guest
         return None
+
+    def inner_guests(self, host_name: str) -> list[Guest]:
+        """Enabled container guests nested inside container-host VM ``host_name``.
+
+        Returns every enabled ``kind = "container"`` guest whose ``host`` points
+        at ``host_name``, in the stable order of :attr:`enabled_guests` (which
+        the generated config.toml emits sorted by name). A nested container's
+        lifecycle is owned by its host VM: the CLI only ever needs these to
+        ensure their key material exists before the VM is built.
+        """
+        return [
+            guest
+            for guest in self.enabled_guests
+            if guest.kind == "container" and guest.host == host_name
+        ]
 
     def require_guest(self, name: str, kind: str | None = None) -> Guest:
         """Return the enabled guest ``name`` or fail with an actionable error.
@@ -305,6 +334,19 @@ def _parse_guests(raw: Any) -> list[Guest]:
             if not isinstance(relays_raw, list):
                 raise TartarusError(f"guest '{name}': `relays` must be an array of tables")
 
+            # New in schema 2. A missing `host` (old config, or a native
+            # container) stays None; a present but empty/non-string value is a
+            # real error rather than silently ignored.
+            host_raw = item.get("host")
+            if host_raw is None:
+                host = None
+            elif isinstance(host_raw, str) and host_raw:
+                host = host_raw
+            else:
+                raise TartarusError(
+                    f"guest '{name}': `host` must be a non-empty string, got {host_raw!r}"
+                )
+
             guests.append(
                 Guest(
                     name=name,
@@ -329,6 +371,10 @@ def _parse_guests(raw: Any) -> list[Guest]:
                         enable=_as_bool(proxy_raw.get("enable", False), f"guest '{name}'.proxy.enable"),
                         allow_hosts=_as_list(proxy_raw.get("allow_hosts"), f"guest '{name}'.proxy.allow_hosts"),
                     ),
+                    container_host=_as_bool(
+                        item.get("container_host", False), f"guest '{name}'.container_host"
+                    ),
+                    host=host,
                 )
             )
     return guests
@@ -417,6 +463,18 @@ def load_config(overrides: Mapping[str, Any] | None = None) -> Config:
         ),
     )
 
+    # Schema 2 added container hosts (`container_host`) and nested containers
+    # (`host`). A file without the marker is schema 1 and still parses. A file
+    # newer than this CLI understands is a warning, never fatal: the fields we
+    # know are still valid.
+    schema = _as_int(data.get("schema", 1), "schema")
+    if schema > 2:
+        warn(
+            f"config.toml uses schema {schema}, newer than this tartarus "
+            "understands (2); unknown fields are ignored. Update tartarus or "
+            "rebuild your host."
+        )
+
     return Config(
         user=user,
         home_dir=home_dir,
@@ -429,5 +487,6 @@ def load_config(overrides: Mapping[str, Any] | None = None) -> Config:
         enabled_guests=_parse_guests(data.get("guests")),
         proxy=proxy,
         log=log,
+        schema=schema,
         config_path=config_path if config_path.is_file() else None,
     )

@@ -6,6 +6,8 @@
 #   * the **user's** flake root (never the tartarus repo);
 #   * the host-runtime paths (state, ssh, and the two CA roots);
 #   * every enabled guest's name/kind/effective id and proxy filtering;
+#   * container-host wiring: `container_host` for VMs, `host` for a nested
+#     container (omitted for native containers), and the `schema` version;
 #   * the global proxy transport endpoint (`resolvedListenAddresses`).
 #
 # It is written through home-manager because that is the mechanism that lands a
@@ -105,6 +107,8 @@
     graphical = ${tBool g.graphical}
     autostart = ${tBool g.autostart}
     shared_folder = ${tBool g.sharedFolder}
+    ${optionalString (g.kind == "vm") "container_host = ${tBool g.containerHost}"}
+    ${optionalString (g.host != null) "host = ${tStr g.host}"}
     requires = ${tArr g.requires}
     ${optionalString ((g.relays or []) != []) (concatStringsSep "" (map relayBlock g.relays))}proxy = ${tInline {
       enable = tBool g.proxy.enable;
@@ -123,6 +127,7 @@
     ssh_ca_dir = ${tStr sshRoot}
     x509_ca_dir = ${tStr x509Root}
     log = ${tBool cfg.log}
+    schema = 2
 
     [proxy]
     enable = ${tBool config.tartarus.proxy.enable}
@@ -163,6 +168,26 @@ in {
       type = types.bool;
       default = false;
       description = "Default logging toggle written to config.toml.";
+    };
+    hostMemoryMiB = mkOption {
+      type = types.nullOr types.ints.positive;
+      default = null;
+      description = ''
+        The host's physical RAM in MiB, used to resolve a guest's
+        `vm.mem = "host"` at evaluation time (the hypervisor still needs a fixed
+        RAM size at boot, so this becomes the guest's host-sized cap). When a
+        guest asks for `"host"` and this is null, evaluation fails with an
+        actionable error naming this option.
+      '';
+    };
+    hostCores = mkOption {
+      type = types.nullOr types.ints.positive;
+      default = null;
+      description = ''
+        The host's CPU count, used to resolve a guest's `vm.vcpu = "host"` at
+        evaluation time. When a guest asks for `"host"` and this is null,
+        evaluation fails with an actionable error naming this option.
+      '';
     };
   };
 

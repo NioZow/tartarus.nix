@@ -203,7 +203,7 @@ def status_word(running: bool) -> str:
     return c("32", "running") if running else c("90", "stopped")
 
 
-def instance_info(config: Config, name: str, kind: str) -> dict:
+def instance_info(config: Config, name: str, kind: str, *, container_host: bool = False) -> dict:
     state = config.state_dir(name)
     running = ssh.is_running(config, name)
     pid = cid = None
@@ -217,6 +217,7 @@ def instance_info(config: Config, name: str, kind: str) -> dict:
         "status": "running" if running else "stopped",
         "pid": pid,
         "cid": cid,
+        "container_host": container_host,
     }
 
 
@@ -224,7 +225,17 @@ def collect_instances(config: Config) -> list[dict]:
     # `list` must enumerate only guests enabled on this host: config.toml is the
     # authoritative enabled set (the flake's outputs are generated from it).
     templates = [name for name in flake.list_templates(config, "vm") if config.guest(name, "vm") is not None]
-    entries = [instance_info(config, name, "template") for name in templates]
+    # Resolve the container-host flag once per template (a numbered instance
+    # shares its base template's role) so the table/JSON can mark it.
+    container_hosts: set[str] = set()
+    for name in templates:
+        guest = config.guest(name, "vm")
+        if guest is not None and guest.container_host:
+            container_hosts.add(name)
+
+    entries = [
+        instance_info(config, name, "template", container_host=name in container_hosts) for name in templates
+    ]
 
     if config.state_root.is_dir():
         for entry in sorted(config.state_root.iterdir()):
@@ -233,7 +244,14 @@ def collect_instances(config: Config) -> list[dict]:
             name = entry.name
             match = flake.INSTANCE_RE.match(name)
             if match and match.group(1) in templates:
-                entries.append(instance_info(config, name, "instance"))
+                entries.append(
+                    instance_info(
+                        config,
+                        name,
+                        "instance",
+                        container_host=match.group(1) in container_hosts,
+                    )
+                )
 
     return entries
 
@@ -250,7 +268,13 @@ def action_list(config: Config, json_output: bool) -> None:
         return
 
     rows = [
-        [e["name"], status_word(e["status"] == "running"), e["type"], e["pid"] or "-", e["cid"] or "-"]
+        [
+            e["name"],
+            status_word(e["status"] == "running"),
+            f"{e['type']} (container host)" if e["container_host"] else e["type"],
+            e["pid"] or "-",
+            e["cid"] or "-",
+        ]
         for e in entries
     ]
     print_table(["NAME", "STATUS", "TYPE", "PID", "CID"], rows)
@@ -411,6 +435,16 @@ def action_start(config: Config, name: str, mounts: list[str], upgrade: bool = F
     flake.require_template(config, "vm", base)
 
     ca.ensure_vm_certs(config, base)
+
+    # A container-host VM's NixOS config publishes each nested container's
+    # CA-signed host key and client cert into the container (P2 bind mounts).
+    # Those files must exist before the VM is built, so ensure them here --
+    # the nested container itself is never started by the host CLI. `base`
+    # (not `name`) is the container-host template even for a numbered instance.
+    host_guest = config.guest(base, "vm")
+    if host_guest is not None and host_guest.container_host:
+        for inner in config.inner_guests(base):
+            ca.ensure_ctn_certs(config, inner.name)
 
     _reap_stale_vfkits(config, name)
 

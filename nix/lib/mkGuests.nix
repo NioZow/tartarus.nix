@@ -126,7 +126,24 @@
     hostPkgs = resolvedHostPkgs;
   };
 
-  vms = lib.mapAttrs (name: guest: build.mkVm name (guest // {id = vmIds.${name};})) vmGuests;
+  # Inner containers of each container-host VM, as `{ name, id, cfg }` records
+  # keyed by the host VM name. A container opts in with `host = "<vm>"`. Only a
+  # VM with `vm.containerHost.enable` receives them; a plain VM gets none.
+  innerByHost = hostName: let
+    host = vmGuests.${hostName} or {};
+  in
+    if (host.vm.containerHost.enable or false)
+    then
+      lib.mapAttrsToList
+      (n: c: {
+        name = n;
+        id = ctnIds.${n};
+        cfg = c;
+      })
+      (lib.filterAttrs (_: c: (c.host or null) == hostName) ctnGuests)
+    else [];
+
+  vms = lib.mapAttrs (name: guest: build.mkVm name (guest // {id = vmIds.${name};}) (innerByHost name)) vmGuests;
   ctns = lib.mapAttrs (name: guest: build.mkContainer name (guest // {id = ctnIds.${name};})) ctnGuests;
 
   nixosConfigurations =

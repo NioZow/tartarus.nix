@@ -76,6 +76,12 @@
   guests = config.tartarus.guests or {};
   globalProxy = config.tartarus.proxy or {};
 
+  # Host-level ceilings backing `vm.mem = "host"` / `vm.vcpu = "host"` (plan
+  # §8). Read from the consumer's evaluated host config; a hand-written sample
+  # config may omit them, which is fine until a guest actually asks for "host".
+  hostMemoryMiB = (config.tartarus or {}).hostMemoryMiB or null;
+  hostCores = (config.tartarus or {}).hostCores or null;
+
   # Resolve the proxy endpoint a guest should use. `location = "host"` (the
   # default) means the guest-side host gateway. A guest name means that VM's
   # trunk IP on Linux. On Darwin it also means the host gateway: vfkit/vmnet
@@ -134,10 +140,16 @@
     baseName,
     id,
     cfg,
+    # True for a nested container running inside a container-host VM.
+    inHostVm ? false,
+    # The container-host VM's inner containers, each `{ name, id, cfg }`
+    # (supplied by mkGuests). Empty for every other guest, so hand-written
+    # sample configs keep working.
+    innerContainers ? [],
   }: let
     proxyHost = proxyHostFor;
     platform = platformLib.mk {
-      inherit hostSystem kind id proxyHost;
+      inherit hostSystem kind id proxyHost inHostVm;
       disableVsock = (cfg.services or {}).disableVsock or false;
       proxyPort = globalProxy.port or 3128;
     };
@@ -170,14 +182,35 @@
       nixStoreOverlay = {
         size = 2048;
       };
+      # Defaults mirror `nix/lib/types.nix`'s containerHost submodule so a
+      # hand-written sample config (which skips the submodule) still resolves.
+      containerHost = {
+        enable = false;
+        stateVolume = {
+          size = 10240;
+        };
+        network = {
+          bridge = ids.innerBridge;
+          hostIP = ids.innerHostIP;
+          subnet = ids.innerSubnet;
+        };
+      };
     };
     vmCfg = cfg.vm or {};
+    chCfg = vmCfg.containerHost or {};
     vm =
       vmDefaults
       // vmCfg
       // {
         persistentHome = vmDefaults.persistentHome // (vmCfg.persistentHome or {});
         nixStoreOverlay = vmDefaults.nixStoreOverlay // (vmCfg.nixStoreOverlay or {});
+        containerHost =
+          vmDefaults.containerHost
+          // chCfg
+          // {
+            stateVolume = vmDefaults.containerHost.stateVolume // (chCfg.stateVolume or {});
+            network = vmDefaults.containerHost.network // (chCfg.network or {});
+          };
       };
 
     proxyCfg = cfg.proxy or {};
@@ -191,9 +224,17 @@
       hostHome
       hostUid
       lowHostUid
+      inHostVm
       ;
 
     isVm = platform.isVm;
+
+    # A VM that hosts nested systemd-nspawn containers. Only such a VM pulls in
+    # ./container-host.nix and the inner key-material shares.
+    isContainerHost = kind == "vm" && (cfg.vm.containerHost.enable or false);
+    # The inner containers as plain `{ name, id }` records so shares.nix can
+    # declare their key-material shares without re-deriving the container ids.
+    innerContainers = map (inner: {inherit (inner) name id;}) innerContainers;
 
     graphical = cfg.graphical or false;
     internet = cfg.internet or true;
@@ -293,40 +334,98 @@
     pkgs-unstable = pkgsUnstable;
   };
 
+  # Resolve one resource ceiling (plan §8). `null` means "let microvm.nix's own
+  # default apply" and is returned as null so mkVmHardware omits the definition;
+  # a positive integer is passed through unchanged; `"host"` is resolved to the
+  # matching host option (`tartarus.hostMemoryMiB` / `tartarus.hostCores`).
+  #
+  # Route chosen: explicit host options, not a runner prelude. microvm.nix's
+  # only runtime hook (`microvm.extraArgsScript`) merely *appends* arguments to
+  # the hypervisor command, while its runners always emit `--memory`/`--cpus`
+  # from `microvm.mem`/`microvm.vcpu`, so a runtime override would mean
+  # duplicate hypervisor flags. An explicit, rebuild-time option is unambiguous
+  # and keeps a fixed RAM size at boot (which hypervisors require).
+  resolveCeiling = {
+    guestName,
+    field,
+    optionName,
+    hostValue,
+    value,
+  }:
+    if value == null
+    then null
+    else if value == "host"
+    then
+      if hostValue != null
+      then hostValue
+      else
+        throw ''
+          tartarus: guest "${guestName}" sets vm.${field} = "host" but
+          ${optionName} is not set on this host. Set it to the host's ${
+            if field == "mem"
+            then "physical RAM in MiB"
+            else "CPU count"
+          } so the ceiling can be resolved at evaluation time.
+        ''
+    else value;
+
   # VM-only microvm.nix hardware wiring: hypervisor, CPU/RAM, the trunk
   # interface and VSOCK CID, all derived from the resolved platform/guest.
   # Shares live in guest/shares.nix, the store overlay in guest/store-overlay.nix.
-  mkVmHardware = guest: _: {
-    microvm = {
-      hypervisor = guest.platform.hypervisor;
-      vcpu = guest.vm.vcpu;
-      mem = guest.vm.mem;
-      kernelParams = ["net.ifnames=0"];
-      vsock.cid = guest.platform.vsockCid;
-      # QEMU, socat, jq, ... in the generated runner must be host-native
-      # (darwin) binaries, not the guest's Linux packages.
-      vmHostPackages = hostPkgs;
-      interfaces =
-        if guest.platform.isDarwin
-        then [
-          {
-            type = "user";
-            id = "vfkit-net0";
-            mac = ids.mkMac guest.id;
-          }
-        ]
-        else [
-          {
-            type = "bridge";
-            id = guest.platform.bridge;
-            bridge = guest.platform.bridge;
-            mac = ids.mkMac guest.id;
-          }
-        ];
+  mkVmHardware = guest: _: let
+    resolvedVcpu = resolveCeiling {
+      guestName = guest.baseName;
+      field = "vcpu";
+      optionName = "tartarus.hostCores";
+      hostValue = hostCores;
+      value = guest.vm.vcpu;
     };
+    resolvedMem = resolveCeiling {
+      guestName = guest.baseName;
+      field = "mem";
+      optionName = "tartarus.hostMemoryMiB";
+      hostValue = hostMemoryMiB;
+      value = guest.vm.mem;
+    };
+  in {
+    microvm =
+      {
+        hypervisor = guest.platform.hypervisor;
+        kernelParams = ["net.ifnames=0"];
+        vsock.cid = guest.platform.vsockCid;
+        # QEMU, socat, jq, ... in the generated runner must be host-native
+        # (darwin) binaries, not the guest's Linux packages.
+        vmHostPackages = hostPkgs;
+        interfaces =
+          if guest.platform.isDarwin
+          then [
+            {
+              type = "user";
+              id = "vfkit-net0";
+              mac = ids.mkMac guest.id;
+            }
+          ]
+          else [
+            {
+              type = "bridge";
+              id = guest.platform.bridge;
+              bridge = guest.platform.bridge;
+              mac = ids.mkMac guest.id;
+            }
+          ];
+      }
+      # `mkIf` keeps the attribute names always present (so module merging never
+      # forces a "host" resolution) while still falling through to microvm.nix's
+      # own default when the value is null.
+      // {
+        vcpu = lib.mkIf (resolvedVcpu != null) resolvedVcpu;
+        mem = lib.mkIf (resolvedMem != null) resolvedMem;
+      };
   };
 
-  mkVm = name: cfg: let
+  # `innerContainers` is the VM's nested container list (`{ name, id, cfg }`),
+  # supplied by mkGuests; empty for a plain VM.
+  mkVm = name: cfg: innerContainers: let
     vmName =
       if vmInstanceSuffix == ""
       then name
@@ -340,20 +439,50 @@
       name = vmName;
       baseName = name;
       id = vmId;
-      inherit cfg;
+      inherit cfg innerContainers;
     };
+
+    # Resolve each inner container through the same guest engine, flagged
+    # `inHostVm` so it addresses itself on the VM-local inner bridge. The
+    # records are handed to container-host.nix, which declares them as
+    # `containers.<name>` inside the VM. `modules`/`specialArgs` are exactly
+    # what the top-level `ctn-<name>` configuration gets, so the nested and
+    # standalone evaluations stay in lockstep.
+    innerRecords =
+      map (
+        inner: let
+          innerGuest = mkGuest {
+            kind = "container";
+            name = inner.name;
+            baseName = inner.name;
+            id = inner.id;
+            cfg = inner.cfg;
+            inHostVm = true;
+          };
+        in {
+          inherit (inner) name id;
+          modules = [
+            inputs.home-manager.nixosModules.home-manager
+            ./default.nix
+          ];
+          specialArgs = mkSpecialArgs innerGuest;
+        }
+      )
+      innerContainers;
   in
     lib.nixosSystem {
       inherit system;
       pkgs = guestPkgs;
       specialArgs = mkSpecialArgs guest;
-      modules = [
-        inputs.microvm.nixosModules.microvm
-        (mkVmHardware guest)
-        virtiofsdModule
-        inputs.home-manager.nixosModules.home-manager
-        ./default.nix
-      ];
+      modules =
+        [
+          inputs.microvm.nixosModules.microvm
+          (mkVmHardware guest)
+          virtiofsdModule
+          inputs.home-manager.nixosModules.home-manager
+          ./default.nix
+        ]
+        ++ lib.optional guest.isContainerHost (import ./container-host.nix {innerContainers = innerRecords;});
     };
 
   mkContainer = name: cfg: let
@@ -371,6 +500,9 @@
       baseName = name;
       id = ctrId;
       inherit cfg;
+      # A container with a `host` pointer runs nested inside that
+      # container-host VM; it uses the VM-local inner bridge addressing.
+      inHostVm = (cfg.host or null) != null;
     };
   in
     lib.nixosSystem {

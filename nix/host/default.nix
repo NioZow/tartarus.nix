@@ -119,6 +119,63 @@
     }
   ];
 
+  # ==== container-host pointer assertions ===============================
+  # `host = "<vm>"` ties a `kind = "container"` guest to a container-host VM
+  # (`kind = "vm"` + `vm.containerHost.enable = true`). Read the plain `guests`
+  # map, never `config.tartarus.guests`, to preserve the module-recursion
+  # safety documented in nix/host/instances.nix.
+  containerHostAssertions = concatLists (mapAttrsToList (name: guest: let
+      hostName = guest.host;
+      hostGuest =
+        if hostName == null
+        then null
+        else guests.${hostName} or null;
+      isNested = guest.kind == "container" && hostName != null;
+      hostServiceFlags = ["clipboardBridge" "sshAgentProxy" "sudoAuthProxy" "gpgAgentProxy"];
+      requestsHostService = any (flag: guest.services.${flag} or false) hostServiceFlags;
+    in [
+      {
+        assertion = hostName == null || guest.kind == "container";
+        message = "tartarus: guest '${name}' sets `host = \"${toString hostName}\"`; `host` is only valid on `kind = \"container\"` guests.";
+      }
+      {
+        assertion = hostName == null || hostGuest != null;
+        message = "tartarus: guest '${name}' sets `host = \"${toString hostName}\"` naming an unknown (or disabled) guest.";
+      }
+      {
+        assertion =
+          hostName
+          == null
+          || hostGuest == null
+          || (hostGuest.kind == "vm" && hostGuest.containerHost);
+        message = "tartarus: guest '${name}' sets `host = \"${toString hostName}\"`, which is not a `kind = \"vm\"` guest with `vm.containerHost.enable = true`.";
+      }
+      {
+        assertion = !(isDarwin && guest.kind == "container" && hostName == null);
+        message = "tartarus: guest '${name}' is a `kind = \"container\"` on Darwin with no `host`; containers need a Linux kernel, so set `host` to a `kind = \"vm\"` guest with `vm.containerHost.enable = true`.";
+      }
+      {
+        assertion = !(guest.containerHost && guest.kind == "container");
+        message = "tartarus: guest '${name}' sets `vm.containerHost.enable = true` on a `kind = \"container\"` guest; `vm.containerHost` is VM-only.";
+      }
+      # Feature gating for nested containers: the host-side wiring for these is
+      # not implemented yet, so fail loudly rather than silently mis-wiring the
+      # guest to the host container bridge (plan §5.3).
+      {
+        assertion = !(isNested && (guest.relays or []) != []);
+        message = "tartarus: nested container '${name}' sets `relays`; host-side relays are unsupported for nested containers (see the container-host plan §5.3).";
+      }
+      {
+        assertion = !(isNested && requestsHostService);
+        message = "tartarus: nested container '${name}' enables a host service integration (clipboardBridge/sshAgentProxy/sudoAuthProxy/gpgAgentProxy); host service wiring for nested containers is not supported yet.";
+      }
+      {
+        assertion = !(isNested && (guest.proxy.enable or false));
+        message = "tartarus: nested container '${name}' sets `proxy.enable = true`; host proxy routing for nested containers is not implemented yet.";
+      }
+    ])
+    guests);
+
   # The full tartarus assertion list. Exposed read-only under an internal
   # option so the eval-level test suite can inspect *these* predicates without
   # tripping over unrelated nixpkgs assertions (see tests/suite.nix).
@@ -127,7 +184,8 @@
     ++ [proxyLocationAssertion]
     ++ requiresAssertions
     ++ mkIdAssertions "vm"
-    ++ mkIdAssertions "container";
+    ++ mkIdAssertions "container"
+    ++ containerHostAssertions;
 in {
   imports =
     [

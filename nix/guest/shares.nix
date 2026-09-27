@@ -24,6 +24,7 @@
 }: let
   inherit
     (lib)
+    concatMap
     dirOf
     filter
     hasPrefix
@@ -92,6 +93,31 @@
         snapshot = false;
       }
     ]
+    # Key material for each nested container of a container-host VM. The share
+    # lands in the VM (under /var/lib/tartarus-inner/<name>), and
+    # container-host.nix bind-mounts it read-only into the container at
+    # /etc/tartarus/{ssh,x509}. Read-only and never snapshotted: they hold
+    # private host/client keys. `vm.action_start` provisions each inner
+    # container's certs before building the VM, so the host sources exist at
+    # build time.
+    ++ concatMap (inner: [
+      {
+        tag = "tartarus-inner-${inner.name}-ssh";
+        source = "${g.hostHome}/.local/share/tartarus/ssh/machines/containers/${inner.name}";
+        mountPoint = "/var/lib/tartarus-inner/${inner.name}/ssh";
+        proto = p.shareProto;
+        readOnly = true;
+        snapshot = false;
+      }
+      {
+        tag = "tartarus-inner-${inner.name}-x509";
+        source = "${g.hostHome}/.local/share/tartarus/x509/machines/containers/${inner.name}";
+        mountPoint = "/var/lib/tartarus-inner/${inner.name}/x509";
+        proto = p.shareProto;
+        readOnly = true;
+        snapshot = false;
+      }
+    ]) (g.innerContainers or [])
     ++ extraShares;
 
   isWritableNinePShare = s: (s.proto or "9p") == "9p" && !(s.readOnly or false);

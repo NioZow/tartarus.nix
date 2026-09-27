@@ -68,6 +68,16 @@ in {
           '';
         };
 
+        host = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = ''
+            Run this `kind = "container"` guest nested inside the named
+            container-host VM (`kind = "vm"` with `vm.containerHost.enable =
+            true`). Required on Darwin.
+          '';
+        };
+
         graphical = mkEnableOption "graphical remote-display support for this guest";
 
         internet = mkOption {

@@ -30,6 +30,7 @@
     (lib)
     concatLists
     filter
+    filterAttrs
     map
     mapAttrsToList
     mkMerge
@@ -49,13 +50,18 @@
   # reading it here rather than `config.tartarus.guests` avoids the nixpkgs
   # `_module.args` recursion this module would otherwise trigger while defining
   # `launchd.*`.
+  #
+  # Relays are host-side forwards into a guest and make no sense for a nested
+  # container (it has no host-reachable address); the P3 assertions reject them
+  # outright, and this filter keeps the generation defensive.
+  hostSideGuests = filterAttrs (_: g: (g.host or null) == null) instances.guests;
   declared = concatLists (
     mapAttrsToList (
       name: g:
         map (relay: {inherit name relay;})
         (g.relays or [])
     )
-    instances.guests
+    hostSideGuests
   );
 
   proxyRelay =

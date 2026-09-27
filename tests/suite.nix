@@ -115,6 +115,18 @@
   in
     r.success && r.value;
 
+  # `assertionsPass` only reads the plain instances map, which never touches
+  # `vm.mem` / `vm.vcpu`, so an invalid resource ceiling must be forced
+  # explicitly for its type check to run. `deepSeq` forces the nested values.
+  resourceFieldsOk = host: let
+    r = builtins.tryEval (
+      builtins.deepSeq
+      (builtins.map (g: [g.vm.mem g.vm.vcpu]) (lib.attrValues host.config.tartarus.guests))
+      true
+    );
+  in
+    r.success && r.value;
+
   # ==== sample guest sets ===============================================
   fullProxy = {
     enable = true;
@@ -487,6 +499,301 @@
     };
   };
 
+  # ==== container-host / resource-ceiling hosts =========================
+  # Darwin argument containers need a Linux kernel, so one with no `host`
+  # pointer must be rejected.
+  hostDarwinContainerNoHost = mkDarwinHost {
+    c = {
+      enable = true;
+      kind = "container";
+      id = 4;
+      internet = true;
+    };
+  };
+
+  # Linux: a container-host VM plus an inner container pointing at it passes.
+  hostContainerHostOk = mkHost {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+      };
+    };
+  };
+
+  # The named host does not exist.
+  hostContainerUnknown = mkHost {
+    guests.inner = {
+      enable = true;
+      kind = "container";
+      id = 6;
+      internet = true;
+      host = "ghost";
+    };
+  };
+
+  # The named guest exists but is a plain VM (containerHost disabled).
+  hostContainerNotHost = mkHost {
+    guests = {
+      plain = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "plain";
+      };
+    };
+  };
+
+  # `vm.containerHost.enable` is VM-only.
+  hostContainerHostOnContainer = mkHost {
+    guests.bad = {
+      enable = true;
+      kind = "container";
+      id = 6;
+      internet = true;
+      vm.containerHost.enable = true;
+    };
+  };
+
+  # `host` is container-only; a VM using it fails even when the target is a
+  # valid container host.
+  hostHostOnVm = mkHost {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      v = {
+        enable = true;
+        kind = "vm";
+        id = 7;
+        internet = true;
+        host = "ch";
+      };
+    };
+  };
+
+  # ==== P3: host-side predicate coverage ================================
+  # A container-host VM `ch` with a nested `inner` and a native `box`. Only
+  # `box` is host-side; `inner` lives on the VM's inner bridge (`10.202.0.6`)
+  # and must never appear on the host container bridge (`trs1`).
+  hostNestedAndNative = mkHost {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+      };
+      box = {
+        enable = true;
+        kind = "container";
+        id = 7;
+        internet = true;
+      };
+    };
+  };
+  nestedAndNativeNft = nftOf hostNestedAndNative;
+  nestedAndNativeCtn = nestedAndNativeNft.tartarus_container.content;
+
+  # A nested container that opts into the host proxy. The step-7 assertion
+  # rejects it, but the option-level `tartarus.proxy.clients` must exclude it
+  # defensively -- hence this host is only ever inspected through the option,
+  # never through `assertionsPass` (the nested-proxy rejection has its own
+  # fixture below).
+  hostProxyNested = mkHost {
+    proxy = {
+      enable = true;
+      location = "host";
+      port = 3128;
+      log = false;
+    };
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = false;
+        host = "ch";
+        proxy = {
+          enable = true;
+          allowHosts = ["nested.example"];
+        };
+      };
+      box = {
+        enable = true;
+        kind = "container";
+        id = 7;
+        internet = false;
+        proxy = {
+          enable = true;
+          allowHosts = ["box.example"];
+        };
+      };
+    };
+  };
+  proxyNestedClientNames = map (c: c.name) hostProxyNested.config.tartarus.proxy.clients;
+
+  # A nested container with `autostart = true`: the autostart entry must be for
+  # the host VM `ch`, not for `inner` (which the VM starts itself).
+  hostNestedAutostart = mkHost {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        autostart = true;
+      };
+    };
+  };
+  nestedAutostartNames = map (g: g.name) hostNestedAutostart.config.tartarus.instances.autostart;
+
+  # Both the host VM and its nested container ask for autostart: the two
+  # requests must collapse to a single host VM unit.
+  hostNestedAutostartDup = mkHost {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        autostart = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        autostart = true;
+      };
+    };
+  };
+  nestedAutostartDupNames = map (g: g.name) hostNestedAutostartDup.config.tartarus.instances.autostart;
+
+  # Step-7 rejections: a nested container may not declare host-side relays,
+  # request a host service, or route through the host proxy yet.
+  hostNestedRelays = mkHost {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        relays = [{port = 8080;}];
+      };
+    };
+  };
+  hostNestedService = mkHost {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        services.sudoAuthProxy = true;
+      };
+    };
+  };
+
+  # Nullable / "host" sentinel ceilings must type-check.
+  hostMemNullHost = mkHost {
+    guests = {
+      a = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm = {
+          mem = null;
+          vcpu = "host";
+        };
+      };
+      b = {
+        enable = true;
+        kind = "vm";
+        id = 6;
+        internet = true;
+        vm = {
+          mem = "host";
+          vcpu = null;
+        };
+      };
+    };
+  };
+
+  # A non-positive mem must fail the type check when the value is forced.
+  hostMemBad = mkHost {
+    guests.a = {
+      enable = true;
+      kind = "vm";
+      id = 5;
+      internet = true;
+      vm.mem = -1;
+    };
+  };
+
   # ==== rendered nftables ===============================================
   nftOf = host: host.config.networking.nftables.tables;
   # Split a kind's table content at the forward chain: everything before it is
@@ -500,6 +807,9 @@
   # so a disabled guest's name must never appear -- that absence is exactly what
   # the CLI guard (`Config.require_guest`) treats as "not enabled".
   configToml = hostOk.config.home-manager.users.user.home.file.".config/tartarus/config.toml".text;
+  # A container-host VM (`ch`) plus its nested container (`inner`), rendered
+  # through the same host module as configToml.
+  containerHostToml = hostContainerHostOk.config.home-manager.users.user.home.file.".config/tartarus/config.toml".text;
   vmContent = hostOkNft.tartarus_vm.content;
   vmForward = forwardPart "vm" vmContent;
   ctnContent = hostOkNft.tartarus_container.content;
@@ -547,6 +857,11 @@
     hostSystem ? evalSystem,
     globalProxy,
     guests,
+    # Host-level ceilings for `vm.mem = "host"` / `vm.vcpu = "host"` (P5). Left
+    # out of the sample config entirely when null so the "option unset" path is
+    # exercised faithfully.
+    hostMemoryMiB ? null,
+    hostCores ? null,
   }:
     self.lib.mkGuests {
       inherit inputs;
@@ -557,8 +872,13 @@
       hostPkgs = pkgs;
       homeDir = "/home/user";
       config = {
-        tartarus.proxy = globalProxy;
-        tartarus.guests = guests;
+        tartarus =
+          {
+            proxy = globalProxy;
+            guests = guests;
+          }
+          // (lib.optionalAttrs (hostMemoryMiB != null) {inherit hostMemoryMiB;})
+          // (lib.optionalAttrs (hostCores != null) {inherit hostCores;});
       };
     };
 
@@ -670,6 +990,102 @@
       };
     };
   };
+
+  # A container-host VM (`ch`) with one nested container (`inner`). Proves the
+  # build engine declares `containers.inner` inside the VM's config and that the
+  # inner container evaluates with inner-bridge addressing.
+  chGuests = mkGuests {
+    globalProxy.enable = false;
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+      };
+    };
+  };
+  chVm = chGuests.nixosConfigurations."vm-ch";
+  chInner = chGuests.nixosConfigurations."ctn-inner";
+
+  # ==== P5: resource-ceiling resolution =================================
+  # A plain VM keeps the numeric defaults (768 MiB / 1 vCPU) passed straight to
+  # microvm.nix -- the regression guard for the retyped `vm.mem`/`vm.vcpu`.
+  memDefaultVm =
+    (mkGuests {
+      globalProxy.enable = false;
+      guests.v = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+      };
+    })
+    .nixosConfigurations."vm-v";
+
+  # Explicit `null` must omit the definition so microvm.nix's own defaults win.
+  # Pinned source: `nixos-modules/microvm/options.nix` -> mem default 512, vcpu
+  # default 1.
+  memNullVm =
+    (mkGuests {
+      globalProxy.enable = false;
+      guests.v = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm = {
+          mem = null;
+          vcpu = null;
+        };
+      };
+    })
+    .nixosConfigurations."vm-v";
+
+  # `"host"` resolves through the explicit host options at evaluation time.
+  memHostVm =
+    (mkGuests {
+      globalProxy.enable = false;
+      hostMemoryMiB = 4096;
+      hostCores = 8;
+      guests.v = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm = {
+          mem = "host";
+          vcpu = "host";
+        };
+      };
+    })
+    .nixosConfigurations."vm-v";
+
+  # `"host"` with the matching host option unset must fail evaluation, not
+  # silently fall back to a hypervisor default.
+  memHostUnsetVm =
+    (mkGuests {
+      globalProxy.enable = false;
+      guests.v = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm = {
+          mem = "host";
+          vcpu = "host";
+        };
+      };
+    })
+    .nixosConfigurations."vm-v";
 
   # ==== standalone service modules ======================================
   # The three service packages must be usable from *any* NixOS/home-manager
@@ -943,6 +1359,203 @@ in {
     "assertions/requires-cycle-rejected" =
       T (!assertionsPass hostRequiresCycle) "requires cycle was accepted";
 
+    # ---- container-host pointer + resource ceilings ---------------------
+    "assertions/darwin-container-needs-host-rejected" =
+      T (!assertionsPass hostDarwinContainerNoHost) "a Darwin container without a host was accepted";
+    "assertions/container-host-ok" =
+      T (assertionsPass hostContainerHostOk) "a valid container host + inner container was rejected";
+    "assertions/container-host-unknown-rejected" =
+      T (!assertionsPass hostContainerUnknown) "a container naming an unknown host was accepted";
+    "assertions/container-host-not-a-host-rejected" =
+      T (!assertionsPass hostContainerNotHost) "a container naming a non-container-host VM was accepted";
+    "assertions/containerhost-on-container-rejected" =
+      T (!assertionsPass hostContainerHostOnContainer) "vm.containerHost.enable on a container was accepted";
+    "assertions/host-on-vm-rejected" =
+      T (!assertionsPass hostHostOnVm) "`host` on a kind = \"vm\" guest was accepted";
+    "types/mem-null-and-host-ok" =
+      T (assertionsPass hostMemNullHost && resourceFieldsOk hostMemNullHost) "null/\"host\" mem or vcpu was rejected";
+    "types/mem-bad-rejected" =
+      T (!resourceFieldsOk hostMemBad) "vm.mem = -1 did not fail the type check";
+
+    # ---- P5: mem/vcpu resolution into microvm.nix -----------------------
+    "types/mem-defaults-numeric" =
+      T
+      (memDefaultVm.config.microvm.mem == 768 && memDefaultVm.config.microvm.vcpu == 1)
+      "numeric defaults (768/1) were not passed through to microvm.nix";
+    # Pinned microvm.nix default: mem = 512, vcpu = 1.
+    "types/mem-null-uses-hypervisor-default" =
+      T
+      (memNullVm.config.microvm.mem == 512 && memNullVm.config.microvm.vcpu == 1)
+      "mem/vcpu = null did not fall through to microvm.nix's defaults (512/1)";
+    "types/mem-host-resolves" =
+      T
+      (memHostVm.config.microvm.mem == 4096 && memHostVm.config.microvm.vcpu == 8)
+      "\"host\" did not resolve to tartarus.hostMemoryMiB / tartarus.hostCores";
+    "types/mem-host-unset-throws" =
+      T
+      (let
+        r = builtins.tryEval (builtins.deepSeq memHostUnsetVm.config.microvm.mem true);
+      in
+        !r.success)
+      "\"host\" with an unset host option did not fail evaluation";
+
+    # ---- inner containers on a container-host VM (P2 build engine) ------
+    # A nested container is Linux-inner regardless of the host platform: the
+    # darwin hostSystem below must not change its address/bridge.
+    "platform/inner-container-addressing" =
+      T
+      (let
+        pl = platform.mk {
+          hostSystem = "aarch64-darwin";
+          kind = "container";
+          id = 6;
+          inHostVm = true;
+        };
+      in
+        pl.guestIP
+        == "10.202.0.6"
+        && pl.gateway == "10.202.0.1"
+        && pl.hostIP == "10.202.0.1"
+        && pl.subnet == "10.202.0.0/24"
+        && !pl.isDarwin
+        && !pl.vsockAvailable
+        && !pl.useVsock
+        && pl.bridge == "trs2")
+      "inner-container platform resolution changed";
+    "platform/inner-container-constants" =
+      T
+      (ids.innerBridge
+        == "trs2"
+        && ids.innerSubnet == "10.202.0.0/24"
+        && ids.innerHostIP == "10.202.0.1"
+        && ids.mkInnerIP 6 == "10.202.0.6")
+      "ids.nix inner constants changed";
+
+    "container-host/configurations" =
+      T
+      (attrNames chGuests.nixosConfigurations
+        == ["ctn-inner" "vm-ch"]
+        && attrNames chGuests.packages.${evalSystem} == ["vm-ch"])
+      "container-host mkGuests output names changed";
+
+    # The VM's config must declare the nested container and wire the bridge
+    # model: hostBridge + privateNetwork, autoStart, persistent state.
+    "container-host/nested-declared" =
+      T
+      (chVm.config.containers ? inner
+        && chVm.config.containers.inner.hostBridge == "trs2"
+        && chVm.config.containers.inner.privateNetwork
+        && chVm.config.containers.inner.autoStart
+        && chVm.config.containers.inner.ephemeral == false)
+      "containers.inner bridge/network flags changed";
+
+    "container-host/nested-bindmounts" =
+      T
+      (chVm.config.containers.inner.bindMounts ? "/etc/tartarus/ssh"
+        && chVm.config.containers.inner.bindMounts ? "/etc/tartarus/x509"
+        && chVm.config.containers.inner.bindMounts."/etc/tartarus/ssh".isReadOnly
+        && chVm.config.containers.inner.bindMounts."/etc/tartarus/x509".isReadOnly)
+      "containers.inner key bind mounts are missing or writable";
+
+    # Force the nested container's own evaluation: its config must resolve with
+    # inner-bridge addressing. `tryEval` so a heavy/fragile nested eval reports
+    # rather than crashing the whole suite.
+    "container-host/nested-config-addressing" =
+      T
+      (let
+        r = builtins.tryEval (
+          chVm.config.containers.inner.config.networking.nameservers
+          == ["10.202.0.1"]
+          && lib.any (a: a.address == "10.202.0.6")
+          chVm.config.containers.inner.config.networking.interfaces.eth0.ipv4.addresses
+        );
+      in
+        r.success && r.value)
+      "the nested container config did not evaluate with inner addressing";
+
+    # The inner container is still a standalone `ctn-<name>` configuration, now
+    # built with inner-bridge addressing.
+    "container-host/inner-standalone-addressing" =
+      T
+      (lib.any (a: a.address == "10.202.0.6") chInner.config.networking.interfaces.eth0.ipv4.addresses
+        && chInner.config.networking.nameservers == ["10.202.0.1"]
+        && chInner.config.networking.defaultGateway.address == "10.202.0.1")
+      "the inner container did not evaluate with inner-bridge addressing";
+
+    # ---- P3: nested containers are host-side absent ---------------------
+    # A host with only a container-host VM and its nested container emits no
+    # host `tartarus_container` table and no `trs1` container bridge.
+    "p3/nested-only-no-container-table" =
+      T
+      (!(hostContainerHostOk.config.networking.nftables.tables ? tartarus_container))
+      "a nested-only host still emitted the host tartarus_container table";
+    "p3/nested-only-no-container-bridge" =
+      T
+      (!(hostContainerHostOk.config.systemd.network.networks ? "10-trs1"))
+      "a nested-only host still declared the trs1 container bridge";
+    "p3/nested-only-hostSideNames-empty" =
+      T
+      (hostContainerHostOk.config.tartarus.instances.container.hostSideNames == [])
+      "nested-only host reported a host-side container";
+
+    # With a native container present, the table exists and its constant set
+    # lists only the native container's host-bridge address.
+    "p3/mixed-container-table-present" =
+      T (nestedAndNativeNft ? tartarus_container) "the mixed host did not emit the container table";
+    "p3/mixed-set-has-native" =
+      inStr "10.201.0.7  comment \"box\"" nestedAndNativeCtn;
+    "p3/mixed-set-excludes-nested" =
+      T
+      (!(hasInfix "10.201.0.6" nestedAndNativeCtn) && !(hasInfix "comment \"inner\"" nestedAndNativeCtn))
+      "the nested container leaked into the host container host set";
+    "p3/mixed-hostSideNames" =
+      T
+      (hostNestedAndNative.config.tartarus.instances.container.hostSideNames == ["box"])
+      "hostSideNames did not exclude the nested container";
+    "p3/nested-address-is-inner" =
+      T
+      (hostNestedAndNative.config.tartarus.instances.guests.inner.ip
+        == "10.202.0.6"
+        && hostNestedAndNative.config.tartarus.instances.guests.box.ip == "10.201.0.7")
+      "a nested container's plain `ip` is not its inner-bridge address";
+
+    # Id assignment is deliberately unchanged: nested containers still consume
+    # ids from the container pool and stay in `enabledNames`/`idByName`.
+    "p3/enabledNames-still-full" =
+      T
+      (hostNestedAndNative.config.tartarus.instances.container.enabledNames == ["box" "inner"])
+      "enabledNames no longer includes every enabled container";
+    "p3/idByName-still-has-nested" =
+      T
+      (hostNestedAndNative.config.tartarus.instances.container.idByName.inner == 6)
+      "idByName dropped or remapped the nested container id";
+
+    # The host proxy ACL/listen set never names a nested container.
+    "p3/proxy-clients-exclude-nested" =
+      T
+      (lib.elem "box" proxyNestedClientNames && !(lib.elem "inner" proxyNestedClientNames))
+      "tartarus.proxy.clients included a nested container";
+
+    # Autostart of a nested container starts its host VM, with no unit that
+    # tries to start the inner container directly.
+    "p3/nested-autostart-targets-host" =
+      T (nestedAutostartNames == ["ch"]) "nested autostart did not target its host VM";
+    "p3/nested-autostart-no-inner-unit" =
+      T
+      (!(hostNestedAutostart.config.systemd.user.services ? "tartarus-autostart-inner")
+        && hostNestedAutostart.config.systemd.user.services ? "tartarus-autostart-ch")
+      "nested autostart generated an inner unit (or omitted the host unit)";
+    "p3/autostart-duplicates-deduped" =
+      T (nestedAutostartDupNames == ["ch"]) "host + nested autostart were not deduped to one unit";
+
+    # Step-7 rejections.
+    "p3/nested-relays-rejected" =
+      T (!assertionsPass hostNestedRelays) "a nested container with relays was accepted";
+    "p3/nested-service-rejected" =
+      T (!assertionsPass hostNestedService) "a nested container requesting a host service was accepted";
+    "p3/nested-proxy-rejected" =
+      T (!assertionsPass hostProxyNested) "a nested container with proxy.enable was accepted";
+
     # ---- Darwin guest firewall: host-service allowances ----------------
     # A proxy-only guest that opts into an in-guest firewall must still reach
     # the host's user services (their ports are outside the trs subnets on
@@ -1055,6 +1668,19 @@ in {
     "config/disabled-guest-omitted" =
       notInStr ''name = "ghost"'' configToml;
 
+    # ---- generated config.toml: schema 2 + container hosts --------------
+    # Schema marker, the VM's `container_host` flag, and the nested
+    # container's `host` pointer must all reach config.toml.
+    "config/schema-v2" = inStr "schema = 2" containerHostToml;
+    "config/container-host-flag" = inStr "container_host = true" containerHostToml;
+    "config/nested-host-pointer" = inStr ''host = "ch"'' containerHostToml;
+    # Every VM carries the flag (true or false); native containers do not.
+    "config/container-host-flag-false" = inStr "container_host = false" configToml;
+    # No VM/container in hostOk declares a `host` pointer, so no guest block
+    # emits `host = "..."` (relay `host` lines would be the only other source,
+    # and hostOk has none).
+    "config/native-guest-no-host-pointer" = notInStr "host = \"" configToml;
+
     # ---- standalone service modules -------------------------------------
     # Each service must evaluate from a bare config that imports *only* that
     # module (no tartarus host/guest modules), and the legacy
@@ -1102,7 +1728,21 @@ in {
 
   # Human-inspectable renderings (plain strings, safe for `nix eval --json`).
   rendered = {
-    inherit squidDefault squidLogged vmContent ctnContent natContent vmForwardGuest ctnForwardGuest natGuest envLinux envGuestProxy envDarwin configToml;
+    inherit
+      squidDefault
+      squidLogged
+      vmContent
+      ctnContent
+      natContent
+      vmForwardGuest
+      ctnForwardGuest
+      natGuest
+      envLinux
+      envGuestProxy
+      envDarwin
+      configToml
+      containerHostToml
+      ;
     vmInput = inputPart "vm" vmContent;
     ctnInput = inputPart "container" ctnContent;
     resolvedListenHost = hostOk.config.tartarus.proxy.resolvedListenAddresses;

@@ -45,6 +45,16 @@ in {
     }
   ];
 
+  # An inner container (nested inside a container-host VM) has no per-container
+  # host address -- its host side is the VM's shared inner bridge -- so it needs
+  # an explicit default route via that bridge's host IP to reach beyond its /24
+  # (DNS/proxy on the VM, and the internet through the VM's NAT). Native
+  # containers get this from nixos-container's --local-address/--host-address.
+  networking.defaultGateway = mkIf (g.inHostVm or false) {
+    address = p.gateway;
+    interface = "eth0";
+  };
+
   # VSOCK is Linux-VM-only. The guest sshd additionally listens on it so the
   # host can reach it without TCP when VSOCK is available.
   systemd.sockets.sshd-vsock = mkIf p.vsockAvailable {

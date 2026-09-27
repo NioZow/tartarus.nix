@@ -15,8 +15,9 @@ import subprocess
 from pathlib import Path
 from typing import NoReturn
 
-from . import ca, system
+from . import ca, ssh, system
 from .config import Config
+from .errors import TartarusError
 from .nix import eval as nix_eval
 from .nix import flake
 from .output import c, die, info, ok, print_table, warn
@@ -118,25 +119,40 @@ def next_instance_name(base: str) -> str:
     die(f"no free instance number for '{base}'")
 
 
-def instance_info(name: str, kind: str) -> dict:
+def instance_info(name: str, kind: str, host: str | None = None) -> dict:
     if name not in list_conf_names():
-        return {"name": name, "type": kind, "status": "not provisioned", "address": None}
+        return {"name": name, "type": kind, "status": "not provisioned", "address": None, "host": host}
     return {
         "name": name,
         "type": kind,
         "status": "running" if is_running(name) else "stopped",
         "address": read_local_address(name),
+        "host": host,
     }
+
+
+def _host_of_by_template(config: Config, templates: list[str]) -> dict[str, str | None]:
+    """Map each container template to its `host` pointer (`None` if native).
+
+    Resolved once per template so `list`/`status` never re-run a nix eval for
+    every table row just to read a name already present in config.toml.
+    """
+    host_of: dict[str, str | None] = {}
+    for name in templates:
+        guest = config.guest(name, "container")
+        host_of[name] = guest.host if guest is not None else None
+    return host_of
 
 
 def collect_instances(config: Config) -> list[dict]:
     templates = list_templates(config)
-    entries = [instance_info(name, "template") for name in templates]
+    host_of = _host_of_by_template(config, templates)
+    entries = [instance_info(name, "template", host_of[name]) for name in templates]
 
     extra = sorted(
         name for name in list_conf_names() if base_name(config, name) != name and base_name(config, name) in templates
     )
-    entries += [instance_info(name, "instance") for name in extra]
+    entries += [instance_info(name, "instance", host_of.get(base_name(config, name))) for name in extra]
 
     return entries
 
@@ -152,15 +168,26 @@ def action_list(config: Config, json_output: bool) -> None:
         print("No containers defined.")
         return
 
-    rows = [[e["name"], status_word(e["status"]), e["type"], e["address"] or "-"] for e in entries]
-    print_table(["NAME", "STATUS", "TYPE", "ADDRESS"], rows)
+    rows = [
+        [e["name"], status_word(e["status"]), e["type"], e["address"] or "-", e["host"] or "-"] for e in entries
+    ]
+    print_table(["NAME", "STATUS", "TYPE", "ADDRESS", "HOST"], rows)
 
 
 def action_status(config: Config, name: str | None) -> None:
     if not name:
         action_list(config, False)
         return
-    require_template(config, base_name(config, name))
+    base = base_name(config, name)
+    require_template(config, base)
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        # A nested container is not registered with `nixos-container` on the
+        # host; its state is the host VM's. Report the association instead of
+        # "not provisioned".
+        host_state = "running" if ssh.is_running(config, guest.host) else "stopped"
+        print(f"{name}: nested in container-host VM '{guest.host}' ({status_word(host_state)})")
+        return
     if name not in list_conf_names():
         print(f"{name}: {status_word('not provisioned')}")
         return
@@ -202,9 +229,23 @@ def create_adhoc(config: Config, name: str, base: str) -> None:
     print(f"    cert (only the canonical '{base}' does).")
 
 
-def action_start(config: Config, name: str) -> None:
+def action_start(config: Config, name: str, upgrade: bool = False) -> None:
     base = base_name(config, name)
     require_template(config, base)
+
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        # Nested container: it has no `nixos-container` registration and no
+        # own systemd unit on the host. It is eager -- the host VM's NixOS
+        # config declares it with `autoStart = true` -- so starting it means
+        # ensuring its key material and starting (or reusing) the host VM.
+        from . import vm  # lazy to avoid a circular import
+
+        ca.ensure_ctn_certs(config, base)
+        info(f"'{name}' runs inside container-host VM '{guest.host}'; ensuring the VM is up...")
+        vm.action_start(config, guest.host, mounts=[], upgrade=upgrade)
+        ok(f"'{name}' is up with container-host VM '{guest.host}' (nested containers start eagerly).")
+        return
 
     if name not in list_conf_names():
         if name != base:
@@ -232,9 +273,20 @@ def action_start(config: Config, name: str) -> None:
     ok(f"'{name}' started.")
 
 
-def action_build(config: Config, name: str) -> None:
+def action_build(config: Config, name: str, upgrade: bool = False) -> None:
     base = base_name(config, name)
     require_template(config, base)
+
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        # A nested container is built as part of its container-host VM's one
+        # NixOS build (P2); there is no standalone `ctn-<name>` build to run.
+        from . import vm  # lazy to avoid a circular import
+
+        info(f"'{name}' is built as part of container-host VM '{guest.host}'.")
+        vm.action_build(config, guest.host, mounts=[], upgrade=upgrade)
+        return
+
     state = config.state_dir(name)
     state.mkdir(parents=True, exist_ok=True)
     nix_eval.build(flake.flake_ref(config), flake.ctn_config_attr(base), state / "result")
@@ -242,7 +294,15 @@ def action_build(config: Config, name: str) -> None:
 
 
 def action_spawn(config: Config, template: str, name_override: str | None) -> None:
-    require_template(config, template)
+    base = base_name(config, template)
+    require_template(config, base)
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        raise TartarusError(
+            f"'{template}' is a nested container inside container-host VM "
+            f"'{guest.host}'; ad-hoc instances are not supported. Add another "
+            "declarative container to that VM's container set and rebuild."
+        )
     name = name_override or next_instance_name(template)
     if name in list_conf_names():
         die(f"instance '{name}' already exists -- use `tartarus --container start {name}` instead")
@@ -251,7 +311,15 @@ def action_spawn(config: Config, template: str, name_override: str | None) -> No
 
 
 def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> None:
-    require_template(config, base_name(config, name))
+    base = base_name(config, name)
+    require_template(config, base)
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        raise TartarusError(
+            f"'{name}' is a nested container inside container-host VM "
+            f"'{guest.host}'; it cannot be stopped independently. Stop the VM "
+            f"instead: tartarus stop {guest.host}"
+        )
 
     if name not in list_conf_names():
         warn(f"'{name}' does not exist.")
@@ -273,6 +341,13 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
 def action_restart(config: Config, name: str) -> None:
     base = base_name(config, name)
     require_template(config, base)
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        raise TartarusError(
+            f"'{name}' is a nested container inside container-host VM "
+            f"'{guest.host}'; it cannot be restarted independently. Restart the "
+            f"VM instead: tartarus restart {guest.host}"
+        )
     if name not in list_conf_names():
         die(f"'{name}' has never been created -- use `tartarus --container start` or `spawn` first")
     ca.ensure_ctn_certs(config, base)
@@ -281,13 +356,84 @@ def action_restart(config: Config, name: str) -> None:
 
 
 def action_logs(config: Config, name: str) -> NoReturn:
-    require_template(config, base_name(config, name))
+    base = base_name(config, name)
+    require_template(config, base)
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        raise TartarusError(
+            f"'{name}' is a nested container inside container-host VM "
+            f"'{guest.host}'; it has no host-side journal. Read the VM's log "
+            f"instead: tartarus logs {guest.host}"
+        )
     os.execvp("journalctl", ["journalctl", "-u", f"container@{name}", "-f"])
+
+
+def _ssh_nested(config: Config, base: str, host: str, start: bool) -> NoReturn:
+    """Exec ``ssh`` into a nested container through its container-host VM.
+
+    The container has no host-reachable address of its own, so the connection
+    is jumped through the VM's sshd:
+
+    * the target stays the **bare** ``<base>`` (never ``<base>.trs``) so it
+      does not match the consumer's ``Host *.trs`` wildcard / ``ProxyCommand``;
+    * ``-o HostName=<base>`` pins the connection hostname to the container's
+      name so it resolves on the jump host (the VM's ``networking.hosts``
+      entry), overriding any native-container Host block that would otherwise
+      point it at a host-bridge IP;
+    * ``-o ProxyJump=<host>.trs`` reaches the VM through that wildcard. Modern
+      OpenSSH implements the jump as a child ``ssh -W <base>:22 <host>.trs``
+      (verified on 10.3), so these ``-o`` options apply only to the target and
+      never leak onto the jump's own host-key check;
+    * ``-o HostKeyAlias=<base>.trs`` makes the ``@cert-authority *.trs`` line in
+      ``known_hosts_trs`` apply, matching the CA-signed ``<base>.trs``
+      principal;
+    * the client key and ControlMaster plumbing mirror a native container.
+    """
+    from . import vm  # lazy to avoid a circular import
+
+    if start:
+        vm.action_start(config, host, mounts=[])
+    elif not ssh.is_running(config, host):
+        raise TartarusError(
+            f"container-host VM '{host}' is not running; start it first: "
+            f"tartarus start {host} (or pass --start)"
+        )
+    ca.ensure_ctn_certs(config, base)
+    os.execvp(
+        "ssh",
+        [
+            "ssh",
+            "-o",
+            f"HostName={base}",
+            "-o",
+            f"ProxyJump={host}.trs",
+            "-o",
+            f"HostKeyAlias={base}.trs",
+            "-o",
+            f"UserKnownHostsFile={ssh.known_hosts_trs(config)}",
+            "-i",
+            str(config.ssh_dir / "containers"),
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPath={config.ssh_dir}/controlmaster/%r@%h:%p",
+            "-o",
+            "StreamLocalBindUnlink=yes",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-l",
+            "user",
+            base,
+        ],
+    )
 
 
 def action_ssh(config: Config, name: str, start: bool = False) -> NoReturn:
     base = base_name(config, name)
     require_template(config, base)
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        _ssh_nested(config, base, guest.host, start)
     if start and not is_running(name):
         action_start(config, name)
     if not is_running(name):
@@ -337,9 +483,9 @@ def dispatch(config: Config, args) -> None:
     elif args.command == "status":
         action_status(config, args.name)
     elif args.command == "start":
-        action_start(config, args.name)
+        action_start(config, args.name, upgrade=getattr(args, "upgrade", False))
     elif args.command == "build":
-        action_build(config, args.name)
+        action_build(config, args.name, upgrade=getattr(args, "upgrade", False))
     elif args.command == "spawn":
         action_spawn(config, args.template, args.name)
     elif args.command == "stop":

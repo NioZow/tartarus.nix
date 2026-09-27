@@ -18,6 +18,14 @@
   ctnSubnet = "10.201.0.0/24";
   ctnHostIP = "10.201.0.1";
 
+  # Inner (nested) containers hosted inside a container-host VM. The VM owns
+  # the host side of `innerBridge`; each inner container gets one address from
+  # `innerSubnet` derived from its id. A third, VM-local bridge (never a host
+  # bridge) keeps nested containers off the host's vm/container bridges.
+  innerBridge = "trs2";
+  innerSubnet = "10.202.0.0/24";
+  innerHostIP = "10.202.0.1";
+
   # vfkit on macOS uses vmnet-shared (192.168.64.0/24) with a host gateway.
   darwinGateway = "192.168.64.1";
   darwinSubnet = "192.168.64.0/24";
@@ -29,6 +37,9 @@
   mkVmIPNat = id: "192.168.64.${toString (id + 42)}";
 
   mkCtnIP = id: "10.201.0.${toString id}";
+
+  # Address of an inner container on the container-host VM's inner bridge.
+  mkInnerIP = id: "10.202.0.${toString id}";
 
   mkMac = id: "02:00:00:00:00:${fixedWidthString 2 "0" (toHexString id)}";
 
@@ -69,11 +80,15 @@ in {
     ctnBridge
     ctnSubnet
     ctnHostIP
+    innerBridge
+    innerSubnet
+    innerHostIP
     darwinGateway
     darwinSubnet
     mkVmIP
     mkVmIPNat
     mkCtnIP
+    mkInnerIP
     mkMac
     mkCid
     assignIds
