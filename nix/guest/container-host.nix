@@ -26,12 +26,24 @@
 }: let
   inherit
     (lib)
+    any
+    concatMap
+    concatMapStringsSep
+    dirOf
+    filter
+    hasPrefix
     listToAttrs
     map
     nameValuePair
+    optional
+    optionals
+    optionalAttrs
+    optionalString
+    unique
     ;
   g = tartarusGuest;
   ids = import ../lib/ids.nix {inherit lib;};
+  sharePolicy = import ../lib/shares.nix {inherit lib;};
 
   ch = g.vm.containerHost;
 
@@ -44,16 +56,146 @@
   subnet = ch.network.subnet;
   stateSize = ch.stateVolume.size;
 
+  # Host-service TCP ports the nested containers need forwarded out of the VM.
+  # A nested container dials the inner bridge's host IP (`platform.serviceHost`)
+  # for these; the DNAT below rewrites that to the VM's own upstream gateway,
+  # and the existing masquerade SNATs to the VM's eth0 address, so the macOS
+  # host sees the container-host VM. Only the ports some inner container
+  # actually requests are opened.
+  servicePorts = unique (concatMap (
+      inner:
+        optional (inner.cfg.services.sudoAuthProxy or false) 65001
+        ++ optional (inner.cfg.services.sshAgentProxy or false) 65000
+        ++ optional (inner.cfg.services.clipboardBridge or false) 27795
+    )
+    innerContainers);
+
+  # A nested proxy client (internet = false, proxy.enable = true) dials the
+  # inner bridge's host IP for the proxy; DNAT that to the VM gateway too, so
+  # the request reaches the host proxy (or the host relay to a guest-hosted
+  # proxy). `g.proxy.port` is the resolved global proxy port.
+  anyInnerProxy = any (inner: inner.cfg.proxy.enable or false) innerContainers;
+  dnatPorts =
+    unique (servicePorts
+      ++ optional anyInnerProxy g.proxy.port);
+
+  # Nested containers that must not egress directly: their traffic is dropped
+  # in `forward` except for the VM gateway (proxy + host services + DNS).
+  noInternetInners = filter (inner: !(inner.cfg.internet or true)) innerContainers;
+  noInternetRules =
+    concatMapStringsSep "\n" (
+      inner:
+        "ip saddr ${ids.mkInnerIP inner.id} ip daddr ${g.platform.gateway} counter accept comment \"inner-egress-exempt\"\n"
+        + "ip saddr ${ids.mkInnerIP inner.id} oifname \"eth0\" counter drop comment \"${inner.name}-no-internet\""
+    )
+    noInternetInners;
+
+  # Host relays into a nested container are two-hop: the host socat targets
+  # this VM (see host/relay.nix), and this VM DNATs the relayed port on to the
+  # inner container. One forward per inner relay.
+  relayForwards =
+    concatMap (
+      inner:
+        map (r: {
+          ip = ids.mkInnerIP inner.id;
+          port = r.port;
+          targetPort =
+            if (r.targetPort or null) != null
+            then r.targetPort
+            else r.port;
+          proto = r.protocol or "tcp";
+        })
+        (inner.cfg.relays or [])
+    )
+    innerContainers;
+  relayRules =
+    concatMapStringsSep "\n" (
+      f:
+      # Host -> container (the host socat targets this VM's eth0 address).
+        "iifname \"eth0\" ${f.proto} dport ${toString f.port} counter dnat ip to ${f.ip}:${toString f.targetPort} comment \"inner-relay-host\"\n"
+        # Container -> container, via the VM-local "gateway" name (e.g. a
+        # guest's `litellm-proxy` alias resolving to the inner host IP): treat
+        # the offering container's relay port as a virtual service on it.
+        + "iifname \"${bridge}\" ip daddr ${hostIP} ${f.proto} dport ${toString f.port} counter dnat ip to ${f.ip}:${toString f.targetPort} comment \"inner-relay-service\""
+    )
+    relayForwards;
+
   # Where the host's CA-signed inner-container key material is made visible
-  # inside the VM by `nix/guest/shares.nix` (one virtiofs/9p share per inner
-  # container). `vm.action_start` provisions each inner container's certs
-  # before building the VM, so the bind-mount sources exist at build time.
-  innerKeyDir = name: "/var/lib/tartarus-inner/${name}";
+  # inside the VM by `nix/guest/shares.nix`: ONE share each for the whole
+  # `containers/` tree (ssh and x509), holding every inner container's material
+  # as `<name>/...`. Apple caps virtio-fs devices at 26, so per-container cert
+  # shares are not affordable. `vm.action_start` provisions each inner
+  # container's certs before building the VM, so the sources exist at build time.
+  certsSsh = name: "/var/lib/tartarus-inner/certs/ssh/${name}";
+  certsX509 = name: "/var/lib/tartarus-inner/certs/x509/${name}";
+  innerShared = name: "/var/lib/tartarus-inner/shared/${name}";
+
+  # nspawn creates a missing bind-mount parent as root, so the nested
+  # container's unprivileged user cannot create e.g. `~/.config/nix` and
+  # home-manager activation fails. Reset every home-tree bind parent (and the
+  # home itself) to the guest user at boot; tmpfiles `d` fixes the ownership of
+  # directories that already exist.
+  homeParents = inner: let
+    mounts = map (s: s.mountPoint) (inner.cfg.shares or []);
+  in
+    unique (["/home/user"] ++ map dirOf (filter (p: hasPrefix "/home/user/" p) mounts));
+  homeTmpfilesModule = inner: {
+    systemd.tmpfiles.rules = map (d: "d ${d} 0755 user user -") (homeParents inner);
+  };
+
+  # A read-only inner share on Darwin is materialised into the Nix store
+  # (`nix/lib/shares.nix`); the VM already reaches the host store through
+  # `ro-store`, so the container can bind the snapshot path directly instead of
+  # exporting it as its own virtiofs device. Referencing the path here also
+  # forces it to build, so it is present in the store at boot.
+  innerSnapshot = s: sharePolicy.storeSnapshot s.tag s.source;
+  snapshotDeps =
+    concatMap
+    (inner: map innerSnapshot (filter (s: sharePolicy.needsStoreSnapshot g.platform s) (inner.cfg.shares or [])))
+    innerContainers;
+
+  # The shared MicroVM client key (`~/.ssh/tartarus`) the VM's `user` account
+  # already trusts (see base.nix's `pubKeyFile`). The same key authorises root
+  # here so the host CLI can manage nested containers over SSH as root without
+  # any passwordless-sudo grant.
+  rootPubKeyFile = "${g.hostHome}/.ssh/tartarus.pub";
+
+  # nspawn preserves the ownership of a bind-mounted source, and the share
+  # arrives owned by the host user (uid 501 / the invoking user) -- sshd
+  # refuses a host key it does not own. Copy the material under /run as
+  # root:root before the containers start and bind-mount that copy instead.
+  stageDir = name: "/run/tartarus-inner/${name}";
+
+  stageScript = pkgs.writeShellScript "tartarus-inner-key-stage" ''
+    set -eu
+    ${concatMapStringsSep "\n" (inner: ''
+        src_ssh=${certsSsh inner.name}
+        src_x509=${certsX509 inner.name}
+        dst=${stageDir inner.name}
+        for _ in $(seq 1 120); do
+          [ -e "$src_ssh/ssh_host_ed25519_key" ] && break
+          sleep 1
+        done
+        install -d -m 0755 "$dst/ssh" "$dst/x509"
+        cp -f "$src_ssh/ssh_host_ed25519_key" "$dst/ssh/ssh_host_ed25519_key"
+        cp -f "$src_ssh/ssh_host_ed25519_key.pub" "$dst/ssh/ssh_host_ed25519_key.pub" || true
+        cp -f "$src_ssh/ssh_host_ed25519_key-cert.pub" "$dst/ssh/ssh_host_ed25519_key-cert.pub" || true
+        cp -f "$src_x509/." "$dst/x509/" 2>/dev/null || true
+        chmod 0600 "$dst/ssh/ssh_host_ed25519_key"
+        chmod 0644 "$dst/ssh/"*.pub 2>/dev/null || true
+      '')
+      innerContainers}
+  '';
 in {
   # nixos-containers.nix defaults this to `containers != {}`, but a container
   # host must always have container support even if a future refactor moves the
   # declarations elsewhere.
   boot.enableContainers = true;
+
+  # Store-snapshotted inner shares are not exported as virtiofs devices; they
+  # are bound from `/nix/store` and so must be built into the host store the VM
+  # reads through `ro-store`.
+  system.extraDependencies = snapshotDeps;
 
   # Nested containers share the VM's kernel; the VM must forward and NAT their
   # traffic. (P0: forwarding under nested nspawn is unverified.)
@@ -89,16 +231,42 @@ in {
   # NAT inner-container traffic out of the VM (the VM's own egress is already
   # provided by the host platform: trs0 on Linux, vmnet-shared on Darwin).
   networking.nftables.enable = true;
-  networking.nftables.tables.tartarus_inner = {
-    family = "inet";
-    content = ''
-      chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
+  networking.nftables.tables =
+    {
+      tartarus_inner = {
+        family = "inet";
+        content = ''
+          ${optionalString (dnatPorts != [] || relayForwards != []) ''
+            chain prerouting {
+              type nat hook prerouting priority dstnat; policy accept;
 
-        ip saddr ${subnet} oifname != "${bridge}" counter masquerade comment "inner-masq"
-      }
-    '';
-  };
+              ${optionalString (dnatPorts != []) ''
+              iifname "${bridge}" ip daddr ${hostIP} tcp dport { ${concatMapStringsSep ", " toString dnatPorts} } counter dnat ip to ${g.platform.gateway} comment "inner-host-services"
+            ''}
+              ${relayRules}
+            }
+          ''}
+          chain postrouting {
+            type nat hook postrouting priority srcnat; policy accept;
+
+            ip saddr ${subnet} oifname != "${bridge}" counter masquerade comment "inner-masq"
+          }
+        '';
+      };
+    }
+    // optionalAttrs (noInternetInners != []) {
+      tartarus_inner_filter = {
+        family = "inet";
+        content = ''
+          chain forward {
+            type filter hook forward priority 0; policy accept;
+
+            ct state established,related counter accept
+            ${noInternetRules}
+          }
+        '';
+      };
+    };
 
   # A minimal resolver the inner containers can use: listen on the inner bridge
   # and forward to the VM's own upstream gateway. `resolveLocalQueries = false`
@@ -127,7 +295,13 @@ in {
     map (
       inner:
         nameValuePair inner.name {
-          autoStart = true;
+          # Only the inner containers that asked for it autostart, driven by
+          # each guest's own `tartarus.guests.<name>.autostart`. The
+          # container-host VM still boots when any inner container (or the VM
+          # itself) requests autostart -- see the escalation in
+          # `nix/host/instances.nix` -- but the remaining nested containers
+          # stay down until `tartarus --container start <name>`.
+          autoStart = inner.cfg.autostart or false;
           # State persists on the /var/lib/nixos-containers volume below.
           ephemeral = false;
           privateNetwork = true;
@@ -137,28 +311,85 @@ in {
           # appends the definition values to the eval-config module list, and
           # the module system rejects a list *element* ("module imports can't
           # be nested lists"). Wrapping the guest's modules in `imports` is the
-          # supported form.
-          config = {imports = inner.modules;};
+          # supported form. The extra module resets home bind-parent ownership
+          # so home-manager can activate (see homeTmpfilesModule).
+          config = {imports = inner.modules ++ [(homeTmpfilesModule inner)];};
           specialArgs = inner.specialArgs;
 
           # The host's CA-signed host key and mTLS client cert reach the VM via
-          # shares.nix and are bind-mounted read-only into the container, where
-          # base.nix reads /etc/tartarus/ssh in place. (P0: readability of the
-          # virtiofs-backed key files inside nested nspawn is unverified.)
-          bindMounts = {
-            "/etc/tartarus/ssh" = {
-              hostPath = "${innerKeyDir inner.name}/ssh";
-              isReadOnly = true;
+          # shares.nix; the stage service copies them root-owned under /run and
+          # these read-only binds expose that copy. `/run/tartarus` covers the
+          # host-key path a MicroVM uses, `/etc/tartarus/*` the container path
+          # base.nix reads in place.
+          bindMounts =
+            {
+              "/etc/tartarus/ssh" = {
+                hostPath = "${stageDir inner.name}/ssh";
+                isReadOnly = true;
+              };
+              "/etc/tartarus/x509" = {
+                hostPath = "${stageDir inner.name}/x509";
+                isReadOnly = true;
+              };
+              "/run/tartarus" = {
+                hostPath = "${stageDir inner.name}/ssh";
+                isReadOnly = true;
+              };
+            }
+            # The inner container's user shares and `~/shared`. A share whose
+            # source is store-snapshotted is bound straight from `/nix/store`
+            # (visible via the VM's ro-store, no device needed); the rest come
+            # from the VM path `nix/guest/shares.nix` mounts under the
+            # container's inner directory. Either way, read-only stays read-only
+            # at the container's own mount point.
+            // listToAttrs (map (s:
+              nameValuePair s.mountPoint (
+                if sharePolicy.needsStoreSnapshot g.platform s
+                then {
+                  hostPath = innerSnapshot s;
+                  isReadOnly = true;
+                }
+                else {
+                  hostPath = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
+                  isReadOnly = s.readOnly or false;
+                }
+              ))
+            (inner.cfg.shares or []))
+            // optionalAttrs (inner.cfg.sharedFolder or false) {
+              "/home/user/shared" = {
+                hostPath = innerShared inner.name;
+                isReadOnly = false;
+              };
             };
-            "/etc/tartarus/x509" = {
-              hostPath = "${innerKeyDir inner.name}/x509";
-              isReadOnly = true;
-            };
-          };
         }
     )
     innerContainers
   );
+
+  # Root SSH for the container-host VM. The host CLI drives a nested container's
+  # own systemd unit over SSH (`tartarus --container start/stop/restart <name>`
+  # runs `ssh root@<vm> systemctl ... container@<name>`), so root must log in
+  # key-only. The same shared MicroVM client key the login user trusts also
+  # authorises root, and `prohibit-password` allows public-key root login while
+  # still refusing passwords (globally off anyway). Only container-host VMs get
+  # this; every other guest keeps base.nix's `PermitRootLogin = "no"`.
+  users.users.root.openssh.authorizedKeys.keys =
+    optionals (builtins.pathExists rootPubKeyFile) [(builtins.readFile rootPubKeyFile)];
+  services.openssh.settings.PermitRootLogin = lib.mkForce "prohibit-password";
+
+  # Root-owned staging of each inner container's key material, ordered before
+  # the container so the read-only binds above have a root-owned source when
+  # nspawn mounts them.
+  systemd.services.tartarus-inner-key-stage = lib.mkIf (innerContainers != []) {
+    description = "Stage nested-container CA key material root-owned";
+    wantedBy = map (inner: "container@${inner.name}.service") innerContainers;
+    before = map (inner: "container@${inner.name}.service") innerContainers;
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      ExecStart = stageScript;
+    };
+  };
 
   # Container root filesystems and logs persist in the VM's state dir and
   # survive VM restarts (mirrors `home.img`/`nix-store-overlay.img`). The image

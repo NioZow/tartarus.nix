@@ -55,6 +55,10 @@
         assertion = !(isDarwin && guest.firewall.location == "host");
         message = "tartarus: guest '${name}' sets `firewall.location = \"host\"` on Darwin; host firewalling is Linux-only, use \"guest\".";
       }
+      {
+        assertion = !(guest.vmOnly && guest.kind == "container");
+        message = "tartarus: guest '${name}' sets `vmOnly = true` but `kind = \"container\"`; a VM-only guest cannot run as an nspawn container.";
+      }
     ])
     guests);
 
@@ -131,8 +135,6 @@
         then null
         else guests.${hostName} or null;
       isNested = guest.kind == "container" && hostName != null;
-      hostServiceFlags = ["clipboardBridge" "sshAgentProxy" "sudoAuthProxy" "gpgAgentProxy"];
-      requestsHostService = any (flag: guest.services.${flag} or false) hostServiceFlags;
     in [
       {
         assertion = hostName == null || guest.kind == "container";
@@ -157,21 +159,6 @@
       {
         assertion = !(guest.containerHost && guest.kind == "container");
         message = "tartarus: guest '${name}' sets `vm.containerHost.enable = true` on a `kind = \"container\"` guest; `vm.containerHost` is VM-only.";
-      }
-      # Feature gating for nested containers: the host-side wiring for these is
-      # not implemented yet, so fail loudly rather than silently mis-wiring the
-      # guest to the host container bridge (plan §5.3).
-      {
-        assertion = !(isNested && (guest.relays or []) != []);
-        message = "tartarus: nested container '${name}' sets `relays`; host-side relays are unsupported for nested containers (see the container-host plan §5.3).";
-      }
-      {
-        assertion = !(isNested && requestsHostService);
-        message = "tartarus: nested container '${name}' enables a host service integration (clipboardBridge/sshAgentProxy/sudoAuthProxy/gpgAgentProxy); host service wiring for nested containers is not supported yet.";
-      }
-      {
-        assertion = !(isNested && (guest.proxy.enable or false));
-        message = "tartarus: nested container '${name}' sets `proxy.enable = true`; host proxy routing for nested containers is not implemented yet.";
       }
     ])
     guests);

@@ -118,17 +118,30 @@ in
       cfg = config.tartarus.proxy;
 
       # Every *host-side* enabled guest that opted into the proxy, as plain
-      # records from `instances.nix`. The Phase 1 assertion guarantees
-      # `internet = false` for all of them and that the global proxy is enabled,
-      # so no further filtering is needed here. Nested containers are excluded:
-      # they have no host-reachable address and their proxy routing is a
-      # not-yet-implemented feature (rejected by the P3 assertions anyway).
+      # records from `instances.nix`, plus one stand-in per container-host VM
+      # with nested proxy clients. The Phase 1 assertion guarantees
+      # `internet = false` for all of them and that the global proxy is enabled.
+      # A nested client's traffic is DNAT'd/SNAT'd through its container-host
+      # VM, so the proxy sees the VM's address; each VM's nested clients
+      # collapse into one entry with the unioned allowlist.
+      hostSideClients = filter (g: (g.host or null) == null) instances.proxyClients;
+      nestedClients = filter (g: (g.host or null) != null) instances.proxyClients;
+      mkNestedClient = hostName: {
+        kind = "vm";
+        name = hostName;
+        ip =
+          if isDarwin
+          then ids.mkVmIPNat instances.vm.idByName.${hostName}
+          else ids.mkVmIP instances.vm.idByName.${hostName};
+        allowHosts = unique (concatMap (c: c.proxy.allowHosts) (filter (g: g.host == hostName) nestedClients));
+      };
       rawClients =
         map (g: {
           inherit (g) name kind ip;
           allowHosts = g.proxy.allowHosts;
         })
-        (filter (g: (g.host or null) == null) instances.proxyClients);
+        hostSideClients
+        ++ map mkNestedClient (unique (map (g: g.host) nestedClients));
 
       proxyIsGuest = cfg.enable && cfg.location != "host";
 

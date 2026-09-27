@@ -8,9 +8,11 @@ density model of one VM for many workloads rather than one VM per workload.
 This document is the technical reference. The full design and phase history
 live in the plan: [`docs/plans/container-host-vms.md`](plans/container-host-vms.md).
 
-**Status:** P1–P6 are implemented and evaluate cleanly. The **P0 runtime
-spike is a manual gate and is not yet verified** — see
-[Limitations and the P0 manual gate](#limitations-and-the-p0-manual-gate).
+**Status:** P1–P6 are implemented and evaluate cleanly, and the **P0 runtime
+gate has been verified** (nested nspawn boot, virtiofs CA-key readability,
+restart persistence and the ProxyJump SSH path). Feature parity for real
+workloads (host services, user shares, relays, proxy routing) is implemented in
+[`plans/nested-container-parity.md`](plans/nested-container-parity.md).
 
 ---
 
@@ -146,6 +148,12 @@ tartarus --container ssh inner
 - `HostKeyAlias=inner.trs` makes the `@cert-authority *.trs` line in
   `known_hosts_trs` apply to the CA-signed `inner.trs` principal.
 
+The container-host VM also permits key-only root SSH (`PermitRootLogin =
+"prohibit-password"`) using the same shared MicroVM client key the `user`
+account trusts (`~/.ssh/tartarus.pub`). This lets the host CLI manage nested
+containers' units as root without a passwordless-sudo grant; no other guest
+enables root login.
+
 ## 6. State persistence
 
 `/var/lib/nixos-containers` inside the host VM is backed by a `microvm.volumes`
@@ -188,27 +196,58 @@ The following are hard evaluation errors:
 - `host` on a `kind = "vm"` guest, or `vm.containerHost.enable` on a
   `kind = "container"` guest.
 - a `kind = "container"` on Darwin with no `host`.
-- a nested container that sets `relays`, enables a host service integration
-  (`clipboardBridge` / `sshAgentProxy` / `sudoAuthProxy` / `gpgAgentProxy`),
-  or sets `proxy.enable`.
 
-Autostart treats a nested container's `autostart = true` as a request to start
-its **host VM** (the VM starts its containers itself); a host VM and its
-nested container that both ask for autostart collapse to one unit.
+Host services, user shares, relays and proxy routing are **supported** for
+nested containers (see below); `graphical` / `apps` remain unsupported.
+
+### Nested host services, shares, relays and proxy
+
+A nested container's traffic to the host is DNAT'd out of the container-host
+VM (its `eth0`), and the VM's existing masquerade SNATs it, so the macOS host
+sees the container-host VM (named by the VM, not the inner container). The VM
+stands in for its inner containers in `nix/host/services.nix` and
+`nix/host/proxy.nix`, and the host ACLs target the VM name.
+
+| Feature | Wiring |
+| --- | --- |
+| Host services (`sudoAuthProxy`, `sshAgentProxy`, `clipboardBridge`) | VM `prerouting` DNATs the service ports from the inner bridge to the VM gateway; the host server authorizes the VM. |
+| `gpgAgentProxy` | Pure SSH `RemoteForward`; reached by ProxyJump (nixcfg `ssh.nix` Host block). |
+| User `shares` / `sharedFolder` | Declared on the container-host VM (mounted under `/var/lib/tartarus-inner/<inner>/…`) and bind-mounted into the container at its guest paths. |
+| `relays` | Two-hop: the host socat targets the VM's NAT address; the VM DNATs the relayed port to the inner container. The same port on the inner bridge is also a VM-local "service" so sibling containers can reach it via the gateway name. |
+| `proxy.enable` | VM DNATs the proxy port (`hostProxyIP` = inner host IP) to the VM gateway; a proxy-only container is fenced to that gateway by a VM `forward` drop. |
+
+`vm.persistentHome` / `vm.nixStoreOverlay` remain VM-only; a nested container's
+rootfs lives on the VM's persistent `nixos-containers.img` volume, so its
+`/home/user` persists there.
+
+Autostart is two-level. A nested container's `autostart = true` is a request to
+start its **host VM** *and* to declare that container `autoStart = true` inside
+the VM, so only the opted-in inner containers come up with the VM — the rest
+stay down until `tartarus --container start <name>`. A host VM and a nested
+container that both ask for autostart collapse to one host unit (the VM).
 
 ## 9. CLI behaviour
 
 | Command | Behaviour for a nested container |
 | --- | --- |
-| `tartarus --container list` | lists nested containers with a `HOST` column naming the host VM. |
-| `tartarus --container status <inner>` | reports the association and the host VM's running state. |
-| `start` / `ssh -s` | ensures the inner certs, then starts (or reuses) the host VM. |
+| `tartarus list` | lists **every** enabled guest: MicroVMs (with a `(container host)` marker) followed by containers, each container's `HOST` column naming its container-host VM. Nested unit states are queried inside the VM (one SSH round-trip per host). `--vm` / `--container` narrow by kind; `-t`/`--tree` nests each container under its host VM. |
+| `tartarus --container list` | containers only (native and nested), the pre-unification form of the above. |
+| `tartarus --container status <inner>` | reports the nested container's own `container@<name>` unit state, queried over SSH. |
+| `start` / `ssh -s` | ensures the inner certs, starts (or reuses) the host VM, then starts `container@<name>` as root over SSH. |
 | `build` | builds the host VM (the nested container is part of that build). |
 | `ssh` | ProxyJumps through the host VM (see §5). |
+| `stop` / `restart` | drives `systemctl stop/restart container@<name>` as root inside the host VM over SSH (`--purge` is refused). |
 | `cid` / `ip` / `proxy` / `proxy-ip` | refused: no host-reachable address. |
-| `stop` / `restart` / `logs` / `spawn` | refused, pointing at the host VM (or, for `spawn`, at adding a declarative container). |
+| `logs` / `spawn` | refused, pointing at the host VM (or, for `spawn`, at adding a declarative container). |
 
-`tartarus list` (VMs) appends `(container host)` to the type column.
+The SSH control path logs into the container-host VM as **root** over key-only
+SSH (the shared MicroVM client key, `PermitRootLogin = "prohibit-password"`) and
+runs `systemctl {start,stop,restart} container@*` directly, so no passwordless
+sudoers entry is required (`nix/guest/container-host.nix`).
+
+`tartarus list` marks a container-host VM's type column with `(container host)`
+and lists its nested containers beneath it (or, with `--tree`, indented under
+it).
 
 ## 10. Minimal end-to-end example
 
@@ -240,7 +279,8 @@ tartarus.guests = {
 ```bash
 tartarus start workbench          # boots the VM; toolbox starts with it
 tartarus --container ssh toolbox  # ProxyJump through workbench.trs
-tartarus list                     # workbench is marked "(container host)"
+tartarus list                     # workbench marked "(container host)", toolbox nested under it
+tartarus list --tree              # same, toolbox indented beneath workbench
 ```
 
 `tartarus.hostMemoryMiB` / `tartarus.hostCores` must be set on the host when a
@@ -248,21 +288,24 @@ guest uses the `"host"` sentinel.
 
 ## 11. Limitations and the P0 manual gate
 
-- **Runtime unverified (P0).** The plan's P0 runtime spike was intentionally
-  skipped. Everything here evaluates and is covered by eval/Python tests, but
-  the following runtime behaviours still need the manual pass described in
-  [`docs/smoke.md`](smoke.md):
-  - nested nspawn boot under microvm.nix (cgroup-v2 delegation inside the VM);
-  - readability of the virtiofs-backed CA key files inside nested nspawn;
-  - persistence of `/var/lib/nixos-containers` across a VM restart;
-  - the `ProxyJump` SSH path end to end.
+- **Runtime verified (P0).** Nested nspawn boot under microvm.nix (cgroup-v2
+  delegation), readability of the virtiofs-backed CA key files inside nested
+  nspawn, persistence of `/var/lib/nixos-containers` across a VM restart, and
+  the `ProxyJump` SSH path have all been exercised. Feature parity (host
+  services, shares, relays, proxy) is implemented but was validated by
+  evaluation, not yet by a full runtime pass on every workload.
 - **Shared kernel.** Nested containers share the host VM's kernel, so their
   isolation is weaker than one VM per guest — the deliberate trade that mirrors
   Linux-native nspawn.
 - **Eager only.** Adding a nested container rebuilds and restarts the host VM.
   Lazy creation is deferred (plan §9).
-- **No host-side features.** Relays, host services and proxy routing for
-  nested containers are not implemented; the assertions reject them.
+- **Writable-share ownership** across macOS host → virtiofs → VM → bind →
+  container relies on matching uids; a nested container's `user` takes the
+  invoking host uid for this reason. Validate when a workload writes to a
+  shared folder.
+- **Host-service identity collapses to the VM.** The VM's masquerade means the
+  host sees the container-host VM, so per-inner `ssh-agent-proxy` ACL rules
+  must target the VM name.
 - **macOS-first.** Linux already has native `kind = "container"` and does not
   need a container host.
 
@@ -277,22 +320,13 @@ on the target hypervisor. The practical mitigation is the `mem = "host"` cap,
 which is host-backed and faulted on demand. Revisit if microvm.nix gains
 vfkit/VZ `VZMemoryBalloonDevice` support.
 
-## 12. Consumer follow-up: nixcfg `ssh.nix`
+## 12. Consumer: nixcfg `ssh.nix`
 
-The `tartarus` CLI overrides the native-container SSH entry with
-`HostName=<inner>` (see §5), so `tartarus --container ssh <inner>` works. But
-the nixcfg consumer module `modules/programs/user/ssh.nix` still generates a
-direct `Host <name>` block for **every** enabled `kind = "container"` guest,
-resolving through `10.201.0.<id>` (the *host* container bridge). For a nested
-container that address is wrong — it lives on `10.202.0.<id>` inside its host
-VM.
-
-Consequence: a bare `ssh <inner>` (not via the CLI) would match that host
-block and try the wrong address. The fix belongs in nixcfg's `ssh.nix`:
-exclude containers with `host != null` from the direct `Host` blocks (or route
-them through the host VM the way `tartarus --container ssh` does). This is
-called out here rather than changed, because the tartarus package must not
-edit the consumer flake.
+`modules/programs/user/ssh.nix` excludes nested containers (`host != null`)
+from the direct `10.201.0.<id>` Host blocks and instead emits a ProxyJump block
+(`ProxyJump <host>.trs`, `HostKeyAlias <name>.trs`,
+`IdentityFile ~/.ssh/containers`), mirroring what `tartarus ssh <inner>`
+already does. A bare `ssh <inner>` therefore works.
 
 ## See also
 

@@ -24,6 +24,7 @@
 }: let
   inherit
     (lib)
+    any
     concatMap
     dirOf
     filter
@@ -93,31 +94,61 @@
         snapshot = false;
       }
     ]
-    # Key material for each nested container of a container-host VM. The share
-    # lands in the VM (under /var/lib/tartarus-inner/<name>), and
-    # container-host.nix bind-mounts it read-only into the container at
-    # /etc/tartarus/{ssh,x509}. Read-only and never snapshotted: they hold
-    # private host/client keys. `vm.action_start` provisions each inner
-    # container's certs before building the VM, so the host sources exist at
-    # build time.
-    ++ concatMap (inner: [
+    # CA key material for the nested containers. ONE share per material type
+    # for the whole VM, not one per container: Apple's Virtualization.framework
+    # caps virtio-fs devices at 26, so six containers each needing ssh+x509 on
+    # top of their user shares would exhaust it. The `containers/` parent holds
+    # every inner container's material as `<name>/...`; container-host.nix binds
+    # the per-container subdirectory at /etc/tartarus/{ssh,x509}. Read-only and
+    # never snapshotted: they hold private host/client keys. `vm.action_start`
+    # provisions each inner container's certs before building the VM.
+    ++ optionals ((g.innerContainers or []) != []) [
       {
-        tag = "tartarus-inner-${inner.name}-ssh";
-        source = "${g.hostHome}/.local/share/tartarus/ssh/machines/containers/${inner.name}";
-        mountPoint = "/var/lib/tartarus-inner/${inner.name}/ssh";
+        tag = "ti-certs-ssh";
+        source = "${g.hostHome}/.local/share/tartarus/ssh/machines/containers";
+        mountPoint = "/var/lib/tartarus-inner/certs/ssh";
         proto = p.shareProto;
         readOnly = true;
         snapshot = false;
       }
       {
-        tag = "tartarus-inner-${inner.name}-x509";
-        source = "${g.hostHome}/.local/share/tartarus/x509/machines/containers/${inner.name}";
-        mountPoint = "/var/lib/tartarus-inner/${inner.name}/x509";
+        tag = "ti-certs-x509";
+        source = "${g.hostHome}/.local/share/tartarus/x509/machines/containers";
+        mountPoint = "/var/lib/tartarus-inner/certs/x509";
         proto = p.shareProto;
         readOnly = true;
         snapshot = false;
       }
-    ]) (g.innerContainers or [])
+    ]
+    # ONE share for every inner container's `~/shared`: the parent
+    # `~/shared/<name>` tree, bind-mounted per-container (same device cap).
+    ++ optional (any (inner: inner.cfg.sharedFolder or false) (g.innerContainers or [])) {
+      tag = "ti-shared";
+      source = "${g.hostHome}/shared";
+      mountPoint = "/var/lib/tartarus-inner/shared";
+      proto = p.shareProto;
+    }
+    # The inner containers' user shares. A share whose source is store-snapshotted
+    # (read-only on Darwin) is deliberately NOT exported as a device: the VM
+    # already reaches the host store through `ro-store`, so `container-host.nix`
+    # bind-mounts the snapshot path straight from `/nix/store`, saving a device
+    # per such share. Everything else gets one device mounted under the
+    # container's inner directory (bind-mounted inward by container-host.nix).
+    #
+    # The tag is kept short and keyed by the inner id (`ti<id>-...`): vfkit
+    # rejects virtiofs tags longer than 36 bytes.
+    ++ concatMap (
+      inner:
+        map (s: {
+          tag = "ti${toString inner.id}-s-${s.tag}";
+          source = s.source;
+          mountPoint = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
+          proto = p.shareProto;
+          readOnly = s.readOnly or false;
+          snapshot = s.snapshot or true;
+        })
+        (filter (s: !(sharePolicy.needsStoreSnapshot p s)) (inner.cfg.shares or []))
+    ) (g.innerContainers or [])
     ++ extraShares;
 
   isWritableNinePShare = s: (s.proto or "9p") == "9p" && !(s.readOnly or false);

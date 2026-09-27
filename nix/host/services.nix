@@ -43,11 +43,44 @@
   instances = config.tartarus.instances;
 
   guests = config.tartarus.guests or {};
-  # Host-half services only apply to host-side guests. Nested containers are
-  # reached through their container-host VM's sshd/relays, so they must not be
-  # added to the host service entries (plan §5.3); the P3 assertions reject any
-  # nested container that requests one.
-  enabled = filterAttrs (_: g: g.enable && (g.host or null) == null) guests;
+
+  # Host-half services are only reachable for host-side guests. A nested
+  # container reaches the host through its container-host VM (the VM DNATs the
+  # service ports out to the host; see `guest/container-host.nix`), so the VM
+  # stands in for its inner containers: it is added as a service peer carrying
+  # the union of its own and its inner containers' requests, addressed by the
+  # VM's NAT IP and named by the VM. Host ACLs therefore target the VM name
+  # (the VM's masquerade collapses the inner identity).
+  hostServices = ["sudoAuthProxy" "sshAgentProxy" "clipboardBridge"];
+  innerContainersOf = hostName:
+    filterAttrs (_: g: g.enable && g.kind == "container" && (g.host or null) == hostName) guests;
+  standInVms =
+    filterAttrs (
+      name: g:
+        g.enable
+        && g.kind == "vm"
+        && (g.vm.containerHost.enable or false)
+        && any (inner: any (f: (inner.services or {}).${f} or false) hostServices) (attrValues (innerContainersOf name))
+    )
+    guests;
+  mkStandIn = name: _: let
+    g = guests.${name};
+    inner = attrValues (innerContainersOf name);
+  in {
+    enable = true;
+    kind = "vm";
+    host = null;
+    services =
+      lib.genAttrs hostServices (
+        f: (g.services.${f} or false) || any (innerGuest: (innerGuest.services or {}).${f} or false) inner
+      )
+      // {disableVsock = true;};
+  };
+  # Host-side guests plus the container-host VMs standing in for their nested
+  # containers (overwriting the VM's own entry with the union of requests).
+  enabled =
+    filterAttrs (_: g: g.enable && (g.host or null) == null) guests
+    // lib.mapAttrs mkStandIn standInVms;
   svc = name: g: (g.services or {}).${name} or false;
   requesting = name: filterAttrs (_: g: svc name g) enabled;
 

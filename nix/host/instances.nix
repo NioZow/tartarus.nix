@@ -105,6 +105,7 @@
     inherit name;
     kind = g.kind;
     enable = g.enable;
+    vmOnly = g.vmOnly or false;
     id =
       if g.kind == "vm"
       then vmIds.${name}
@@ -126,12 +127,13 @@
 
   details = lib.mapAttrs detail (vmEnabled // ctnEnabled);
 
-  # Autostart records. Starting a container-host VM starts its nested
-  # containers (P2 declares them with `autoStart = true` inside the VM), so a
-  # nested container's `autostart = true` becomes an autostart request for its
-  # *host VM*, never for the container itself. Dedupe by name (via the keyed
-  # attrset) so a host VM that also sets `autostart = true` yields exactly one
-  # unit, and sorting is preserved.
+  # Autostart records. A nested container's `autostart = true` becomes an
+  # autostart request for its *host VM*: the VM must boot for the container to
+  # start. The container itself additionally carries `autoStart =
+  # cfg.autostart` inside the VM (nix/guest/container-host.nix), so only the
+  # nested containers that asked for autostart come up with it, not the whole
+  # set. Dedupe by name (via the keyed attrset) so a host VM that also sets
+  # `autostart = true` yields exactly one unit, and sorting is preserved.
   autostartOf = g:
     if g.kind == "container" && (g.host or null) != null && details ? ${g.host}
     then details.${g.host}

@@ -232,9 +232,10 @@
     # A VM that hosts nested systemd-nspawn containers. Only such a VM pulls in
     # ./container-host.nix and the inner key-material shares.
     isContainerHost = kind == "vm" && (cfg.vm.containerHost.enable or false);
-    # The inner containers as plain `{ name, id }` records so shares.nix can
-    # declare their key-material shares without re-deriving the container ids.
-    innerContainers = map (inner: {inherit (inner) name id;}) innerContainers;
+    # The inner containers, carrying their raw `cfg` so the container-host VM
+    # can bind their shares/services into the nested nspawn config (shares.nix,
+    # container-host.nix) without re-evaluating each inner guest.
+    innerContainers = map (inner: {inherit (inner) name id cfg;}) innerContainers;
 
     graphical = cfg.graphical or false;
     internet = cfg.internet or true;
@@ -460,10 +461,16 @@
             inHostVm = true;
           };
         in {
-          inherit (inner) name id;
+          inherit (inner) name id cfg;
           modules = [
             inputs.home-manager.nixosModules.home-manager
             ./default.nix
+            # `containers.<name>` re-evaluates nixpkgs with only `localSystem`
+            # (no overlays), so without this every nested container would lose
+            # the consumer's overlay packages (e.g. `skills-ref`). Pinning the
+            # already-overlaid guest pkgs keeps nested and standalone
+            # `ctn-<name>` evaluations in lockstep and reuses the VM's pkgs.
+            {nixpkgs.pkgs = guestPkgs;}
           ];
           specialArgs = mkSpecialArgs innerGuest;
         }

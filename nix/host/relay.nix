@@ -51,17 +51,17 @@
   # `_module.args` recursion this module would otherwise trigger while defining
   # `launchd.*`.
   #
-  # Relays are host-side forwards into a guest and make no sense for a nested
-  # container (it has no host-reachable address); the P3 assertions reject them
-  # outright, and this filter keeps the generation defensive.
-  hostSideGuests = filterAttrs (_: g: (g.host or null) == null) instances.guests;
+  # A nested container's relay is a two-hop forward: the host socat targets the
+  # container-host VM's address, and the VM DNATs the port on to the inner
+  # container (see guest/container-host.nix). `mkRelayService` resolves the
+  # target address accordingly.
   declared = concatLists (
     mapAttrsToList (
       name: g:
         map (relay: {inherit name relay;})
         (g.relays or [])
     )
-    hostSideGuests
+    instances.guests
   );
 
   proxyRelay =
@@ -102,6 +102,17 @@
       if relay.host != null
       then relay.host
       else ids.darwinGateway;
+    # A nested container has no host-reachable address of its own: target its
+    # container-host VM, which DNATs the port on to the inner container.
+    targetIp =
+      if (g.host or null) != null
+      then let
+        vmId = instances.vm.idByName.${g.host};
+      in
+        if isDarwin
+        then ids.mkVmIPNat vmId
+        else ids.mkVmIP vmId
+      else g.ip;
     # See the header: UDP must RECVFROM (not LISTEN) so the parent keeps its
     # socket across forks instead of dying with EADDRINUSE on Darwin.
     listen =
@@ -110,8 +121,8 @@
       else "TCP4-LISTEN:${toString relay.port},bind=${host},reuseaddr,fork";
     target =
       if relay.protocol == "udp"
-      then "UDP4:${g.ip}:${toString targetPort}"
-      else "TCP4:${g.ip}:${toString targetPort}";
+      then "UDP4:${targetIp}:${toString targetPort}"
+      else "TCP4:${targetIp}:${toString targetPort}";
     serviceName = "tartarus-relay-${name}-${relay.protocol}-${toString relay.port}";
     command = "${pkgs.socat}/bin/socat ${listen} ${target}";
   in

@@ -372,6 +372,30 @@
     };
   };
 
+  # A Darwin relay into a nested container is two-hop: the host socat targets
+  # the container-host VM's NAT address (vm id 5 -> 192.168.64.47), and the VM
+  # DNATs the port on to the inner container.
+  hostDarwinNestedRelay = mkDarwinHost {
+    ch = {
+      enable = true;
+      kind = "vm";
+      id = 5;
+      internet = true;
+      vm.containerHost.enable = true;
+    };
+    inner = {
+      enable = true;
+      kind = "container";
+      id = 6;
+      internet = true;
+      host = "ch";
+      relays = [{port = 8080;}];
+    };
+  };
+  darwinNestedRelayArgs =
+    concatStringsSep " "
+    hostDarwinNestedRelay.config.launchd.agents."tartarus-relay-inner-tcp-8080".serviceConfig.ProgramArguments;
+
   hostBadInternetProxy = mkHost {
     proxy = fullProxy;
     guests.x = {
@@ -716,8 +740,9 @@
   };
   nestedAutostartDupNames = map (g: g.name) hostNestedAutostartDup.config.tartarus.instances.autostart;
 
-  # Step-7 rejections: a nested container may not declare host-side relays,
-  # request a host service, or route through the host proxy yet.
+  # Step-7 rejections: a nested container may not declare host-side relays or
+  # route through the host proxy yet. Host services ARE supported: the
+  # container-host VM stands in for its nested containers (DNAT to the host).
   hostNestedRelays = mkHost {
     guests = {
       ch = {
@@ -1015,6 +1040,149 @@
   };
   chVm = chGuests.nixosConfigurations."vm-ch";
   chInner = chGuests.nixosConfigurations."ctn-inner";
+
+  # The same VM with one inner container opting into `autostart`, so the
+  # per-inner `autoStart` mirroring (only opted-in inners autostart) can be
+  # asserted against `chGuests`, where `inner` does not opt in.
+  chAutoGuests = mkGuests {
+    globalProxy.enable = false;
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        autostart = true;
+      };
+    };
+  };
+  chAutoVm = chAutoGuests.nixosConfigurations."vm-ch";
+
+  # A container-host VM whose nested container requests host services, declares
+  # a host relay, and has user shares + sharedFolder -- the feature-parity
+  # fixture for the inner DNAT, share and bind-mount wiring.
+  chRichGuests = mkGuests {
+    globalProxy.enable = false;
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        sharedFolder = true;
+        services = {
+          sudoAuthProxy = true;
+          sshAgentProxy = true;
+        };
+        relays = [
+          {port = 8080;}
+          {
+            port = 53;
+            protocol = "udp";
+          }
+        ];
+        shares = [
+          {
+            tag = "notes";
+            source = "/host/notes";
+            mountPoint = "/home/user/notes";
+            readOnly = true;
+          }
+          {
+            tag = "work";
+            source = "/host/work";
+            mountPoint = "/home/user/work";
+          }
+        ];
+      };
+    };
+  };
+  chRichVm = chRichGuests.nixosConfigurations."vm-ch";
+  chRichNft = chRichVm.config.networking.nftables.tables.tartarus_inner.content;
+  chRichBinds = chRichVm.config.containers.inner.bindMounts;
+
+  # A proxy-only nested container: the VM must DNAT the proxy port to the host
+  # gateway and drop the container's other direct egress.
+  chProxyGuests = mkGuests {
+    globalProxy = {
+      enable = true;
+      location = "host";
+      port = 3128;
+    };
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = false;
+        host = "ch";
+        proxy = {
+          enable = true;
+          allowHosts = ["nested.example"];
+        };
+      };
+    };
+  };
+  chProxyVm = chProxyGuests.nixosConfigurations."vm-ch";
+  chProxyNft = chProxyVm.config.networking.nftables.tables.tartarus_inner.content;
+  chProxyFilter = chProxyVm.config.networking.nftables.tables.tartarus_inner_filter.content;
+
+  # A Darwin container-host: a read-only inner share is store-snapshotted and so
+  # must NOT cost a virtiofs device (Apple caps them at 26); the container binds
+  # the snapshot path straight from /nix/store.
+  chDarwinGuests = mkGuests {
+    hostSystem = "aarch64-darwin";
+    globalProxy.enable = false;
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        shares = [
+          {
+            tag = "rosnap";
+            source = ./.;
+            mountPoint = "/home/user/rosnap";
+            readOnly = true;
+          }
+        ];
+      };
+    };
+  };
+  chDarwinVm = chDarwinGuests.nixosConfigurations."vm-ch";
+  chDarwinBinds = chDarwinVm.config.containers.inner.bindMounts;
 
   # ==== P5: resource-ceiling resolution =================================
   # A plain VM keeps the numeric defaults (768 MiB / 1 vCPU) passed straight to
@@ -1439,15 +1607,35 @@ in {
       "container-host mkGuests output names changed";
 
     # The VM's config must declare the nested container and wire the bridge
-    # model: hostBridge + privateNetwork, autoStart, persistent state.
+    # model: hostBridge + privateNetwork, persistent state. `autoStart` mirrors
+    # the inner guest's own `autostart`, so a non-opted-in inner stays down.
     "container-host/nested-declared" =
       T
       (chVm.config.containers ? inner
         && chVm.config.containers.inner.hostBridge == "trs2"
         && chVm.config.containers.inner.privateNetwork
-        && chVm.config.containers.inner.autoStart
+        && chVm.config.containers.inner.autoStart == false
         && chVm.config.containers.inner.ephemeral == false)
       "containers.inner bridge/network flags changed";
+
+    # Only the nested containers that opt into `autostart` come up with the VM.
+    "container-host/nested-autostart-mirrors-guest" =
+      T
+      (chAutoVm.config.containers.inner.autoStart && !chVm.config.containers.inner.autoStart)
+      "a nested container's autoStart does not mirror its own `autostart`";
+
+    # The host CLI drives a nested container's unit over key-only root SSH
+    # (`ssh root@<vm> systemctl ... container@<name>`), so the container-host VM
+    # permits public-key root login with the same key the `user` account trusts.
+    # A non-container-host VM keeps the base default of no root login.
+    "container-host/nested-control-root-ssh" =
+      T
+      (chVm.config.services.openssh.settings.PermitRootLogin
+        == "prohibit-password"
+        && chVm.config.users.users.root.openssh.authorizedKeys.keys
+        == chVm.config.users.users.user.openssh.authorizedKeys.keys
+        && envLinuxGuests.nixosConfigurations."vm-vault".config.services.openssh.settings.PermitRootLogin == "no")
+      "the container-host VM's root SSH for nested-container control is misconfigured";
 
     "container-host/nested-bindmounts" =
       T
@@ -1456,6 +1644,74 @@ in {
         && chVm.config.containers.inner.bindMounts."/etc/tartarus/ssh".isReadOnly
         && chVm.config.containers.inner.bindMounts."/etc/tartarus/x509".isReadOnly)
       "containers.inner key bind mounts are missing or writable";
+
+    # Feature parity: a nested container's services, relays and shares are wired
+    # into the container-host VM (the VM DNATs services/relays out to the host /
+    # inner address and holds the shares, then bind-mounts them inward).
+    "container-host/nested-service-dnat" =
+      T
+      (hasInfix "ip daddr 10.202.0.1 tcp dport { 65001, 65000 } counter dnat ip to 10.200.0.1" chRichNft)
+      "the nested container's host-service ports are not DNATed to the VM gateway";
+    "container-host/nested-relay-dnat" =
+      T
+      (hasInfix "iifname \"eth0\" tcp dport 8080 counter dnat ip to 10.202.0.6:8080" chRichNft
+        && hasInfix "iifname \"trs2\" ip daddr 10.202.0.1 udp dport 53 counter dnat ip to 10.202.0.6:53" chRichNft)
+      "the nested container's relays are not DNATed (host and inner-service paths)";
+    "container-host/nested-shares-mounted" =
+      T
+      (let
+        byTag = tag: lib.findFirst (s: s.tag == tag) null chRichVm.config.microvm.shares;
+        notes = byTag "ti6-s-notes";
+        work = byTag "ti6-s-work";
+        shared = byTag "ti-shared";
+        certsSsh = byTag "ti-certs-ssh";
+        certsX509 = byTag "ti-certs-x509";
+      in
+        notes
+        != null
+        && notes.mountPoint == "/var/lib/tartarus-inner/inner/shares/notes"
+        && (notes.readOnly or false)
+        && work != null
+        && work.mountPoint == "/var/lib/tartarus-inner/inner/shares/work"
+        && shared != null
+        && shared.mountPoint == "/var/lib/tartarus-inner/shared"
+        && certsSsh != null
+        && certsSsh.mountPoint == "/var/lib/tartarus-inner/certs/ssh"
+        && certsX509 != null
+        && certsX509.mountPoint == "/var/lib/tartarus-inner/certs/x509")
+      "the nested container's shares were not declared on the container-host VM";
+    "container-host/nested-share-bindmounts" =
+      T
+      (chRichBinds ? "/home/user/notes"
+        && chRichBinds ? "/home/user/work"
+        && chRichBinds ? "/home/user/shared"
+        && chRichBinds."/home/user/notes".isReadOnly
+        && !(chRichBinds."/home/user/work".isReadOnly)
+        && chRichBinds."/home/user/notes".hostPath == "/var/lib/tartarus-inner/inner/shares/notes"
+        && chRichBinds."/home/user/work".hostPath == "/var/lib/tartarus-inner/inner/shares/work"
+        && chRichBinds."/home/user/shared".hostPath == "/var/lib/tartarus-inner/shared/inner")
+      "the nested container's shares are not bind-mounted at their guest paths";
+    # Device-budget guard: on Darwin a read-only inner share is store-snapshotted
+    # and bound from /nix/store rather than exported as a virtiofs device.
+    "container-host/nested-rosnapshot-no-device" =
+      T
+      (let
+        byTag = tag: lib.findFirst (s: s.tag == tag) null chDarwinVm.config.microvm.shares;
+      in
+        byTag "ti6-s-rosnap"
+        == null
+        && chDarwinBinds."/home/user/rosnap".isReadOnly
+        && builtins.match "/nix/store/.*" chDarwinBinds."/home/user/rosnap".hostPath != null)
+      "a store-snapshotted inner share still costs a virtiofs device";
+    "container-host/nested-proxy-dnat" =
+      T
+      (hasInfix "ip daddr 10.202.0.1 tcp dport { 3128 } counter dnat ip to 10.200.0.1" chProxyNft)
+      "the nested proxy client's port is not DNATed to the VM gateway";
+    "container-host/nested-no-internet-drop" =
+      T
+      (hasInfix "ip saddr 10.202.0.6 oifname \"eth0\" counter drop comment \"inner-no-internet\"" chProxyFilter
+        && hasInfix "ip saddr 10.202.0.6 ip daddr 10.200.0.1 counter accept" chProxyFilter)
+      "a proxy-only nested container is not fenced to the VM gateway";
 
     # Force the nested container's own evaluation: its config must resolve with
     # inner-bridge addressing. `tryEval` so a heavy/fragile nested eval reports
@@ -1530,11 +1786,15 @@ in {
       (hostNestedAndNative.config.tartarus.instances.container.idByName.inner == 6)
       "idByName dropped or remapped the nested container id";
 
-    # The host proxy ACL/listen set never names a nested container.
-    "p3/proxy-clients-exclude-nested" =
+    # The host proxy ACL/listen set collapses nested clients into their
+    # container-host VM (whose DNAT/SNAT makes the proxy see the VM), never the
+    # inner container's own name/address.
+    "p3/proxy-clients-nested-stand-in" =
       T
-      (lib.elem "box" proxyNestedClientNames && !(lib.elem "inner" proxyNestedClientNames))
-      "tartarus.proxy.clients included a nested container";
+      (lib.elem "box" proxyNestedClientNames
+        && lib.elem "ch" proxyNestedClientNames
+        && !(lib.elem "inner" proxyNestedClientNames))
+      "the proxy client list did not collapse nested clients to their host VM";
 
     # Autostart of a nested container starts its host VM, with no unit that
     # tries to start the inner container directly.
@@ -1548,13 +1808,25 @@ in {
     "p3/autostart-duplicates-deduped" =
       T (nestedAutostartDupNames == ["ch"]) "host + nested autostart were not deduped to one unit";
 
-    # Step-7 rejections.
-    "p3/nested-relays-rejected" =
-      T (!assertionsPass hostNestedRelays) "a nested container with relays was accepted";
-    "p3/nested-service-rejected" =
-      T (!assertionsPass hostNestedService) "a nested container requesting a host service was accepted";
-    "p3/nested-proxy-rejected" =
-      T (!assertionsPass hostProxyNested) "a nested container with proxy.enable was accepted";
+    # Step-7 rejections: only host proxy routing remains unimplemented for
+    # nested containers.
+    "p3/nested-relays-stand-in" =
+      T (assertionsPass hostNestedRelays) "a nested container with relays was rejected";
+    "p3/nested-service-stand-in" =
+      T (assertionsPass hostNestedService) "a nested container requesting a host service was rejected";
+    "p3/nested-service-stand-in-enables-server" =
+      T
+      (hostNestedService.config.home-manager.users.user.tartarus.sudo-auth-proxy.server.enable == true)
+      "the container-host VM did not stand in for its nested container's host-service request";
+    "p3/nested-proxy-stand-in" =
+      T (assertionsPass hostProxyNested) "a nested container with proxy.enable was rejected";
+    "p3/nested-proxy-stand-in-allowlist" =
+      T
+      (let
+        c = lib.findFirst (x: x.name == "ch") null hostProxyNested.config.tartarus.proxy.clients;
+      in
+        c != null && lib.elem "nested.example" c.allowHosts)
+      "the container-host VM did not carry its nested proxy client's allowlist";
 
     # ---- Darwin guest firewall: host-service allowances ----------------
     # A proxy-only guest that opts into an in-guest firewall must still reach
@@ -1576,6 +1848,11 @@ in {
       T (hostDarwinRelays.config.launchd.agents ? "tartarus-relay-x-tcp-3128") "non-privileged relay is not a user launch agent";
     "relay/darwin-proxy-auto" =
       T (hostDarwinGuestProxyOk.config.launchd.agents ? "tartarus-relay-proxyvm-tcp-3128") "the guest-hosted proxy relay was not generated automatically";
+    "relay/darwin-nested-targets-host-vm" =
+      T
+      (hostDarwinNestedRelay.config.launchd.agents ? "tartarus-relay-inner-tcp-8080"
+        && hasInfix "TCP4-LISTEN:8080,bind=192.168.64.1,reuseaddr,fork TCP4:192.168.64.47:8080" darwinNestedRelayArgs)
+      "a nested container's relay did not target its container-host VM";
 
     # ---- rendered Squid config -----------------------------------------
     "squid/src-acl" = inStr "acl g_vault src 10.200.0.3/32" squidDefault;

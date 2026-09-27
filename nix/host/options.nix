@@ -58,6 +58,16 @@ in {
           description = "Guest kind: a QEMU/vfkit MicroVM or a systemd-nspawn container.";
         };
 
+        vmOnly = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Pin this guest to `kind = "vm"`. Declared next to the guest content
+            (e.g. because it needs its own kernel, such as Docker), it fails
+            evaluation if the guest is ever switched to a `kind = "container"`.
+          '';
+        };
+
         id = mkOption {
           type = shared.idType;
           default = null;
