@@ -365,6 +365,13 @@ def _build_runner(config: Config, name: str, mounts: list[str], *, upgrade: bool
     # such source directory for its share.
     config.shared_dir(name).mkdir(parents=True, exist_ok=True)
 
+    # A nested container with `sharedFolder` shares its own host directory
+    # (`~/shared/<inner>`) into the VM via shares.nix; create it before the
+    # build so the virtiofs source exists.
+    for inner in config.inner_guests(base):
+        if inner.shared_folder:
+            config.shared_dir(inner.name).mkdir(parents=True, exist_ok=True)
+
     result = state / "result"
     cid: int | None = None
     if name != base:
@@ -419,9 +426,27 @@ def _build_runner(config: Config, name: str, mounts: list[str], *, upgrade: bool
     return result, cid
 
 
+def _ensure_build_certs(config: Config, base: str) -> None:
+    """Create the SSH/X509 material a guest build bakes in.
+
+    The VM's own host key/client cert plus, for a container-host VM, every
+    nested container's (``container-host.nix`` bind-mounts those). All must
+    exist before ``_build_runner`` so ``base.nix`` can read the client public
+    key -- ``~/.ssh/tartarus.pub`` for VMs, ``~/.ssh/containers.pub`` for
+    containers -- and so the shares have a source. ``base`` (not the numbered
+    instance name) is the template either way.
+    """
+    ca.ensure_vm_certs(config, base)
+    host_guest = config.guest(base, "vm")
+    if host_guest is not None and host_guest.container_host:
+        for inner in config.inner_guests(base):
+            ca.ensure_ctn_certs(config, inner.name)
+
+
 def action_build(config: Config, name: str, mounts: list[str], upgrade: bool = False) -> None:
     base = flake.base_name(config, "vm", name)
     flake.require_template(config, "vm", base)
+    _ensure_build_certs(config, base)
     reused = _should_reuse(config, name, mounts, upgrade)
     result, _cid = _build_runner(config, name, mounts, upgrade=upgrade)
     if reused:
@@ -434,24 +459,16 @@ def action_start(config: Config, name: str, mounts: list[str], upgrade: bool = F
     base = flake.base_name(config, "vm", name)
     flake.require_template(config, "vm", base)
 
-    ca.ensure_vm_certs(config, base)
-
-    # A container-host VM's NixOS config publishes each nested container's
-    # CA-signed host key and client cert into the container (P2 bind mounts).
-    # Those files must exist before the VM is built, so ensure them here --
-    # the nested container itself is never started by the host CLI. `base`
-    # (not `name`) is the container-host template even for a numbered instance.
-    host_guest = config.guest(base, "vm")
-    if host_guest is not None and host_guest.container_host:
-        for inner in config.inner_guests(base):
-            ca.ensure_ctn_certs(config, inner.name)
-
     _reap_stale_vfkits(config, name)
 
     if ssh.is_running(config, name):
         pid = (config.state_dir(name) / "microvm.pid").read_text().strip()
         warn(f"'{name}' is already running (pid {pid}).")
         return
+
+    # Only a build needs the key material baked in -- skip the (for a
+    # container-host VM, per-inner) cert work entirely when already running.
+    _ensure_build_certs(config, base)
 
     _STARTING.add(name)
     try:

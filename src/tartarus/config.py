@@ -165,6 +165,22 @@ class Config:
                 return guest
         return None
 
+    def find_guest(self, name: str) -> Guest | None:
+        """Resolve ``name`` (with optional ``.trs``/``-N``) to any enabled guest.
+
+        Like :meth:`require_guest` but non-raising and kind-agnostic: returns the
+        enabled guest, or ``None`` when nothing matches. Used to infer a guest's
+        kind from ``config.toml`` so the CLI needs no ``--container`` flag.
+        """
+        candidate = name[: -len(".trs")] if name.endswith(".trs") else name
+        guest = self.guest(candidate)
+        if guest is not None:
+            return guest
+        match = _INSTANCE_RE.match(candidate)
+        if match is not None:
+            return self.guest(match.group(1))
+        return None
+
     def inner_guests(self, host_name: str) -> list[Guest]:
         """Enabled container guests nested inside container-host VM ``host_name``.
 

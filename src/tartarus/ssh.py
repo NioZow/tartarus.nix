@@ -27,6 +27,7 @@ from .process import run_quiet
 
 KNOWN_HOSTS_TRS_NAME = "known_hosts_trs"
 USER_SSH_KEY_NAME = "tartarus"
+CONTAINER_SSH_KEY_NAME = "containers"
 
 # A freshly started MicroVM needs a moment to bring up its interface and get a
 # DHCP lease; until then the host ARP table has no entry for its MAC. Poll
@@ -39,20 +40,19 @@ def user_ssh_key(config: Config) -> Path:
     return config.ssh_dir / USER_SSH_KEY_NAME
 
 
+def container_ssh_key(config: Config) -> Path:
+    return config.ssh_dir / CONTAINER_SSH_KEY_NAME
+
+
 def known_hosts_trs(config: Config) -> Path:
     return config.ssh_dir / KNOWN_HOSTS_TRS_NAME
 
 
-def ensure_user_ssh_key(config: Config) -> None:
-    """Generate ``~/.ssh/tartarus`` (Ed25519, no passphrase) if missing.
-
-    This is the shared client key used to authenticate to all MicroVMs and
-    containers; the matching public key is baked into guest builds.
-    """
-    key = user_ssh_key(config)
+def _ensure_client_key(config: Config, key: Path, comment: str, label: str) -> None:
+    """Generate an Ed25519 client key (and ``.pub``) if missing."""
     if key.exists():
         return
-    info("Generating MicroVM user SSH key...")
+    info(f"Generating {label} user SSH key...")
     key.parent.mkdir(parents=True, exist_ok=True)
     run_quiet(
         [
@@ -64,12 +64,29 @@ def ensure_user_ssh_key(config: Config) -> None:
             "-N",
             "",
             "-C",
-            f"microvm-{config.user}@{socket.gethostname()}",
+            comment,
         ],
         check=True,
     )
     key.chmod(0o600)
     (key.parent / f"{key.name}.pub").chmod(0o644)
+
+
+def ensure_user_ssh_key(config: Config) -> None:
+    """Generate the shared client keys if missing.
+
+    MicroVMs authenticate with ``~/.ssh/tartarus``; containers authenticate
+    with ``~/.ssh/containers``. The matching public keys are baked into guest
+    builds (``base.nix`` picks ``containers.pub`` for ``kind = "container"``),
+    so both must exist before a guest is built.
+    """
+    host = socket.gethostname()
+    _ensure_client_key(
+        config, user_ssh_key(config), f"microvm-{config.user}@{host}", "MicroVM"
+    )
+    _ensure_client_key(
+        config, container_ssh_key(config), f"container-{config.user}@{host}", "container"
+    )
 
 
 def ensure_known_hosts_trs(config: Config, ca_pub: Path) -> None:

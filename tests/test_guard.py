@@ -165,6 +165,9 @@ def test_all_guests_commands_are_not_guarded(monkeypatch):
 
     reached: list[str] = []
     monkeypatch.setattr(cli.vm, "dispatch", lambda _c, a: reached.append(a.command))
+    # `list` now spans both kinds and is routed to the unified listing module
+    # before the VM/container dispatch, so it never reaches vm.dispatch.
+    monkeypatch.setattr(cli.listing, "action_list", lambda *_a, **_k: reached.append("list"))
 
     cli.main(["list"])
     cli.main(["status"])

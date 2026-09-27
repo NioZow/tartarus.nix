@@ -173,8 +173,9 @@ that proves it actually boots). Enable a container host `ch` (`kind = "vm"`,
 (`kind = "container"`, `host = "ch"`), and a plain VM `vault` alongside.
 
 - [ ] `tartarus start ch` builds (via `nix.linux-builder`) and boots;
-      `tartarus status ch` is running, and `tartarus list` marks it
-      `(container host)`.
+      `tartarus status ch` is running, `tartarus list` marks it
+      `(container host)` and lists `inner` beneath it, and
+      `tartarus list --tree` indents `inner` under `ch`.
 - [ ] The nested container starts with the VM (eager): after boot,
       `tartarus --container status inner` reports it nested in `ch`.
 - [ ] `tartarus --container ssh inner` connects: `ssh -v` shows

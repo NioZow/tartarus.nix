@@ -12,6 +12,7 @@ Run from the repository root::
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -199,49 +200,76 @@ def test_inner_guests_preserves_stable_order():
 # --- vm.action_start: publish inner key material --------------------------
 
 
+class _FakeProc:
+    pid = 4242
+
+
+def _patch_vm_build_path(monkeypatch, config, name: str = "ch"):
+    """Mock everything ``vm.action_start`` touches once past its running check."""
+    monkeypatch.setattr(vm.flake, "base_name", lambda _c, _k, n: n)
+    monkeypatch.setattr(vm.flake, "require_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(vm.flake, "guest_id", lambda _c, _k, _n: 5)
+    monkeypatch.setattr(vm, "_reap_stale_vfkits", lambda *_a, **_k: 0)
+    monkeypatch.setattr(vm.ssh, "is_running", lambda _c, _n: False)
+    monkeypatch.setattr(vm, "_ensure_dependencies", lambda *_a, **_k: None)
+    monkeypatch.setattr(vm, "_start_relays", lambda *_a, **_k: None)
+    monkeypatch.setattr(vm.platform, "system", lambda: "Linux")
+    state = config.state_dir(name)
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "result").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(vm, "_build_runner", lambda _c, _n, _m, upgrade=False: (state / "result", None))
+    monkeypatch.setattr(vm.subprocess, "Popen", lambda *_a, **_k: _FakeProc())
+    return state
+
+
 def test_container_host_start_ensures_inner_certs(monkeypatch, tmp_path):
     config = make_config_in(tmp_path, CH, INNER)
-    monkeypatch.setattr(vm.flake, "base_name", lambda _c, _k, name: name)
-    monkeypatch.setattr(vm.flake, "require_template", lambda *_a, **_k: None)
+    _patch_vm_build_path(monkeypatch, config)
     monkeypatch.setattr(vm.ca, "ensure_vm_certs", lambda *_a, **_k: None)
     ensured: list[str] = []
     monkeypatch.setattr(vm.ca, "ensure_ctn_certs", lambda _c, name: ensured.append(name))
-    monkeypatch.setattr(vm, "_reap_stale_vfkits", lambda *_a, **_k: 0)
-    # Already running: action_start warns and returns after preparing certs.
-    monkeypatch.setattr(vm.ssh, "is_running", lambda _c, _n: True)
-    state = config.state_dir("ch")
-    state.mkdir(parents=True, exist_ok=True)
-    (state / "microvm.pid").write_text("123\n")
 
     vm.action_start(config, "ch", mounts=[])
 
     assert ensured == ["inner"]
 
 
-def test_plain_vm_start_ignores_inner_certs(monkeypatch, tmp_path):
-    plain = Guest(name="plain", kind="vm", id=5)
-    config = make_config_in(tmp_path, plain)
+def test_container_host_start_skips_certs_when_already_running(monkeypatch, tmp_path, capsys):
+    config = make_config_in(tmp_path, CH, INNER)
     monkeypatch.setattr(vm.flake, "base_name", lambda _c, _k, name: name)
     monkeypatch.setattr(vm.flake, "require_template", lambda *_a, **_k: None)
-    monkeypatch.setattr(vm.ca, "ensure_vm_certs", lambda *_a, **_k: None)
-    ensured: list[str] = []
-    monkeypatch.setattr(vm.ca, "ensure_ctn_certs", lambda _c, name: ensured.append(name))
     monkeypatch.setattr(vm, "_reap_stale_vfkits", lambda *_a, **_k: 0)
     monkeypatch.setattr(vm.ssh, "is_running", lambda _c, _n: True)
-    state = config.state_dir("plain")
+    monkeypatch.setattr(vm.ca, "ensure_vm_certs", lambda *_a, **_k: pytest.fail("cert work ran for a running VM"))
+    monkeypatch.setattr(vm.ca, "ensure_ctn_certs", lambda *_a, **_k: pytest.fail("cert work ran for a running VM"))
+    state = config.state_dir("ch")
     state.mkdir(parents=True, exist_ok=True)
     (state / "microvm.pid").write_text("123\n")
 
+    vm.action_start(config, "ch", mounts=[])
+
+    assert "already running" in capsys.readouterr().err
+
+
+def test_plain_vm_start_ignores_inner_certs(monkeypatch, tmp_path):
+    plain = Guest(name="plain", kind="vm", id=5)
+    config = make_config_in(tmp_path, plain)
+    _patch_vm_build_path(monkeypatch, config, "plain")
+    ensured_vm: list[str] = []
+    monkeypatch.setattr(vm.ca, "ensure_vm_certs", lambda _c, name: ensured_vm.append(name))
+    monkeypatch.setattr(vm.ca, "ensure_ctn_certs", lambda *_a, **_k: pytest.fail("inner certs for a plain VM"))
+
     vm.action_start(config, "plain", mounts=[])
 
-    assert ensured == []
+    assert ensured_vm == ["plain"]
 
 
-# --- ctn.action_start: delegate to the host VM ----------------------------
+def _done(returncode: int = 0, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
-def test_nested_start_delegates_to_host_vm(monkeypatch, tmp_path):
-    config = make_config_in(tmp_path, CH, INNER)
+def _patch_nested_start(monkeypatch, state: str = "stopped") -> tuple[list[tuple], list[tuple]]:
+    """Mock the VM start, the unit-state probe and the SSH systemctl."""
     monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "inner")
     monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
     monkeypatch.setattr(ctn.ca, "ensure_ctn_certs", lambda *_a, **_k: None)
@@ -251,25 +279,192 @@ def test_nested_start_delegates_to_host_vm(monkeypatch, tmp_path):
     monkeypatch.setattr(
         vm, "action_start", lambda _c, name, mounts, upgrade=False: started.append((name, mounts, upgrade))
     )
+    monkeypatch.setattr(ctn, "nested_state", lambda *_a, **_k: state)
+    ctl: list[tuple] = []
+    monkeypatch.setattr(
+        ctn, "nested_systemctl", lambda _c, host, verb, name: ctl.append((host, verb, name)) or _done()
+    )
+    return started, ctl
+
+
+# --- ctn.action_start: delegate to the host VM, then start the unit --------
+
+
+def test_nested_start_delegates_to_host_vm(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    started, ctl = _patch_nested_start(monkeypatch)
 
     ctn.action_start(config, "inner")
 
     assert started == [("ch", [], False)]
+    assert ctl == [("ch", "start", "inner")]
 
 
 def test_nested_start_forwards_upgrade_to_host_vm(monkeypatch, tmp_path):
     config = make_config_in(tmp_path, CH, INNER)
-    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "inner")
-    monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
-    monkeypatch.setattr(ctn.ca, "ensure_ctn_certs", lambda *_a, **_k: None)
-    started: list[tuple] = []
-    monkeypatch.setattr(
-        vm, "action_start", lambda _c, name, mounts, upgrade=False: started.append((name, mounts, upgrade))
-    )
+    started, ctl = _patch_nested_start(monkeypatch)
 
     ctn.action_start(config, "inner", upgrade=True)
 
     assert started == [("ch", [], True)]
+    assert ctl == [("ch", "start", "inner")]
+
+
+def test_nested_start_noop_when_already_running(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    started, ctl = _patch_nested_start(monkeypatch, state="running")
+
+    ctn.action_start(config, "inner")
+
+    assert started == [("ch", [], False)]
+    assert ctl == []
+
+
+def test_nested_start_skips_host_vm_when_already_running(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    started, ctl = _patch_nested_start(monkeypatch)
+    monkeypatch.setattr(ctn.ssh, "is_running", lambda _c, _n: True)
+    monkeypatch.setattr(ctn.ca, "ensure_ctn_certs", lambda *_a, **_k: pytest.fail("cert work while VM up"))
+
+    ctn.action_start(config, "inner")
+
+    assert started == []
+    assert ctl == [("ch", "start", "inner")]
+
+
+# --- ctn.action_stop / action_restart: drive the unit over SSH ------------
+
+
+def test_nested_stop_over_ssh(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "inner")
+    monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctn.ssh, "is_running", lambda _c, _n: True)
+    ctl: list[tuple] = []
+    monkeypatch.setattr(
+        ctn, "nested_systemctl", lambda _c, host, verb, name: ctl.append((host, verb, name)) or _done()
+    )
+
+    ctn.action_stop(config, "inner", False)
+
+    assert ctl == [("ch", "stop", "inner")]
+
+
+def test_nested_stop_when_vm_down(monkeypatch, tmp_path, capsys):
+    config = make_config_in(tmp_path, CH, INNER)
+    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "inner")
+    monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctn.ssh, "is_running", lambda _c, _n: False)
+    monkeypatch.setattr(ctn, "nested_systemctl", lambda *_a, **_k: pytest.fail("ssh systemctl was invoked"))
+
+    ctn.action_stop(config, "inner", False)
+
+    assert "is down" in capsys.readouterr().err
+
+
+def test_nested_stop_purge_rejected(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "inner")
+    monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
+
+    with pytest.raises(SystemExit) as exc:
+        ctn.action_stop(config, "inner", True)
+    assert exc.value.code == 1
+
+
+def test_nested_restart_over_ssh(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "inner")
+    monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctn.ssh, "is_running", lambda _c, _n: True)
+    monkeypatch.setattr(ctn, "run_sudo", lambda *_a, **_k: pytest.fail("host systemctl was invoked"))
+    ctl: list[tuple] = []
+    monkeypatch.setattr(
+        ctn, "nested_systemctl", lambda _c, host, verb, name: ctl.append((host, verb, name)) or _done()
+    )
+
+    ctn.action_restart(config, "inner")
+
+    assert ctl == [("ch", "restart", "inner")]
+
+
+def test_nested_status_queries_unit_state(monkeypatch, tmp_path, capsys):
+    config = make_config_in(tmp_path, CH, INNER)
+    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "inner")
+    monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctn, "nested_state", lambda _c, _h, _n: "running")
+
+    ctn.action_status(config, "inner")
+
+    out = capsys.readouterr().out
+    assert "nested in container-host VM 'ch'" in out
+    assert "running" in out
+
+
+# --- nested unit control goes over root SSH (no sudoers grant) ------------
+
+
+def test_nested_systemctl_runs_as_root_over_ssh(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    calls: list[list[str]] = []
+
+    def _run(argv, **_kwargs):
+        calls.append(argv)
+        return _done()
+
+    monkeypatch.setattr(ctn.subprocess, "run", _run)
+
+    ctn.nested_systemctl(config, "ch", "stop", "inner")
+
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[0] == "ssh"
+    assert "root@ch" in argv
+    assert "sudo" not in argv
+    assert argv[-3:] == [ctn.VM_SYSTEMCTL, "stop", "container@inner"]
+
+
+def test_nested_state_probe_stays_unprivileged(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    calls: list[list[str]] = []
+
+    def _run(argv, **_kwargs):
+        calls.append(argv)
+        return _done(stdout="active\n")
+
+    monkeypatch.setattr(ctn.subprocess, "run", _run)
+
+    assert ctn.nested_state(config, "ch", "inner") == "running"
+
+    argv = calls[0]
+    assert "ch" in argv
+    assert "root@ch" not in argv
+    assert argv[-3:] == [ctn.VM_SYSTEMCTL, "is-active", "container@inner"]
+
+
+def test_nested_states_batches_in_one_ssh_roundtrip(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    calls: list[list[str]] = []
+
+    def _run(argv, **_kwargs):
+        calls.append(argv)
+        return _done(stdout="dotfiles active\ninner inactive\n")
+
+    monkeypatch.setattr(ctn.subprocess, "run", _run)
+
+    states = ctn.nested_states(config, "ch", ["dotfiles", "inner"])
+
+    assert states == {"dotfiles": "running", "inner": "stopped"}
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[0] == "ssh"
+    assert "ch" in argv
+    # ssh joins the remote-command arguments with spaces, so the whole script
+    # must be ONE argv element. Passing ["sh", "-c", script] lets ssh send
+    # `sh -c printf ...`, whose first token is dropped -- misreporting the first
+    # name as stopped (the bug this guards).
+    assert "-c" not in argv
+    assert all(f"container@{n}" in argv[-1] for n in ("dotfiles", "inner"))
 
 
 # --- ctn.action_build: delegate to the host VM ----------------------------
@@ -348,14 +543,12 @@ def test_nested_ssh_without_start_refuses_stopped_host(monkeypatch, tmp_path, ca
     assert "container-host VM 'ch' is not running" in str(exc.value)
 
 
-# --- ctn lifecycle commands refuse a nested container ---------------------
+# --- ctn commands with no host-side equivalent refuse a nested container --
 
 
 @pytest.mark.parametrize(
     "call",
     [
-        lambda config: ctn.action_stop(config, "inner", False),
-        lambda config: ctn.action_restart(config, "inner"),
         lambda config: ctn.action_logs(config, "inner"),
         lambda config: ctn.action_spawn(config, "inner", None),
     ],
@@ -398,6 +591,7 @@ def test_ctn_list_shows_host(monkeypatch, tmp_path, capsys):
     config = make_config_in(tmp_path, CH, INNER)
     monkeypatch.setattr(ctn, "list_templates", lambda _c: ["inner"])
     monkeypatch.setattr(ctn, "list_conf_names", lambda: set())
+    monkeypatch.setattr(ctn, "nested_states", lambda _c, _h, names: {n: "running" for n in names})
 
     ctn.action_list(config, json_output=False)
 
@@ -411,6 +605,7 @@ def test_ctn_list_json_includes_host(monkeypatch, tmp_path, capsys):
     config = make_config_in(tmp_path, CH, INNER)
     monkeypatch.setattr(ctn, "list_templates", lambda _c: ["inner"])
     monkeypatch.setattr(ctn, "list_conf_names", lambda: set())
+    monkeypatch.setattr(ctn, "nested_states", lambda _c, _h, names: {n: "stopped" for n in names})
 
     ctn.action_list(config, json_output=True)
 
@@ -454,11 +649,18 @@ def test_guard_accepts_nested_container(monkeypatch):
     assert reached == ["ssh"]
 
 
-def test_vm_command_on_nested_container_reports_kind(monkeypatch, capsys):
-    config = make_config(CH, INNER)
+def test_vm_command_on_nested_container_infers_container(monkeypatch):
+    # Without `--container`, the CLI infers the kind from config.toml, so a
+    # nested container's name routes to the container path.
+    config = make_config(CH, INNER, BOX)
     monkeypatch.setattr(cli, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli.flake, "require_flake", lambda _c: None)
+    reached: list[str] = []
+    monkeypatch.setattr(cli.ctn, "dispatch", lambda _c, a: reached.append(("ctn", a.command)))
+    monkeypatch.setattr(cli.vm, "dispatch", lambda _c, a: reached.append(("vm", a.command)))
 
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["ssh", "inner"])
-    assert exc.value.code == 1
-    assert 'enabled as kind "container"' in capsys.readouterr().err
+    cli.main(["ssh", "inner"])
+    cli.main(["start", "box"])
+    cli.main(["ssh", "ch"])
+
+    assert reached == [("ctn", "ssh"), ("ctn", "start"), ("vm", "ssh")]

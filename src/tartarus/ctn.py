@@ -81,6 +81,83 @@ def is_running(name: str) -> bool:
     return result.returncode == 0
 
 
+# The stable current-system symlink the container-host VM's root SSH login and
+# this CLI use, so the command resolves without depending on root's non-login
+# PATH (nix/guest/container-host.nix).
+VM_SYSTEMCTL = "/run/current-system/sw/bin/systemctl"
+
+
+def nested_host(config: Config, name: str) -> str | None:
+    """The container-host VM name if `name` is a nested container, else None."""
+    base = base_name(config, name)
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        return guest.host
+    return None
+
+
+def _ssh_vm(
+    config: Config, host: str, argv: list[str], user: str | None = None
+) -> subprocess.CompletedProcess:
+    """Run `argv` on the container-host VM `host` over SSH (non-interactive).
+
+    BatchMode keeps a probe/start/stop from hanging on a password or host-key
+    prompt: the host's ssh config already routes `<host>` (ProxyCommand), and
+    the VM trusts the shared MicroVM client key for both the login user and
+    root (nix/guest/container-host.nix), so mutating commands can run as `root`
+    over key-only SSH.
+
+    ``argv`` is joined into the remote command by ssh itself, which concatenates
+    every post-host argument with spaces. A bare command (``["systemctl", "x"]``)
+    is therefore fine, but a shell *script* must be passed as a single element
+    (``[script]``) -- ``["sh", "-c", script]`` would be sent as
+    ``sh -c printf ...`` and the remote ``sh`` would keep only the first token.
+    """
+    target = f"{user}@{host}" if user else host
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", target, *argv],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def nested_state(config: Config, host: str, name: str) -> str:
+    """The state of a nested container's own unit inside its host VM."""
+    result = _ssh_vm(config, host, [VM_SYSTEMCTL, "is-active", f"container@{name}"])
+    return "running" if result.stdout.strip() == "active" else "stopped"
+
+
+def nested_states(config: Config, host: str, names: list[str]) -> dict[str, str]:
+    """Batch `nested_state` for several containers in one SSH round-trip."""
+    names = [n for n in sorted(names) if re.fullmatch(r"[A-Za-z0-9_.-]+", n)]
+    if not names:
+        return {}
+    script = "; ".join(
+        f'printf "%s " "{n}"; {VM_SYSTEMCTL} is-active "container@{n}" 2>/dev/null || true'
+        for n in names
+    )
+    # One element: ssh joins argv with spaces and the remote login shell runs the
+    # string, so wrapping it as ["sh", "-c", script] would truncate it after the
+    # first token (dropping the first name's state).
+    result = _ssh_vm(config, host, [script])
+    states = {n: "stopped" for n in names}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == "active":
+            states[fields[0]] = "running"
+    return states
+
+
+def nested_systemctl(config: Config, host: str, verb: str, name: str) -> subprocess.CompletedProcess:
+    """Run `systemctl <verb> container@<name>` as root inside the host VM.
+
+    Root logs in over key-only SSH with the shared MicroVM client key
+    (nix/guest/container-host.nix), so no passwordless-sudo grant is needed.
+    """
+    return _ssh_vm(config, host, [VM_SYSTEMCTL, verb, f"container@{name}"], user="root")
+
+
 def read_local_address(name: str) -> str | None:
     conf = CTN_CONF_DIR / f"{name}.conf"
     if not conf.exists():
@@ -119,7 +196,29 @@ def next_instance_name(base: str) -> str:
     die(f"no free instance number for '{base}'")
 
 
-def instance_info(name: str, kind: str, host: str | None = None) -> dict:
+def instance_info(
+    config: Config,
+    name: str,
+    kind: str,
+    host: str | None = None,
+    states: dict[str, str] | None = None,
+) -> dict:
+    if host is not None:
+        # A nested container has no `nixos-container` registration (and thus no
+        # `/etc/nixos-containers/<name>.conf`) on the host; its unit lives inside
+        # its container-host VM, so its state is queried there (`states` is a
+        # batched pre-fetch; a lone call falls back to a direct query).
+        if states is not None and name in states:
+            status = states[name]
+        else:
+            status = nested_state(config, host, name)
+        return {
+            "name": name,
+            "type": kind,
+            "status": status,
+            "address": None,
+            "host": host,
+        }
     if name not in list_conf_names():
         return {"name": name, "type": kind, "status": "not provisioned", "address": None, "host": host}
     return {
@@ -147,12 +246,26 @@ def _host_of_by_template(config: Config, templates: list[str]) -> dict[str, str 
 def collect_instances(config: Config) -> list[dict]:
     templates = list_templates(config)
     host_of = _host_of_by_template(config, templates)
-    entries = [instance_info(name, "template", host_of[name]) for name in templates]
+
+    # Batch the nested-container unit states: one SSH round-trip per host VM
+    # rather than one per container.
+    names_by_host: dict[str, list[str]] = {}
+    for name in templates:
+        host = host_of[name]
+        if host is not None:
+            names_by_host.setdefault(host, []).append(name)
+    states: dict[str, str] = {}
+    for host, names in names_by_host.items():
+        states.update(nested_states(config, host, names))
+
+    entries = [instance_info(config, name, "template", host_of[name], states) for name in templates]
 
     extra = sorted(
         name for name in list_conf_names() if base_name(config, name) != name and base_name(config, name) in templates
     )
-    entries += [instance_info(name, "instance", host_of.get(base_name(config, name))) for name in extra]
+    entries += [
+        instance_info(config, name, "instance", host_of.get(base_name(config, name)), states) for name in extra
+    ]
 
     return entries
 
@@ -183,10 +296,10 @@ def action_status(config: Config, name: str | None) -> None:
     guest = config.guest(base, "container")
     if guest is not None and guest.host is not None:
         # A nested container is not registered with `nixos-container` on the
-        # host; its state is the host VM's. Report the association instead of
-        # "not provisioned".
-        host_state = "running" if ssh.is_running(config, guest.host) else "stopped"
-        print(f"{name}: nested in container-host VM '{guest.host}' ({status_word(host_state)})")
+        # host; its unit lives inside its container-host VM. Report the unit's
+        # own state there.
+        state = nested_state(config, guest.host, name)
+        print(f"{name}: nested in container-host VM '{guest.host}' ({status_word(state)})")
         return
     if name not in list_conf_names():
         print(f"{name}: {status_word('not provisioned')}")
@@ -235,16 +348,27 @@ def action_start(config: Config, name: str, upgrade: bool = False) -> None:
 
     guest = config.guest(base, "container")
     if guest is not None and guest.host is not None:
-        # Nested container: it has no `nixos-container` registration and no
-        # own systemd unit on the host. It is eager -- the host VM's NixOS
-        # config declares it with `autoStart = true` -- so starting it means
-        # ensuring its key material and starting (or reusing) the host VM.
-        from . import vm  # lazy to avoid a circular import
+        # Nested container: no `nixos-container` registration and no own unit on
+        # the host. Its unit lives inside the container-host VM, so bring the VM
+        # up (starting it also provisions the inner certs) and then start the
+        # container's `container@<name>` unit over SSH.
+        #
+        # When the host VM is already up there is nothing to build or certify:
+        # skip the cert pass (which otherwise touches every inner) and go
+        # straight to the unit.
+        if not ssh.is_running(config, guest.host):
+            from . import vm  # lazy to avoid a circular import
 
-        ca.ensure_ctn_certs(config, base)
-        info(f"'{name}' runs inside container-host VM '{guest.host}'; ensuring the VM is up...")
-        vm.action_start(config, guest.host, mounts=[], upgrade=upgrade)
-        ok(f"'{name}' is up with container-host VM '{guest.host}' (nested containers start eagerly).")
+            ca.ensure_ctn_certs(config, base)
+            info(f"'{name}' runs inside container-host VM '{guest.host}'; ensuring the VM is up...")
+            vm.action_start(config, guest.host, mounts=[], upgrade=upgrade)
+        if nested_state(config, guest.host, name) == "running":
+            warn(f"'{name}' is already running.")
+            return
+        result = nested_systemctl(config, guest.host, "start", name)
+        if result.returncode != 0:
+            die(f"failed to start '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
+        ok(f"'{name}' started.")
         return
 
     if name not in list_conf_names():
@@ -315,11 +439,19 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
     require_template(config, base)
     guest = config.guest(base, "container")
     if guest is not None and guest.host is not None:
-        raise TartarusError(
-            f"'{name}' is a nested container inside container-host VM "
-            f"'{guest.host}'; it cannot be stopped independently. Stop the VM "
-            f"instead: tartarus stop {guest.host}"
-        )
+        # Nested container: stop its own `container@<name>` unit inside the
+        # container-host VM. A `--purge` has no meaning here -- the container is
+        # declarative, owned by the VM's configuration.
+        if purge:
+            die(f"'{name}' is a nested container inside container-host VM '{guest.host}'; --purge is not supported. Remove it from the VM's container set and rebuild instead.")
+        if not ssh.is_running(config, guest.host):
+            warn(f"'{name}' is not running (container-host VM '{guest.host}' is down).")
+            return
+        result = nested_systemctl(config, guest.host, "stop", name)
+        if result.returncode != 0:
+            die(f"failed to stop '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
+        ok(f"'{name}' stopped.")
+        return
 
     if name not in list_conf_names():
         warn(f"'{name}' does not exist.")
@@ -343,11 +475,18 @@ def action_restart(config: Config, name: str) -> None:
     require_template(config, base)
     guest = config.guest(base, "container")
     if guest is not None and guest.host is not None:
-        raise TartarusError(
-            f"'{name}' is a nested container inside container-host VM "
-            f"'{guest.host}'; it cannot be restarted independently. Restart the "
-            f"VM instead: tartarus restart {guest.host}"
-        )
+        # Nested container: restart its own `container@<name>` unit inside the
+        # container-host VM (starting the VM first if it is down).
+        if not ssh.is_running(config, guest.host):
+            from . import vm  # lazy to avoid a circular import
+
+            ca.ensure_ctn_certs(config, base)
+            vm.action_start(config, guest.host, mounts=[], upgrade=False)
+        result = nested_systemctl(config, guest.host, "restart", name)
+        if result.returncode != 0:
+            die(f"failed to restart '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
+        ok(f"'{name}' restarted.")
+        return
     if name not in list_conf_names():
         die(f"'{name}' has never been created -- use `tartarus --container start` or `spawn` first")
     ca.ensure_ctn_certs(config, base)

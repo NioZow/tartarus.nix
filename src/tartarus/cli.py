@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from typing import Sequence
 
-from . import ctn, vm
+from . import ctn, listing, vm
 from .config import Config, load_config
 from .ctn import CTN_CONF_DIR
 from .errors import TartarusError
@@ -20,8 +20,17 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
     acts on, defaulting to MicroVMs.
     """
 
-    p = sub.add_parser("list", help="show every defined guest (and any numbered instances) and whether it's running")
+    p = sub.add_parser("list", help="show every enabled guest (MicroVMs and containers) and whether it's running")
     p.add_argument("--json", action="store_true", help="print as JSON instead of a table")
+    p.add_argument("-t", "--tree", action="store_true", help="nest containers under their container-host VM")
+    p.add_argument(
+        "-c",
+        "--container",
+        dest="list_container",
+        action="store_true",
+        help="only containers, native and nested (the global -c before the subcommand also works)",
+    )
+    p.add_argument("--vm", action="store_true", help="only MicroVMs (default: MicroVMs and containers)")
 
     p = sub.add_parser("status", help="detailed status (all, or just one)")
     p.add_argument("name", nargs="?", help="instance name (template or template-N)")
@@ -157,7 +166,8 @@ def build_parser(config) -> argparse.ArgumentParser:
         "-c",
         "--container",
         action="store_true",
-        help="operate on containers instead of MicroVMs (the default)",
+        default=None,
+        help="force the container path; when omitted, a named guest's kind is inferred from config.toml",
     )
     parser.add_argument("--config", metavar="PATH", help="path to config.toml (default: ~/.config/tartarus/config.toml)")
     parser.add_argument("--flake", metavar="PATH", help="override the user's flake root (from config.toml)")
@@ -187,6 +197,24 @@ def _overrides(args: argparse.Namespace) -> dict:
     }
 
 
+def resolve_kind(config: Config, args: argparse.Namespace) -> None:
+    """Fill ``args.container`` from the named guest's kind when ``--container`` is absent.
+
+    ``--container`` is tri-state: explicit ``True`` forces the container path,
+    ``None`` means "infer". A command that names a single guest (by ``name`` or,
+    for ``spawn``, ``template``) is routed to that guest's own kind, so e.g.
+    ``tartarus start inner`` needs no flag. Commands with no name (``status``,
+    nameless) keep the default MicroVM path unless ``--container`` is explicit.
+    ``list`` is handled before this (it spans both kinds), so it never reaches
+    here.
+    """
+    if args.container is not None:
+        return
+    name = getattr(args, "template", None) or getattr(args, "name", None)
+    guest = config.find_guest(name) if name else None
+    args.container = bool(guest is not None and guest.kind == "container")
+
+
 def guard_guest(config: Config, args: argparse.Namespace) -> None:
     """Refuse to act on a guest that isn't enabled on this host.
 
@@ -200,6 +228,23 @@ def guard_guest(config: Config, args: argparse.Namespace) -> None:
         config.require_guest(name, "container" if args.container else "vm")
 
 
+def _list_kind(args: argparse.Namespace) -> str | None:
+    """The kind filter for ``list``: ``"vm"``, ``"container"`` or ``None`` (both).
+
+    ``list`` accepts its own ``-c/--container`` (``list_container``) as well as
+    the global one (written before the subcommand, ``container``), so either
+    spelling narrows to containers.
+    """
+    only_container = bool(args.container) or getattr(args, "list_container", False)
+    if only_container and args.vm:
+        raise TartarusError("list: --vm and --container are mutually exclusive")
+    if only_container:
+        return "container"
+    if args.vm:
+        return "vm"
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     try:
         # Resolve without CLI flags first so --help can show the real paths.
@@ -207,6 +252,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         args = parser.parse_args(argv)
 
         config = load_config(_overrides(args))
+
+        # `list` spans both kinds, so it runs before the VM/container routing.
+        if args.command == "list":
+            flake.require_flake(config)
+            listing.action_list(
+                config, json_output=args.json, tree=args.tree, kind=_list_kind(args)
+            )
+            return
+
+        resolve_kind(config, args)
 
         if args.container and args.command in ("cid", "proxy", "ip", "proxy-ip"):
             raise TartarusError(

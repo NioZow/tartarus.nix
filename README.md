@@ -182,7 +182,8 @@ trust (`tartarus.ssh.*`), the generated CLI config
 ## CLI
 
 ```
-tartarus list                     # every guest and whether it is running
+tartarus list [-c|--container] [-t|--tree] [--vm] [--json]
+                                  # every enabled guest (MicroVMs + containers)
 tartarus status [name]            # detailed status
 tartarus start <name> [-u]        # reuse/build and launch in the background
 tartarus build <name> [-u]        # build without starting (reuses an existing build)
@@ -196,6 +197,23 @@ tartarus ip <name>                # host-reachable IP (Darwin: via ARP)
 tartarus proxy <name>             # ProxyCommand helper (VSOCK)
 tartarus proxy-ip <name>          # ProxyCommand helper (vmnet IP)
 ```
+
+`list` spans both guest kinds by default; `--vm` narrows it to MicroVMs and
+`-c`/`--container` (either after `list`, or globally before the subcommand) to
+containers. `-t`/`--tree` nests each nested container under its container-host
+VM instead of showing a flat table; `--json` mirrors the same shape (tree
+entries gain a `children` list). Every entry carries a `kind` field (`"vm"` or
+`"container"`) so scripts can tell the two apart:
+
+```bash
+# ssh-reachable running guests: MicroVMs as <name>.trs, containers by name
+tartarus list --json \
+  | jq -r '.[] | select(.status=="running")
+           | if .kind=="vm" then .name+".trs" else .name end'
+```
+
+For commands that name a single guest (`start`, `ssh`, `stop`, ...) the kind is
+inferred from `config.toml`, so no `--container` flag is needed.
 
 `start`, `restart`, `spawn` and `build` treat a guest's build as a cache: they
 reuse the existing `state/result` when it is valid, without re-evaluating or
