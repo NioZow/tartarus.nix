@@ -224,14 +224,17 @@ def instance_info(config: Config, name: str, kind: str, *, container_host: bool 
 def collect_instances(config: Config) -> list[dict]:
     # `list` must enumerate only guests enabled on this host: config.toml is the
     # authoritative enabled set (the flake's outputs are generated from it).
-    templates = [name for name in flake.list_templates(config, "vm") if config.guest(name, "vm") is not None]
-    # Resolve the container-host flag once per template (a numbered instance
-    # shares its base template's role) so the table/JSON can mark it.
-    container_hosts: set[str] = set()
-    for name in templates:
-        guest = config.guest(name, "vm")
-        if guest is not None and guest.container_host:
-            container_hosts.add(name)
+    # Derive it from config instead of running `nix eval` on the flake -- the
+    # flake call returns the same names only to have them filtered against
+    # config, and its evaluation dominated the cost of `list`.
+    vm_guests = sorted(
+        (guest for guest in config.enabled_guests if guest.kind == "vm"),
+        key=lambda guest: guest.name,
+    )
+    templates = [guest.name for guest in vm_guests]
+    # A numbered instance shares its base template's role, so the
+    # container-host flag is resolved once per template.
+    container_hosts = {guest.name for guest in vm_guests if guest.container_host}
 
     entries = [
         instance_info(config, name, "template", container_host=name in container_hosts) for name in templates

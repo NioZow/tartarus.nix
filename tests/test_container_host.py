@@ -633,6 +633,51 @@ def test_vm_list_container_host_marker_in_table(monkeypatch, tmp_path, capsys):
     assert "container host" in out
 
 
+# --- collect derives the enabled set from config, not a nix eval ----------
+
+
+def _no_eval(*_a, **_k):  # pragma: no cover - must never run
+    raise AssertionError("collect_instances must not run a nix eval")
+
+
+def test_vm_collect_does_not_eval_the_flake(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH)
+    monkeypatch.setattr(vm.flake, "list_templates", _no_eval)
+    monkeypatch.setattr(vm.ssh, "is_running", lambda *_a, **_k: False)
+
+    entries = vm.collect_instances(config)
+
+    assert [e["name"] for e in entries] == ["ch"]
+
+
+def test_ctn_collect_does_not_eval_the_flake(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, INNER, BOX)
+    monkeypatch.setattr(ctn.flake, "list_templates", _no_eval)
+    monkeypatch.setattr(ctn, "list_conf_names", lambda: set())
+    monkeypatch.setattr(ctn, "nested_states", lambda _c, _h, names: {n: "stopped" for n in names})
+
+    entries = ctn.collect_instances(config)
+
+    assert [e["name"] for e in entries] == ["box", "inner"]
+
+
+def test_ctn_collect_skips_ssh_when_host_vm_is_down(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, INNER)
+    monkeypatch.setattr(ctn, "list_conf_names", lambda: set())
+    monkeypatch.setattr(ctn.ssh, "is_running", lambda *_a, **_k: False)
+
+    def fail(*_a, **_k):  # pragma: no cover - must never run
+        raise AssertionError("must not SSH to a stopped host VM")
+
+    monkeypatch.setattr(ctn, "nested_states", fail)
+
+    entries = ctn.collect_instances(config)
+
+    assert entries == [
+        {"name": "inner", "type": "template", "status": "stopped", "address": None, "host": "ch"}
+    ]
+
+
 # --- CLI guard: nested containers validate as kind = "container" ----------
 
 

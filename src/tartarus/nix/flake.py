@@ -59,12 +59,27 @@ def _prefix(kind: str) -> str:
     return VM_PREFIX if kind == "vm" else CTN_PREFIX
 
 
+# In-process cache of flake template names. A single CLI invocation resolves
+# `base_name` + `require_template` together for every guest it touches, and each
+# resolution otherwise re-runs `nix eval`; within one process the flake cannot
+# change, so the first result is reused for the rest of the command.
+_TEMPLATE_CACHE: dict[tuple[str, str, str], list[str]] = {}
+
+
 def list_templates(config: Config, kind: str) -> list[str]:
-    """Every guest name of ``kind`` exposed by the user's flake."""
-    prefix = _prefix(kind)
-    root = _attr_root(config, kind)
-    names = nix_eval.attr_names(flake_ref(config), root)
-    return sorted(name[len(prefix) :] for name in names if name.startswith(prefix))
+    """Every guest name of ``kind`` exposed by the user's flake.
+
+    Memoized per (flake path, system, kind) for the life of the process.
+    """
+    key = (str(config.flake_path), config.system, kind)
+    cached = _TEMPLATE_CACHE.get(key)
+    if cached is None:
+        prefix = _prefix(kind)
+        root = _attr_root(config, kind)
+        names = nix_eval.attr_names(flake_ref(config), root)
+        cached = sorted(name[len(prefix) :] for name in names if name.startswith(prefix))
+        _TEMPLATE_CACHE[key] = cached
+    return list(cached)
 
 
 def require_template(config: Config, kind: str, name: str) -> None:

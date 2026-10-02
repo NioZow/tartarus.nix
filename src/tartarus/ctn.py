@@ -230,41 +230,47 @@ def instance_info(
     }
 
 
-def _host_of_by_template(config: Config, templates: list[str]) -> dict[str, str | None]:
-    """Map each container template to its `host` pointer (`None` if native).
-
-    Resolved once per template so `list`/`status` never re-run a nix eval for
-    every table row just to read a name already present in config.toml.
-    """
-    host_of: dict[str, str | None] = {}
-    for name in templates:
-        guest = config.guest(name, "container")
-        host_of[name] = guest.host if guest is not None else None
-    return host_of
-
-
 def collect_instances(config: Config) -> list[dict]:
-    templates = list_templates(config)
-    host_of = _host_of_by_template(config, templates)
+    # `list` derives the enabled set from config.toml (the authoritative
+    # source; the flake's outputs are generated from it) so it needs no
+    # `nix eval`. The flake enumeration returned the same names only to have
+    # them filtered against config, and its evaluation dominated `list`'s
+    # runtime.
+    ctn_guests = sorted(
+        (guest for guest in config.enabled_guests if guest.kind == "container"),
+        key=lambda guest: guest.name,
+    )
+    templates = [guest.name for guest in ctn_guests]
+    host_of = {guest.name: guest.host for guest in ctn_guests}
 
     # Batch the nested-container unit states: one SSH round-trip per host VM
     # rather than one per container.
     names_by_host: dict[str, list[str]] = {}
-    for name in templates:
-        host = host_of[name]
+    for name, host in host_of.items():
         if host is not None:
             names_by_host.setdefault(host, []).append(name)
     states: dict[str, str] = {}
     for host, names in names_by_host.items():
-        states.update(nested_states(config, host, names))
+        # A nested container cannot be running while its host VM is down, so
+        # skip the (potentially slow) SSH probe entirely when it is not running
+        # -- and pre-seed "stopped" so `instance_info` does not re-probe either.
+        if ssh.is_running(config, host):
+            states.update(nested_states(config, host, names))
+        else:
+            states.update({name: "stopped" for name in names})
 
     entries = [instance_info(config, name, "template", host_of[name], states) for name in templates]
 
-    extra = sorted(
-        name for name in list_conf_names() if base_name(config, name) != name and base_name(config, name) in templates
-    )
+    # Registered numbered instances (`box-2`) whose base template is enabled.
+    # Match locally instead of via `base_name`, which would re-run the flake
+    # eval once per registered container.
+    extra = [
+        (name, match.group(1))
+        for name in sorted(list_conf_names())
+        if (match := flake.INSTANCE_RE.match(name)) and match.group(1) in templates
+    ]
     entries += [
-        instance_info(config, name, "instance", host_of.get(base_name(config, name)), states) for name in extra
+        instance_info(config, name, "instance", host_of.get(base), states) for name, base in extra
     ]
 
     return entries
