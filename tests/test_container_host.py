@@ -320,15 +320,20 @@ def test_nested_start_noop_when_already_running(monkeypatch, tmp_path):
     assert ctl == []
 
 
-def test_nested_start_skips_host_vm_when_already_running(monkeypatch, tmp_path):
+def test_nested_start_ensures_own_certs_when_host_vm_already_running(monkeypatch, tmp_path):
+    # The host VM start already certifies every inner container; when it is up
+    # it is skipped, so a container added after boot would otherwise never get
+    # its client cert. The nested start must ensure its own material.
     config = make_config_in(tmp_path, CH, INNER)
     started, ctl = _patch_nested_start(monkeypatch)
     monkeypatch.setattr(ctn.ssh, "is_running", lambda _c, _n: True)
-    monkeypatch.setattr(ctn.ca, "ensure_ctn_certs", lambda *_a, **_k: pytest.fail("cert work while VM up"))
+    ensured: list[str] = []
+    monkeypatch.setattr(ctn.ca, "ensure_ctn_certs", lambda _c, name: ensured.append(name))
 
     ctn.action_start(config, "inner")
 
     assert started == []
+    assert ensured == ["inner"]
     assert ctl == [("ch", "start", "inner")]
 
 

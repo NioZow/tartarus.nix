@@ -348,6 +348,11 @@ def _ensure_x509_client_cert(config: Config, kind: str, name: str) -> None:
         info(f"Generating client key for {name} ({kind})...")
         _run(["openssl", "genrsa", "-out", str(client_key), X509_LEAF_RSA_BITS])
 
+    # Sign whenever the certificate is missing, not only when the key is: a
+    # previous run may have generated the key but failed before signing, and
+    # the clients require `client.crt`. Gating only on the key left such a
+    # half-provisioned machine dir forever.
+    if not client_crt.exists():
         csr = guest_dir / "client.csr"
         _run(
             [

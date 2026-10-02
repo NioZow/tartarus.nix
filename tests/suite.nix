@@ -1642,8 +1642,15 @@ in {
       (chVm.config.containers.inner.bindMounts ? "/etc/tartarus/ssh"
         && chVm.config.containers.inner.bindMounts ? "/etc/tartarus/x509"
         && chVm.config.containers.inner.bindMounts."/etc/tartarus/ssh".isReadOnly
-        && chVm.config.containers.inner.bindMounts."/etc/tartarus/x509".isReadOnly)
-      "containers.inner key bind mounts are missing or writable";
+        && chVm.config.containers.inner.bindMounts."/etc/tartarus/x509".isReadOnly
+        # The SSH host key is staged root-owned; the X509 client material binds
+        # the live cert share directly (guest-user owned), so the ssh-agent /
+        # sudo-auth clients can read `client.key`.
+        && chVm.config.containers.inner.bindMounts."/etc/tartarus/ssh".hostPath
+        == "/run/tartarus-inner/inner/ssh"
+        && chVm.config.containers.inner.bindMounts."/etc/tartarus/x509".hostPath
+        == "/var/lib/tartarus-inner/certs/x509/inner")
+      "containers.inner key bind mounts are missing or wrong";
 
     # Feature parity: a nested container's services, relays and shares are wired
     # into the container-host VM (the VM DNATs services/relays out to the host /

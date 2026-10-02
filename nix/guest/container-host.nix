@@ -162,25 +162,30 @@
 
   # nspawn preserves the ownership of a bind-mounted source, and the share
   # arrives owned by the host user (uid 501 / the invoking user) -- sshd
-  # refuses a host key it does not own. Copy the material under /run as
+  # refuses a host key it does not own. Copy the SSH host key under /run as
   # root:root before the containers start and bind-mount that copy instead.
+  #
+  # The X509 client material is *not* staged: it must stay owned by the guest
+  # user (the ssh-agent-proxy/sudo-auth-proxy clients run as that user and read
+  # `client.key` at 0600), which is exactly the share's ownership, so the
+  # container binds the live share subdirectory directly (below). That also
+  # means a cert provisioned after the VM booted becomes visible without a
+  # re-stage.
   stageDir = name: "/run/tartarus-inner/${name}";
 
   stageScript = pkgs.writeShellScript "tartarus-inner-key-stage" ''
     set -eu
     ${concatMapStringsSep "\n" (inner: ''
-        src_ssh=${certsSsh inner.name}
-        src_x509=${certsX509 inner.name}
+        src=${certsSsh inner.name}
         dst=${stageDir inner.name}
         for _ in $(seq 1 120); do
-          [ -e "$src_ssh/ssh_host_ed25519_key" ] && break
+          [ -e "$src/ssh_host_ed25519_key" ] && break
           sleep 1
         done
-        install -d -m 0755 "$dst/ssh" "$dst/x509"
-        cp -f "$src_ssh/ssh_host_ed25519_key" "$dst/ssh/ssh_host_ed25519_key"
-        cp -f "$src_ssh/ssh_host_ed25519_key.pub" "$dst/ssh/ssh_host_ed25519_key.pub" || true
-        cp -f "$src_ssh/ssh_host_ed25519_key-cert.pub" "$dst/ssh/ssh_host_ed25519_key-cert.pub" || true
-        cp -f "$src_x509/." "$dst/x509/" 2>/dev/null || true
+        install -d -m 0755 "$dst/ssh"
+        cp -f "$src/ssh_host_ed25519_key" "$dst/ssh/ssh_host_ed25519_key"
+        cp -f "$src/ssh_host_ed25519_key.pub" "$dst/ssh/ssh_host_ed25519_key.pub" || true
+        cp -f "$src/ssh_host_ed25519_key-cert.pub" "$dst/ssh/ssh_host_ed25519_key-cert.pub" || true
         chmod 0600 "$dst/ssh/ssh_host_ed25519_key"
         chmod 0644 "$dst/ssh/"*.pub 2>/dev/null || true
       '')
@@ -316,11 +321,13 @@ in {
           config = {imports = inner.modules ++ [(homeTmpfilesModule inner)];};
           specialArgs = inner.specialArgs;
 
-          # The host's CA-signed host key and mTLS client cert reach the VM via
-          # shares.nix; the stage service copies them root-owned under /run and
-          # these read-only binds expose that copy. `/run/tartarus` covers the
-          # host-key path a MicroVM uses, `/etc/tartarus/*` the container path
-          # base.nix reads in place.
+          # The host's CA-signed host key and mTLS client material reach the VM
+          # via shares.nix. The host key is staged root-owned under /run (sshd
+          # refuses a key it does not own) and bound from there; `/run/tartarus`
+          # covers the host-key path a MicroVM uses. The X509 client material is
+          # bound straight from the share (owned by the guest user, as the
+          # clients need), so it needs no staging and self-heals if the host
+          # provisions it after the VM booted.
           bindMounts =
             {
               "/etc/tartarus/ssh" = {
@@ -328,7 +335,7 @@ in {
                 isReadOnly = true;
               };
               "/etc/tartarus/x509" = {
-                hostPath = "${stageDir inner.name}/x509";
+                hostPath = certsX509 inner.name;
                 isReadOnly = true;
               };
               "/run/tartarus" = {
@@ -377,16 +384,17 @@ in {
     optionals (builtins.pathExists rootPubKeyFile) [(builtins.readFile rootPubKeyFile)];
   services.openssh.settings.PermitRootLogin = lib.mkForce "prohibit-password";
 
-  # Root-owned staging of each inner container's key material, ordered before
-  # the container so the read-only binds above have a root-owned source when
-  # nspawn mounts them.
+  # Root-owned staging of each inner container's SSH host key, ordered before
+  # the container so the read-only bind above has a root-owned source when
+  # nspawn mounts it. No `RemainAfterExit`: the (cheap) copy re-runs on every
+  # container start, so a host key rotated after the VM booted is picked up
+  # without a VM restart.
   systemd.services.tartarus-inner-key-stage = lib.mkIf (innerContainers != []) {
-    description = "Stage nested-container CA key material root-owned";
+    description = "Stage nested-container SSH host key root-owned";
     wantedBy = map (inner: "container@${inner.name}.service") innerContainers;
     before = map (inner: "container@${inner.name}.service") innerContainers;
     serviceConfig = {
       Type = "oneshot";
-      RemainAfterExit = true;
       ExecStart = stageScript;
     };
   };

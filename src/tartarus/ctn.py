@@ -359,15 +359,18 @@ def action_start(config: Config, name: str, upgrade: bool = False) -> None:
         # up (starting it also provisions the inner certs) and then start the
         # container's `container@<name>` unit over SSH.
         #
-        # When the host VM is already up there is nothing to build or certify:
-        # skip the cert pass (which otherwise touches every inner) and go
-        # straight to the unit.
+        # When the host VM is not up, starting it provisions every inner
+        # container's certs (see `vm._ensure_build_certs`). When it is already
+        # up, still ensure this container's material: a container added after
+        # the VM booted has no client cert otherwise, so its ssh-agent /
+        # sudo-auth-proxy bridge would fail closed.
         if not ssh.is_running(config, guest.host):
             from . import vm  # lazy to avoid a circular import
 
-            ca.ensure_ctn_certs(config, base)
             info(f"'{name}' runs inside container-host VM '{guest.host}'; ensuring the VM is up...")
             vm.action_start(config, guest.host, mounts=[], upgrade=upgrade)
+        else:
+            ca.ensure_ctn_certs(config, base)
         if nested_state(config, guest.host, name) == "running":
             warn(f"'{name}' is already running.")
             return
