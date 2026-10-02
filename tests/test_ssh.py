@@ -1,9 +1,10 @@
-"""Tests for host-reachable guest IP resolution (Darwin MicroVMs).
+"""Tests for host-reachable guest IP resolution.
 
-``vmnet``'s DHCP server is not usable (and guests are configured with a
-deterministic static address anyway), so ``resolve_running_ip`` probes the
-known address to prime the host ARP cache, prefers whatever the table then
-reports, and falls back to the deterministic address instead of failing.
+Darwin guests are statically addressed (DHCP is broken under vfkit), so
+``resolve_running_ip`` returns the deterministic address directly without
+touching the ARP table. On Linux it prefers whatever the host ARP table
+reports (probing the known address to prime it) and falls back to the
+deterministic address instead of failing.
 
 Run from the repository root::
 
@@ -67,10 +68,11 @@ def test_arp_miss_returns_none():
 # --- resolve_running_ip ---------------------------------------------------
 
 
-def test_waits_until_the_arp_entry_appears(monkeypatch, capsys, tmp_path):
+def test_linux_waits_until_the_arp_entry_appears(monkeypatch, capsys, tmp_path):
     config = make_config(tmp_path)
     _running_state(config)
     monkeypatch.setattr(ssh, "is_running", lambda *_a, **_k: True)
+    monkeypatch.setattr(ssh.system, "is_darwin", lambda: False)
     monkeypatch.setattr(ssh, "_ping_once", lambda _ip: None)
     monkeypatch.setattr(ssh.time, "sleep", lambda _seconds: None)
 
@@ -86,19 +88,37 @@ def test_waits_until_the_arp_entry_appears(monkeypatch, capsys, tmp_path):
     assert captured.out == ""
 
 
-def test_falls_back_to_the_deterministic_static_ip(monkeypatch, capsys, tmp_path):
+def test_linux_falls_back_to_the_deterministic_static_ip(monkeypatch, capsys, tmp_path):
     config = make_config(tmp_path)
     _running_state(config, name="network", guest_id=9)
     monkeypatch.setattr(ssh, "is_running", lambda *_a, **_k: True)
+    monkeypatch.setattr(ssh.system, "is_darwin", lambda: False)
     monkeypatch.setattr(ssh, "_ping_once", lambda _ip: None)
     monkeypatch.setattr(ssh, "_arp_table", lambda: ARP_OTHER)
-    # Force the Darwin static-address formula regardless of the test host.
-    monkeypatch.setattr(ssh.system, "is_darwin", lambda: True)
     monkeypatch.setattr(ssh.time, "sleep", lambda _seconds: None)
     ticks = iter([0.0, 1000.0])
     monkeypatch.setattr(ssh.time, "monotonic", lambda: next(ticks))
 
+    assert ssh.resolve_running_ip(config, "network") == "10.200.0.9"
+
+
+def test_darwin_returns_the_static_ip_without_probing(monkeypatch, capsys, tmp_path):
+    config = make_config(tmp_path)
+    _running_state(config, name="network", guest_id=9)
+    monkeypatch.setattr(ssh, "is_running", lambda *_a, **_k: True)
+    monkeypatch.setattr(ssh.system, "is_darwin", lambda: True)
+
+    def boom(*_a, **_k):  # pragma: no cover - must never run
+        raise AssertionError("the ARP probe must not run on Darwin")
+
+    monkeypatch.setattr(ssh, "_arp_table", boom)
+    monkeypatch.setattr(ssh, "_ping_once", boom)
+
     assert ssh.resolve_running_ip(config, "network") == "192.168.64.51"
+
+    captured = capsys.readouterr()
+    assert "probing" not in captured.err
+    assert captured.out == ""
 
 
 def test_does_not_wait_when_the_guest_is_stopped(monkeypatch, capsys, tmp_path):

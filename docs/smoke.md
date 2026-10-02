@@ -140,8 +140,8 @@ For a guest with `firewall.enable = true` and `firewall.location = "guest"`:
 ### NAT + TCP
 
 - [ ] `tartarus start vault` builds (via `nix.linux-builder`) and boots.
-- [ ] `tartarus ip vault` resolves the vmnet address (ARP lookup by MAC
-      `02:00:00:00:00:<hex id>`) and prints `192.168.64.<id + 42>`.
+- [ ] `tartarus ip vault` prints the deterministic static address
+      `192.168.64.<id + 42>` instantly (no ARP probe).
 - [ ] `tartarus ssh vault` connects over TCP using `tartarus proxy-ip %h`
       (`ssh -v` shows the `nc <ip> 22` path), and the CA host key validates.
 - [ ] Inside the guest: `ip -brief addr` shows `192.168.64.<id + 42>/24`; the

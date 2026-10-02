@@ -193,7 +193,7 @@ tartarus restart <name> [-u]      # stop, then start
 tartarus logs <name>              # console log / journal
 tartarus ssh <name> [-s|--start]  # start it first if it isn't running
 tartarus cid <name>               # MicroVM VSOCK CID
-tartarus ip <name>                # host-reachable IP (Darwin: via ARP)
+tartarus ip <name>                # host-reachable IP (deterministic static)
 tartarus proxy <name>             # ProxyCommand helper (VSOCK)
 tartarus proxy-ip <name>          # ProxyCommand helper (vmnet IP)
 ```
@@ -319,10 +319,9 @@ macOS. The guest halves are wired automatically when a guest sets the matching
   the gateway as the client and the per-guest ACLs collapse into one relay
   client with a unioned allowlist.
 - Guests get deterministic static addresses (`192.168.64.<id + 42>`); DHCP is
-  broken under vfkit.
-- All host/guest services use TCP. `tartarus proxy-ip` resolves the guest from
-  the host ARP table via its deterministic MAC (falling back to the
-  deterministic address), since guests send no gratuitous ARP.
+  broken under vfkit. The address is on the host's vmnet L2 segment, so
+  `tartarus proxy-ip` uses it directly -- no ARP lookup, no probe.
+- All host/guest services use TCP.
 - A guest can opt into an in-guest nftables firewall (a practical policy, not a
   hard boundary).
 - **Read-only shares are enforced host-side.** vfkit ignores a share's

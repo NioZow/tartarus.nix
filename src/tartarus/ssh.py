@@ -3,7 +3,8 @@
 Covers three things the original script kept together:
 
 * the shared ``~/.ssh/tartarus`` client key and ``known_hosts_trs`` CA trust;
-* locating a running VM (recorded VSOCK CID, deterministic MAC -> ARP IP);
+* locating a running VM (recorded VSOCK CID; Darwin: deterministic static IP,
+  Linux: deterministic MAC -> ARP IP);
 * the ``proxy`` / ``proxy-ip`` / ``ip`` actions consumed by nixcfg's
   ``modules/programs/user/ssh.nix`` as ``ProxyCommand`` targets.
 """
@@ -29,9 +30,11 @@ KNOWN_HOSTS_TRS_NAME = "known_hosts_trs"
 USER_SSH_KEY_NAME = "tartarus"
 CONTAINER_SSH_KEY_NAME = "containers"
 
-# A freshly started MicroVM needs a moment to bring up its interface and get a
-# DHCP lease; until then the host ARP table has no entry for its MAC. Poll
-# instead of failing the first `ssh` that races the guest's boot.
+# Linux only: a freshly started MicroVM needs a moment to bring up its
+# interface; until then the host ARP table has no entry for its MAC. Poll
+# instead of failing the first `ssh` that races the guest's boot. Darwin never
+# probes -- it uses the deterministic static address directly (see
+# resolve_running_ip).
 ARP_WAIT_SECONDS = 20.0
 ARP_POLL_INTERVAL = 0.5
 
@@ -221,12 +224,13 @@ def _ping_once(ip: str) -> None:
 def resolve_running_ip(config: Config, name: str) -> str:
     """Resolve the host-reachable IP of a running MicroVM.
 
-    Guests are configured with a deterministic static address and send no
-    gratuitous ARP, so the host's ARP cache stays empty until we address them.
-    Probe the known address to populate it, prefer whatever the table then
-    reports (covers a shifted subnet), and otherwise trust the deterministic
-    address -- never fail with "no ARP entry": the caller (ssh/nc) surfaces a
-    real connection error if the address is wrong.
+    Guests are configured with a deterministic static address. On Darwin the
+    address lives on the host's vmnet L2 segment, so it is authoritative and
+    needs no lookup: ``nc`` resolves ARP itself when it connects. On Linux the
+    address is on the ``trs0`` bridge; there we prefer whatever the host ARP
+    table reports (covers a shifted subnet) and otherwise fall back to the
+    deterministic address -- never failing with "no ARP entry": the caller
+    (ssh/nc) surfaces a real connection error if the address is wrong.
     """
     if name.endswith(".trs"):
         name = name[: -len(".trs")]
@@ -247,8 +251,15 @@ def resolve_running_ip(config: Config, name: str) -> str:
         flake.require_template(config, "vm", base)
         guest_id = flake.guest_id(config, "vm", base)
 
-    mac = system.guest_mac(guest_id)
     expected = system.guest_ip(guest_id)
+
+    # Darwin: the deterministic static address is authoritative. Probing the
+    # host ARP table here only stalled every `ssh` for up to ARP_WAIT_SECONDS
+    # (and raced the guest's boot), so return it directly.
+    if system.is_darwin():
+        return expected
+
+    mac = system.guest_mac(guest_id)
 
     ip = arp_ip_for_mac(_arp_table(), mac)
     if ip is not None:
