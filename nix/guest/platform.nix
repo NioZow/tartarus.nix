@@ -84,6 +84,20 @@ in {
       then ids.darwinGateway
       else hostIP;
 
+    # The address that reaches the *physical host* from this guest -- where
+    # host-side services (the proxy, host relays such as `litellm-proxy`) live.
+    # For a VM (or a native Linux container) that is simply its own gateway. A
+    # nested container's own gateway is the container-host VM's inner bridge,
+    # which only NATs outward, so the host is reached at *that VM's* gateway
+    # instead. The host VM is always a VM, so its gateway is the platform
+    # default for `kind = "vm"` on the eval host.
+    hostGateway =
+      if !inHostVm
+      then gateway
+      else if lib.hasSuffix "-darwin" hostSystem
+      then ids.darwinGateway
+      else ids.vmHostIP;
+
     # Guest -> host service address when falling back to TCP: VSOCK CID 2 when
     # VSOCK is in use, the vmnet gateway on Darwin (loopback is unreachable from
     # a vmnet-shared guest), otherwise the bridge's host IP. For an inner
@@ -143,6 +157,7 @@ in {
       subnet
       guestIP
       gateway
+      hostGateway
       serviceHost
       hostProxyIP
       proxyBind

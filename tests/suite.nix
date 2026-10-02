@@ -1432,6 +1432,7 @@ in {
         && p.useVsock
         && p.guestIP == "10.200.0.3"
         && p.gateway == "10.200.0.1"
+        && p.hostGateway == "10.200.0.1"
         && p.serviceHost == "2"
         && p.hypervisor == "qemu")
       "Linux VM platform resolution changed";
@@ -1449,6 +1450,7 @@ in {
         && !p.useVsock
         && p.guestIP == "192.168.64.45"
         && p.gateway == "192.168.64.1"
+        && p.hostGateway == "192.168.64.1"
         && p.serviceHost == "_gateway"
         && p.hypervisor == "vfkit"
         && p.shareProto == "virtiofs"
@@ -1463,7 +1465,12 @@ in {
           id = 4;
         };
       in
-        !p.vsockAvailable && !p.useVsock && p.guestIP == "10.201.0.4" && p.hypervisor == "qemu")
+        !p.vsockAvailable
+        && !p.useVsock
+        && p.guestIP == "10.201.0.4"
+        && p.gateway == "10.201.0.1"
+        && p.hostGateway == "10.201.0.1"
+        && p.hypervisor == "qemu")
       "containers must never select VSOCK";
 
     # ---- nix/lib/shares.nix: macOS read-only snapshot policy ------------
@@ -1583,6 +1590,7 @@ in {
         pl.guestIP
         == "10.202.0.6"
         && pl.gateway == "10.202.0.1"
+        && pl.hostGateway == "192.168.64.1"
         && pl.hostIP == "10.202.0.1"
         && pl.subnet == "10.202.0.0/24"
         && !pl.isDarwin
@@ -1598,6 +1606,20 @@ in {
         && ids.innerHostIP == "10.202.0.1"
         && ids.mkInnerIP 6 == "10.202.0.6")
       "ids.nix inner constants changed";
+    # A nested container on a Linux host reaches the physical host at the host
+    # VM's trunk gateway (its own gateway is the inner bridge).
+    "platform/inner-container-linux-host-gateway" =
+      T
+      (let
+        pl = platform.mk {
+          hostSystem = "x86_64-linux";
+          kind = "container";
+          id = 6;
+          inHostVm = true;
+        };
+      in
+        pl.gateway == "10.202.0.1" && pl.hostGateway == "10.200.0.1")
+      "inner-container host gateway on Linux changed";
 
     "container-host/configurations" =
       T
