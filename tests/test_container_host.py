@@ -525,16 +525,29 @@ def test_nested_ssh_builds_proxyjump_argv(monkeypatch, tmp_path):
     assert argv[-1] == "inner"
 
 
-def test_nested_ssh_start_starts_host_vm(monkeypatch, tmp_path):
+def test_nested_ssh_start_starts_container(monkeypatch, tmp_path):
     config = _nested_ssh_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(ctn, "nested_state", lambda *_a, **_k: "stopped")
     started: list[str] = []
-    monkeypatch.setattr(vm, "action_start", lambda _c, name, mounts, upgrade=False: started.append(name))
+    monkeypatch.setattr(ctn, "action_start", lambda _c, name, upgrade=False: started.append(name))
     monkeypatch.setattr(ctn.os, "execvp", lambda *_a: (_ for _ in ()).throw(_Exec))
 
     with pytest.raises(_Exec):
         ctn.action_ssh(config, "inner", start=True)
 
-    assert started == ["ch"]
+    # Starting only the host VM left the container itself stopped; `--start`
+    # must start the nested container (which brings the VM up if needed).
+    assert started == ["inner"]
+
+
+def test_nested_ssh_start_skips_when_container_running(monkeypatch, tmp_path):
+    config = _nested_ssh_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(ctn, "nested_state", lambda *_a, **_k: "running")
+    monkeypatch.setattr(ctn, "action_start", lambda *_a, **_k: pytest.fail("start ran for a running container"))
+    monkeypatch.setattr(ctn.os, "execvp", lambda *_a: (_ for _ in ()).throw(_Exec))
+
+    with pytest.raises(_Exec):
+        ctn.action_ssh(config, "inner", start=True)
 
 
 def test_nested_ssh_without_start_refuses_stopped_host(monkeypatch, tmp_path, capsys):

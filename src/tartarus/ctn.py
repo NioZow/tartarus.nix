@@ -537,10 +537,13 @@ def _ssh_nested(config: Config, base: str, host: str, start: bool) -> NoReturn:
       principal;
     * the client key and ControlMaster plumbing mirror a native container.
     """
-    from . import vm  # lazy to avoid a circular import
-
     if start:
-        vm.action_start(config, host, mounts=[])
+        # Start the nested container itself -- `action_start` brings up the
+        # container-host VM first when it is down, then starts the container's
+        # own unit inside it. Starting only the VM (as this used to) left the
+        # container stopped, so the ProxyJump connected to a dead address.
+        if not ssh.is_running(config, host) or nested_state(config, host, base) != "running":
+            action_start(config, base)
     elif not ssh.is_running(config, host):
         raise TartarusError(
             f"container-host VM '{host}' is not running; start it first: "
