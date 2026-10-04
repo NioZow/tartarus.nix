@@ -56,6 +56,16 @@ in {
           image = "nix-store-overlay.img";
           mountPoint = "/nix/.rw-store";
           size = nixStoreOverlay.size;
+          # A Nix store is overwhelmingly small files and directories, but ext4
+          # defaults to one inode per 16 KiB, so the writable upper only gets 64
+          # inodes per MiB (e.g. exactly 131072 for the 2048 MiB default). A
+          # store accumulated across a container host's nested guests exhausts
+          # those inodes long before it runs out of bytes, after which every
+          # store write fails with ENOSPC and Nix reports "No space left on
+          # device". Densify the inode table (one inode per 4 KiB) so bytes, not
+          # inodes, are the binding limit. Applied at mkfs time, so it only
+          # takes effect on a freshly created overlay image.
+          mkfsExtraArgs = ["-i" "4096"];
         }
       ];
     };
