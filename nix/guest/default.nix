@@ -32,18 +32,11 @@
   user = g.user.name;
 
   # Per-guest sudo-auth-proxy transport marker (audit A1). `unix` selects the
-  # host→guest SSH-forwarded Unix socket instead of the callback transports; it
-  # is served with `transport_encryption = "none"` and `client_auth = "x509"`,
-  # not mTLS (the SSH tunnel already protects the channel).
+  # host→guest SSH-forwarded Unix socket instead of the callback transports.
+  # Since mTLS is the only authentication mechanism left (doc §7), the `unix`
+  # path runs mTLS *inside* the SSH tunnel: same tartarus CA and the same
+  # client certificate the other guest services already present.
   sapUnix = (services.sudoAuthProxyTransport or "vsock") == "unix";
-
-  # `server_auth = "signature"` trust root for the `unix` client. The host
-  # server signs with its tartarus SSH identity (`~/.ssh/tartarus`, see
-  # `nix/host/services.nix`); the guest already reads that public key impurely
-  # for `authorized_keys` (see `base.nix`). An empty list fails closed.
-  hostSshPub = "${g.hostHome}/.ssh/tartarus.pub";
-  sapTrustedServerKeys =
-    optional (builtins.pathExists hostSshPub) (builtins.readFile hostSshPub);
 
   sudoAuthProxy = import ../packages/sudo-auth-proxy.nix {inherit inputs;};
   sshAgentProxyPkg = import ../packages/ssh-agent-proxy.nix {inherit inputs;};
@@ -106,32 +99,28 @@ in {
         # decision is bounded by decisionTimeout (audit A2).
         recvTimeout = 0.5;
         decisionTimeout = 120;
-        # `unix`: SSH already protects the channel, the guest presents its
-        # tartarus X.509 client certificate (x509), and the host signs its
-        # response (signature) with the key the guest trusts from
-        # `trustedServerKeys`. Do NOT force mTLS here.
+        # `unix`: the SSH tunnel protects the channel, and mTLS authenticates
+        # both ends inside it (the only mechanism left, doc §7) with the
+        # tartarus client certificate. The server presents its tartarus server
+        # certificate and authorizes the guest's SPKI against the CA.
         #
         # Callback transports (vsock/tcp): the tartarus-internal channel is
         # private by construction, so use it unencrypted and unauthenticated --
-        # stated explicitly on all three knobs. The Python warns about `none`,
-        # and fail-closed only accepts `client_auth = "none"` when the host's
-        # server pairs it with `acl.mode = "none"`. No mTLS, no message
-        # signatures, no X.509 material.
-        security =
-          if sapUnix
-          then {
-            transportEncryption = "none";
-            serverAuth = "signature";
-            clientAuth = "x509";
-            clientCert = "${x509}/client.crt";
-            clientKey = "${x509}/client.key";
-            trustedServerKeys = sapTrustedServerKeys;
-          }
-          else {
-            transportEncryption = "none";
-            serverAuth = "none";
-            clientAuth = "none";
-          };
+        # stated explicitly on all three knobs (the module asserts it). The
+        # Python warns about `none`, and fail-closed only accepts
+        # `client_auth = "none"` when the host's server pairs it with
+        # `acl.mode = "none"`.
+        security = {
+          transportEncryption = if sapUnix then "mtls" else "none";
+          serverAuth = if sapUnix then "transport" else "none";
+          clientAuth = if sapUnix then "transport" else "none";
+        };
+        # mTLS material for the `unix` path only; under `none` the block is not
+        # emitted at all (`transport_encryption != "mtls"`), so the guest
+        # carries the tartarus client certificate only where it is used.
+        mtls =
+          clientMtls "1.3.6.1.4.1.99999.1.2" "1.3.6.1.4.1.99999.1.1"
+          // {enable = sapUnix;};
       };
     })
 

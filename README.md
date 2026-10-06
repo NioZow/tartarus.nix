@@ -277,11 +277,38 @@ as `nixosModules."sudo-auth-proxy"`, kept as an alias for compatibility.
   nixosConfigurations.client = nixpkgs.lib.nixosSystem {
     modules = [
       inputs.tartarus.nixosModules."sudo-auth-proxy-pam"
-      {tartarus.sudo-auth-proxy = {enable = true; host = "10.200.0.1"; port = 65001;};}
+      {tartarus.sudo-auth-proxy = {
+        enable = true;
+        # mTLS is the only authentication mechanism (doc §7); the channel must
+        # be authenticated on both ends, so a real deployment points these at
+        # the tartarus CA and this guest's client certificate.
+        host = "10.200.0.1";
+        port = 65001;
+        security = {
+          transportEncryption = "mtls";
+          clientAuth = "transport";
+          serverAuth = "transport";
+        };
+        mtls = {
+          enable = true;
+          caFile = "/etc/tartarus/x509/ca.crt";
+          certFile = "/etc/tartarus/x509/client.crt";
+          keyFile = "/etc/tartarus/x509/client.key";
+        };
+      };}
     ];
   };
 }
 ```
+
+> **mTLS only.** `ssh`, `x509` and `signature` authentication were removed: the
+> three security knobs are now each `"transport"` or `"none"`, and a config that
+> sets `transportEncryption = "none"` must write `clientAuth = "none"` and
+> `serverAuth = "none"` explicitly. See `docs/sudo-auth-proxy.md` §7 and §14.
+
+For a host that has no Nix at all, `examples/` carries a ready-to-edit server
+config plus a systemd user unit (`examples/sudo-auth-proxy-server.toml`,
+`examples/sudo-auth-proxy.service`); see `docs/sudo-auth-proxy.md` §15.1.
 
 Packages are also directly buildable: `nix build .#sudo-auth-proxy`,
 `.#ssh-agent-proxy`, `.#clipboard-bridge`. All units are created through

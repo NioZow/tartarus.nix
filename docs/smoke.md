@@ -224,6 +224,19 @@ here needs the tartarus host module or a guest.
       `nixosModules."sudo-auth-proxy"`; `homeManagerModules."sudo-auth-proxy"`
       for the server). Confirm `sudo` uses the proxy and that a mismatched
       client OID is rejected.
+- [ ] `sudo-auth-proxy`, mTLS-only: a config that sets
+      `transportEncryption = "none"` without `clientAuth = "none"` and
+      `serverAuth = "none"` fails evaluation with the
+      "refusing to disable authentication implicitly" assertion, and
+      `transportEncryption = "mtls"` with `clientAuth = "x509"`/`"ssh"` no longer
+      evaluates at all (the option values were removed).
+- [ ] `sudo-auth-proxy`, prompt: run `sudo true` and check the dialog shows the
+      **two-line summary** only, with the field block behind the backend's
+      Details affordance (swiftDialog info button / osascript third button /
+      zenity extra button — the last one only when `zenity --help-all` lists
+      `--extra-button`), that pressing it shows the block (identity, TTY, CWD,
+      request id) and asks again, that **Details** alone never allows, and that
+      `debug = true` logs the full block (doc §11.4).
 - [ ] `ssh-agent-proxy`: `nixosModules."ssh-agent-proxy"` (host server) and
       `homeManagerModules."ssh-agent-proxy"` (server/bridge/agent/merge);
       confirm the guest's `SSH_AUTH_SOCK` is the merged socket and that

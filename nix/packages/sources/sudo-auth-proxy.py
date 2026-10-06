@@ -3,8 +3,9 @@
 import argparse
 import base64
 import binascii
-import copy
+import contextlib
 import datetime
+import difflib
 import hashlib
 import hmac
 import io
@@ -31,7 +32,7 @@ from socketserver import (
     ThreadingMixIn,
     UnixStreamServer,
 )
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
     import cryptography.x509 as x509
@@ -68,7 +69,7 @@ DEFAULT_SERVER_READ_TIMEOUT = 10.0
 DEFAULT_MAX_CONNECTIONS = 64
 
 
-def resolve_read_timeouts(config: dict) -> tuple[float, Optional[float]]:
+def resolve_read_timeouts(config: dict) -> tuple[float, float | None]:
     """Return (first_frame_timeout, tail_timeout) for the client's frame reads.
 
     `recv_timeout` (default 0.5s, `first_frame_timeout`) bounds the wait for the
@@ -118,29 +119,31 @@ CLIENT_VERSION = "1"
 # another exchange cannot be mistaken for this request's ack.
 PENDING_TYPE = "auth_pending"
 
-# Domain separation label (doc §6.4; review log S8). It names this project and
-# protocol version and is prepended (with a NUL separator) to every signed
-# transcript, so a signature minted for another protocol or service can never
-# be replayed here. It deliberately replaces the retired "SAP-v1" label.
-DOMAIN_LABEL = b"tartarus/sudo-auth-proxy/v1"
-
 # The three explicit security knobs (doc §7.2-§7.5; review log S13). Exactly one
 # value each; `transport_encryption = "mtls"` forces both auths to "transport"
-# and no message signatures are layered on top. `"none"` disables requester
-# authentication entirely and is only meaningful paired with `acl.mode = "none"`
-# (see `build_security`/`validate_security_config`): it exists so a fully
+# and nothing is layered on top. `"none"` disables requester authentication
+# entirely and is only meaningful paired with `acl.mode = "none"` (see
+# `build_security`/`validate_security_config`): it exists so a fully
 # unauthenticated deployment is an explicit, warned, conscious choice instead of
 # an accident.
+#
+# mTLS is the ONLY authentication/signature mechanism (doc §7). The former
+# `client_auth = "ssh"` (SSH-key or ssh-agent signatures) and
+# `client_auth = "x509"` (application-layer certificate signatures) and the
+# `server_auth = "signature"` (host-signed responses) paths were removed
+# entirely, together with their keyrings, signature algorithms, domain
+# separation label and wire fields. `"transport"` means "identity comes from the
+# mTLS handshake"; `"none"` means "no authentication, explicitly chosen".
 TRANSPORT_ENCRYPTIONS = ("none", "mtls")
-CLIENT_AUTH_METHODS = ("ssh", "x509", "transport", "none")
-SERVER_AUTH_METHODS = ("signature", "transport", "none")
+CLIENT_AUTH_METHODS = ("transport", "none")
+SERVER_AUTH_METHODS = ("transport", "none")
 
 # Authorization (`[acl]`) modes (doc §8.1; redesign Phase 4). Exactly one mode:
-# `"list"` pins credential fingerprints; `"ca"` accepts any credential that
-# chains to a configured CA and carries the service EKU. There is deliberately
-# no `ca`+`list` combination and no wildcard: an empty trust list denies all
-# (doc §8.3). `"none"` authorizes every request because there is no credential
-# to authorize; it is rejected unless `client_auth = "none"` (XOR).
+# `"list"` pins credential fingerprints (mTLS leaf SPKI); `"ca"` accepts any
+# credential that chains to a configured CA and carries the service EKU. There
+# is deliberately no `ca`+`list` combination and no wildcard: an empty trust
+# list denies all (doc §8.3). `"none"` authorizes every request because there is
+# no credential to authorize; it is rejected unless `client_auth = "none"` (XOR).
 ACL_MODES = ("list", "ca", "none")
 
 # The fixed identity returned by `authenticate_request` when requester
@@ -148,29 +151,6 @@ ACL_MODES = ("list", "ca", "none")
 # non-credential sentinel: it names "no authenticated requester" and can never
 # collide with a real `SHA256:` fingerprint or an X.509/mTLS SPKI.
 NONE_IDENTITY = "none"
-
-# Signature algorithm allow-lists (doc §7.7, review log NF1). SSH covers
-# Ed25519 and RSA with SHA-256/512 (never SHA-1 `ssh-rsa`); X.509 uses the plain
-# algorithm names. An unknown or absent `alg` is rejected, never guessed.
-SSH_SIGNATURE_ALGS = ("ssh-ed25519", "rsa-sha2-256", "rsa-sha2-512")
-X509_SIGNATURE_ALGS = ("ed25519", "rsa-sha2-256", "rsa-sha2-512")
-
-# SSH agent protocol (draft-miller-ssh-agent; doc §7.9). Used only when
-# `client_auth = "ssh"` signs through the running agent rather than a key file:
-# `ssh_agent = true` with `ssh_key` selecting the loaded identity. The client
-# opens a short-lived AF_UNIX connection per request, lists identities to find
-# the configured fingerprint, then asks the agent to sign the domain-separated
-# transcript. The response cap bounds a hostile/broken agent (it may not force
-# an unbounded allocation) and the timeout bounds a hung one.
-SSH_AGENT_FAILURE = 5
-SSH_AGENTC_REQUEST_IDENTITIES = 11
-SSH_AGENT_IDENTITIES_ANSWER = 12
-SSH_AGENTC_SIGN_REQUEST = 13
-SSH_AGENT_SIGN_RESPONSE = 14
-SSH_AGENT_RSA_SHA2_256 = 2
-SSH_AGENT_RSA_SHA2_512 = 4
-SSH_AGENT_MAX_RESPONSE = 1024 * 1024
-SSH_AGENT_TIMEOUT = 5.0
 
 # Response freshness (doc §6.6). A response is valid from `issued_at` to
 # `expires_at`, with a small clock-skew allowance in both directions. The
@@ -210,10 +190,10 @@ def _ms(seconds: float) -> str:
 class ProtocolError(Exception):
     """A frame or field violated the NDJSON protocol; callers must fail closed.
 
-    Phase 1 has no cryptographic authentication yet, but the framing contract
-    is already strict: an unknown `v`/`type`, a missing required field, a
-    malformed frame or trailing data is rejected rather than guessed at, so a
-    Phase 3 auth block can be layered on without loosening parsing.
+    The framing contract is strict: an unknown `v`/`type`, a missing required
+    field, a malformed frame or trailing data is rejected rather than guessed
+    at, so a peer can never talk this process into parsing something it did not
+    intend to accept.
     """
 
 
@@ -222,12 +202,13 @@ class ConnectionClosed(Exception):
 
 
 class AuthError(Exception):
-    """A cryptographic authentication check failed; callers must fail closed.
+    """An authentication or authorization check failed; callers must fail closed.
 
-    Raised for a missing/malformed auth block, an unknown or absent `alg`, a
-    `key_id` outside the trust root, a bad chain, or a signature that does not
-    verify. There is deliberately no "skip verification" path: a caller that
-    catches this rejects the message rather than trusting it.
+    Raised for a missing/malformed `client_auth` block, a method the server is
+    not configured for, `client_auth = "transport"` without mTLS, an ACL that
+    rejects the verified credential, or an unverifiable certificate chain. There
+    is deliberately no "skip verification" path: a caller that catches this
+    rejects the message rather than trusting it.
     """
 
 
@@ -256,38 +237,16 @@ def canonical_bytes(obj: dict) -> bytes:
     ).encode("utf-8")
 
 
-def without_signature(obj: dict, block_name: str) -> dict:
-    """Return a deep copy of `obj` with `block_name.signature` removed.
-
-    A signature covers the message *minus its own signature field*, so both the
-    digest and the signed transcript are computed over the same body a verifier
-    reconstructs after stripping the signature. Removing an absent field is a
-    no-op, which is what makes the construction stable.
-    """
-    clone = copy.deepcopy(obj)
-    block = clone.get(block_name)
-    if isinstance(block, dict):
-        block.pop("signature", None)
-    return clone
-
-
-def signing_payload(obj: dict, block_name: str) -> bytes:
-    """The domain-separated transcript a signature commits to (doc §6.4).
-
-    `"tartarus/sudo-auth-proxy/v1" || 0x00 || canonical(body-without-signature)`.
-    """
-    return DOMAIN_LABEL + b"\x00" + canonical_bytes(without_signature(obj, block_name))
-
-
 def compute_request_digest(request: dict) -> str:
-    """SHA-256 (hex) over the canonical request with `client_auth.signature` removed.
+    """SHA-256 (hex) over the canonical request.
 
-    The digest binds the full request — including the credential's `method`,
-    `alg`, `key_id` and (for x509) `cert` — into the response, so a server cannot
-    answer a different request than the one it authenticated.
+    The digest binds the whole request — including the `client_auth` method —
+    into the response, so a server cannot answer a different request than the
+    one it authenticated. Requests carry no signature any more (authentication
+    is the mTLS channel, doc §7), so the digest is computed over the request as
+    it arrived.
     """
-    body = canonical_bytes(without_signature(request, "client_auth"))
-    return hashlib.sha256(body).hexdigest()
+    return hashlib.sha256(canonical_bytes(request)).hexdigest()
 
 
 def secure_equals(left: object, right: object) -> bool:
@@ -324,10 +283,10 @@ def build_request(
 ) -> dict:
     """Build a versioned `auth_request` object.
 
-    Phase 1 carries session metadata only; the Phase 3 `client_auth` block is
-    added to this same dict (and the canonicalisation/digest helpers live next
-    to `read_message`/`write_message`, which is why the object shape is built
-    in one place).
+    The session metadata is built here; `attach_client_auth` adds the
+    `client_auth` marker block to this same dict before it is sent (the
+    canonicalisation/digest helpers live next to `read_message`/`write_message`,
+    which is why the object shape is built in one place).
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -348,19 +307,19 @@ def build_response(
     nonce: str,
     decision: str,
     *,
-    request: Optional[dict] = None,
-    security: "Optional[SecurityConfig]" = None,
+    request: dict | None = None,
+    security: "SecurityConfig | None" = None,
     approver: str = "",
 ) -> dict:
     """Build a versioned `auth_response`.
 
     With no `request`/`security` this returns the minimal Phase-1 response used
     by the framing tests. In production the handler passes both: the response
-    then carries `request_digest` (binding it to the authenticated request),
-    an `issued_at`/`expires_at` freshness window, the informational `approver`,
-    and — when `server_auth = "signature"` — a `server_auth` block signing the
-    canonical response (doc §6.3-§6.5). Under mTLS or `server_auth = "none"` the
-    block is omitted and no signature is added.
+    then carries `request_digest` (binding it to the authenticated request), an
+    `issued_at`/`expires_at` freshness window and the informational `approver`.
+    There is no `server_auth` block: the response is authenticated by the mTLS
+    channel, or explicitly not at all (`server_auth = "none"`), and the removed
+    `"signature"` method is gone (doc §7.2).
     """
     response: dict = {
         "v": PROTOCOL_VERSION,
@@ -376,7 +335,6 @@ def build_response(
         response["expires_at"] = issued_at + security.response_ttl
         if approver:
             response["approver"] = approver
-        attach_server_auth(response, security)
     return response
 
 
@@ -385,9 +343,9 @@ def build_pending(nonce: str) -> dict:
 
     Sent only after the requester credential has been verified and the `[acl]`
     authorized it, immediately before the dialog is raised. It echoes the
-    request nonce and carries no decision, so it is not signed and not
-    authenticated (see `PENDING_TYPE`): the client's trust in the eventual
-    `allow` still rests entirely on `server_auth`/mTLS.
+    request nonce and carries no decision, so it is not authenticated (see
+    `PENDING_TYPE`): the client's trust in the eventual `allow` rests entirely on
+    the mTLS channel.
     """
     return {
         "v": PROTOCOL_VERSION,
@@ -443,7 +401,7 @@ def read_message(fileobj) -> dict:
     return message
 
 
-def read_frame(fileobj, sock, timeout: Optional[float]) -> dict:
+def read_frame(fileobj, sock, timeout: float | None) -> dict:
     """Read one NDJSON frame from a buffered socket reader under `timeout`.
 
     `fileobj` **must** be the buffered reader over `sock` (``sock.makefile("rb")``
@@ -508,11 +466,11 @@ REQUEST_REQUIRED_FIELDS = (
 def parse_request(message: dict) -> dict:
     """Validate and return an `auth_request` object (raises `ProtocolError`)."""
     validate_envelope(message, "auth_request")
-    for field in REQUEST_REQUIRED_FIELDS:
-        if field not in message:
-            raise ProtocolError(f"missing required field {field!r}")
-        if not isinstance(message[field], str):
-            raise ProtocolError(f"field {field!r} must be a string")
+    for name in REQUEST_REQUIRED_FIELDS:
+        if name not in message:
+            raise ProtocolError(f"missing required field {name!r}")
+        if not isinstance(message[name], str):
+            raise ProtocolError(f"field {name!r} must be a string")
     _validate_nonce(message["nonce"])
     if "guest_hint" in message and not isinstance(message["guest_hint"], str):
         raise ProtocolError("field 'guest_hint' must be a string")
@@ -524,8 +482,8 @@ def parse_response(message: dict, expected_nonce: str) -> str:
 
     The nonce comparison is constant-time (`secure_equals`). A response for any
     other nonce is rejected -- a captured old `allow` can never satisfy a fresh
-    request (doc §6.6; Phase 3 adds the signature and `request_digest` checks on
-    top).
+    request (doc §6.6; `verify_response` adds the `request_digest`, decision and
+    freshness checks on top).
     """
     validate_envelope(message, "auth_response")
     nonce = message.get("nonce")
@@ -573,48 +531,15 @@ def load_config(path: str) -> dict:
             return str(config_dir / pth)
         return str(pth)
 
-    # Top-level cert paths (keep for forward compat)
-    for key in ("ca_file", "cert_file", "key_file"):
-        if key in config and config[key]:
-            config[key] = resolve(config[key])
-
-    # mtls subsection
+    # Top-level mtls paths are resolved so a hand-written config can use
+    # paths relative to the config file. `[security]` holds no paths any more:
+    # the removed ssh/x509/signature methods owned every key reference, and
+    # mTLS carries its own `[mtls]` section.
     mtls = config.get("mtls")
     if isinstance(mtls, dict):
         for key in ("ca_file", "cert_file", "key_file"):
             if key in mtls and mtls[key]:
                 mtls[key] = resolve(mtls[key])
-
-    # `[security]` key/keyring paths (doc §7). A list entry that contains a
-    # space is an inline OpenSSH public-key line and is left untouched; a bare
-    # path is resolved relative to the config file, like every other path.
-    security = config.get("security")
-    if isinstance(security, dict):
-        for key in (
-            "ssh_signing_key",
-            "ssh_agent_socket",
-            "server_signing_key",
-            "client_cert",
-            "client_key",
-            "ca_file",
-        ):
-            if security.get(key):
-                security[key] = resolve(security[key])
-        # `ssh_key` may be an inline OpenSSH public-key line; like a keyring
-        # entry, a value containing a space is left untouched and only a bare
-        # path is resolved. `ssh_agent_socket` is resolved above like any other
-        # path; `$SSH_AUTH_SOCK` is an environment-variable *name*, never
-        # expanded here (the default comes from the environment at build time).
-        ssh_key = security.get("ssh_key")
-        if isinstance(ssh_key, str) and ssh_key and " " not in ssh_key:
-            security["ssh_key"] = resolve(ssh_key)
-        for key in ("trusted_keys", "trusted_server_keys"):
-            entries = security.get(key)
-            if isinstance(entries, list):
-                security[key] = [
-                    entry if (not isinstance(entry, str) or " " in entry) else resolve(entry)
-                    for entry in entries
-                ]
 
     # `[acl]` (doc §8): `ca_file` is a path like every other; the fingerprint
     # lists are opaque strings (never paths) and are left untouched.
@@ -623,6 +548,229 @@ def load_config(path: str) -> dict:
         acl["ca_file"] = resolve(acl["ca_file"])
 
     return config
+
+
+# --- configuration schema (doc §7.9, §15.1) -------------------------------
+#
+# The **whole file** is checked against this schema before anything else runs:
+# every key, at every level, must be one the implementation actually reads. A
+# typo (`max_connection`) and a key written on the wrong side of a table header
+# are therefore startup errors instead of lines that are quietly skipped -- a
+# service that backs a PAM hook must never run with a knob the operator believes
+# is set but that nothing read.
+#
+# The misplacement case is why this exists. TOML assigns a key to the **nearest
+# preceding `[table]` header**, so a config whose `transport_encryption`/
+# `client_auth`/`server_auth` lines sit *above* `[security]` has no `[security]`
+# knobs at all. Under the previous "unknown keys are ignored" policy that was
+# reported as `transport_encryption = 'none' requires an explicit client_auth =
+# 'none'` -- which names the one thing the operator had already written, and not
+# the placement that made it invisible. Naming the key *and* the table it belongs
+# to is the whole point (doc §7.5, §7.9).
+
+# Every key the implementation reads, per namespace.
+CONFIG_TOP_LEVEL_KEYS = frozenset(
+    {
+        # role and transport selection
+        "mode",
+        "transport",
+        "cid",
+        "host",
+        "port",
+        # listener / selector paths and their modes
+        "socket",
+        "socket_dir_mode",
+        "socket_mode",
+        # timeouts and server-side pre-auth resource bounds
+        "connect_timeout",
+        "decision_timeout",
+        "recv_timeout",
+        "max_connections",
+        "server_read_timeout",
+        # interactive behaviour
+        "dialog_program",
+        "resolution",
+        "debug",
+        # request metadata a client config carries
+        "approver",
+        "client_version",
+        "guest_hint",
+        # sub-tables
+        "security",
+        "acl",
+        "mtls",
+        # internal: the `SecurityConfig` cache `build_security` writes back
+        "_security",
+    }
+)
+
+CONFIG_SECURITY_KEYS = frozenset(
+    {
+        "transport_encryption",
+        "client_auth",
+        "server_auth",
+        "response_ttl",
+        "clock_skew",
+    }
+)
+
+# `labels` is a fingerprint -> display-label map; it is the one free-form table,
+# so its keys are fingerprints and are deliberately not schema keys themselves.
+CONFIG_ACL_KEYS = frozenset(
+    {
+        "mode",
+        "trusted_fingerprints",
+        "ca_file",
+        "required_oid",
+        "labels",
+    }
+)
+
+CONFIG_MTLS_KEYS = frozenset(
+    {
+        "enable",
+        "ca_file",
+        "cert_file",
+        "key_file",
+        "required_oid",
+        "peer_required_oid",
+    }
+)
+
+CONFIG_TABLE_KEYS = {
+    "security": CONFIG_SECURITY_KEYS,
+    "acl": CONFIG_ACL_KEYS,
+    "mtls": CONFIG_MTLS_KEYS,
+}
+
+# Below this length a fuzzy match has more false positives than value (`post`
+# must not be answered with `host`), so short typos get the plain message.
+CONFIG_SUGGESTION_MIN_LENGTH = 4
+
+
+def _table_names_for(key: str) -> list[str]:
+    """Return the `[tables]` that read `key` (empty for an unknown or top key)."""
+    return sorted(
+        name for name, keys in CONFIG_TABLE_KEYS.items() if key in keys
+    )
+
+
+def _owner_phrase(key: str) -> str | None:
+    """Where `key` is read from, as a phrase (`None` when nothing reads it)."""
+    tables = _table_names_for(key)
+    if tables:
+        return " in " + " or ".join(f"[{name}]" for name in tables)
+    if key in CONFIG_TOP_LEVEL_KEYS:
+        return " at the top level"
+    return None
+
+
+def _suggest_key(key: str, allowed: frozenset) -> str | None:
+    """The misspelled key's real name, when there is an obvious one."""
+    if len(key) < CONFIG_SUGGESTION_MIN_LENGTH:
+        return None
+    matches = difflib.get_close_matches(key.lower(), sorted(allowed), n=1, cutoff=0.75)
+    return matches[0] if matches else None
+
+
+def _join_names(names: list[str]) -> str:
+    """``['a']`` -> ``'a'``; ``['a', 'b']`` -> ``'a' and 'b'``."""
+    quoted = [repr(name) for name in names]
+    if len(quoted) == 1:
+        return quoted[0]
+    return ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
+
+
+def _suggestion_hint(key: str, allowed: frozenset) -> str:
+    """``; did you mean 'x'?``, when there is an obvious spelling to offer."""
+    suggestion = _suggest_key(key, allowed)
+    return f"; did you mean {suggestion!r}?" if suggestion else ""
+
+
+def _unknown_keys_sentence(
+    where_phrase: str, keys: list[str], allowed: frozenset
+) -> str:
+    """One sentence for the unknown keys refused at the same place."""
+    if len(keys) == 1:
+        # A single typo is worth the guess; a list of them is not.
+        return (
+            f"unknown key {_join_names(keys)} {where_phrase}"
+            f"{_suggestion_hint(keys[0], allowed)}"
+        )
+    return f"unknown keys {where_phrase}: {_join_names(keys)}"
+
+
+def validate_config_schema(config: dict, *, source: str | None = None) -> None:
+    """Refuse any key the implementation does not read (doc §7.9, §15.1).
+
+    Fail-closed and exact: the top level and the `[security]`, `[acl]` and
+    `[mtls]` tables are each checked against their allowed key set, so both a
+    typo and a misplaced key (a `[security]` key written above the `[security]`
+    header, say) stop the process with a message naming the key and the table it
+    belongs to. Unknown keys are **not** ignored: that policy is what turned a
+    flattened `[security]` block into a misleading "requires an explicit
+    client_auth = 'none'" error instead of a diagnosable one.
+
+    `acl.labels` is the single free-form table (fingerprint -> label); only its
+    own key, never its contents, is part of the schema. Values are still typed
+    where they are used (`_positive_int`, `_parse_mode`, the knob validators), so
+    this checks *names*; `source` is the config path, when the caller knows it, so
+    the message can name the file to edit. Every offending key is reported, and
+    keys refused for the same reason share one sentence: a flattened `[security]`
+    block is five misplaced keys, and five copies of the same paragraph help
+    nobody.
+    """
+    # (owner, where) -> keys, so the five keys of one flattened table collapse
+    # into a single sentence; `where` is kept per group because the same owner can
+    # be wrong in more than one place.
+    misplaced: dict[tuple[str, str], list[str]] = {}
+    unknown: dict[str, list[str]] = {}
+    allowed_at: dict[str, frozenset] = {}
+    broken_tables: list[str] = []
+
+    def inspect(keys: dict, where_phrase: str, allowed: frozenset) -> None:
+        for key in sorted(set(keys) - allowed):
+            owner = _owner_phrase(key)
+            if owner is None:
+                unknown.setdefault(where_phrase, []).append(key)
+                allowed_at[where_phrase] = allowed
+            else:
+                misplaced.setdefault((owner, where_phrase), []).append(key)
+
+    inspect(config, "at the top level", CONFIG_TOP_LEVEL_KEYS)
+    for name, allowed in CONFIG_TABLE_KEYS.items():
+        table = config.get(name)
+        if table is None:
+            continue
+        if not isinstance(table, dict):
+            # Nothing to inspect: a scalar where a table belongs would fail in the
+            # reader with a far worse message.
+            broken_tables.append(f"[{name}] must be a table")
+            continue
+        inspect(table, f"inside [{name}]", allowed)
+
+    sentences = list(broken_tables)
+    sentences.extend(
+        f"{_join_names(keys)} must be written{owner}, not {where_phrase}"
+        for (owner, where_phrase), keys in misplaced.items()
+    )
+    if misplaced:
+        sentences.append(
+            "TOML assigns every key to the nearest preceding [table] header"
+        )
+    sentences.extend(
+        _unknown_keys_sentence(where_phrase, keys, allowed_at[where_phrase])
+        for where_phrase, keys in unknown.items()
+    )
+    if unknown:
+        sentences.append(
+            "the file is validated against an exact schema: a key the service "
+            "does not read is refused, never ignored"
+        )
+
+    if sentences:
+        source_suffix = f" in {source}" if source else ""
+        raise SecurityConfigError("; ".join(sentences) + source_suffix)
 
 
 # --- security model: validation, keyrings, auth blocks (doc §7) -----------
@@ -635,38 +783,36 @@ class AclConfig:
     This is the *authorization* layer, distinct from the cryptographic
     `[security]` authentication: it decides whether an already-verified
     credential may use the mechanism at all. It matches **only** cryptographic
-    material (fingerprints and CA chains); metadata such as `PAM_USER`,
-    `PAM_TTY`, `rhost` or `guest_hint` is never consulted (review log S11).
+    material (mTLS leaf SPKI fingerprints and CA chains); metadata such as
+    `PAM_USER`, `PAM_TTY`, `rhost` or `guest_hint` is never consulted (review
+    log S11).
 
-    - `mode = "list"`: a credential is eligible only when its fingerprint is in
-      `trusted_keys` (SSH) or `trusted_fingerprints` (X.509 SPKI / mTLS SPKI).
-      An empty set denies everyone; there is no wildcard.
-    - `mode = "ca"`: any X.509/mTLS credential that chains to `ca_file` and
-      carries `required_oid` is eligible; `trusted_fingerprints` optionally
-      additionally pins the leaf SPKI. SSH keys never chain to a CA, so they are
-      never authorized in this mode.
+    - `mode = "list"`: a credential is eligible only when its mTLS leaf SPKI
+      fingerprint is in `trusted_fingerprints`. An empty set denies everyone;
+      there is no wildcard.
+    - `mode = "ca"`: any mTLS credential that chains to `ca_file` and carries
+      `required_oid` is eligible; `trusted_fingerprints` optionally additionally
+      pins the leaf SPKI.
 
     `labels` maps a fingerprint to a display/log label only. It is never an
     authorization input and is never accepted from the requester.
     """
 
     mode: str = "list"
-    trusted_keys: frozenset = field(default_factory=frozenset)
     trusted_fingerprints: frozenset = field(default_factory=frozenset)
-    ca_file: Optional[str] = None
-    required_oid: Optional[str] = None
+    ca_file: str | None = None
+    required_oid: str | None = None
     labels: dict = field(default_factory=dict)
 
 
 @dataclass
 class SecurityConfig:
-    """The validated `[security]` model plus the keys loaded for one role.
+    """The validated `[security]` model for one role.
 
     `transport_encryption`, `client_auth` and `server_auth` are the three
-    explicit knobs (doc §7). The remaining fields are populated by
-    `build_security` for the role in use: a server loads its trusted requester
-    keyring and host signing key; a client loads its requester key and the
-    trusted host-key keyring.
+    explicit knobs (doc §7). Nothing else needs loading: authentication is the
+    mTLS channel (or the explicit absence of it), so there is no signing key,
+    keyring or certificate material to read here any more.
     """
 
     transport: str
@@ -676,29 +822,7 @@ class SecurityConfig:
     response_ttl: int = DEFAULT_RESPONSE_TTL
     clock_skew: int = DEFAULT_CLOCK_SKEW
     # server role
-    acl: Optional[AclConfig] = None
-    server_signing_key: object = None
-    server_signing_alg: Optional[str] = None
-    server_key_id: Optional[str] = None
-    # client role
-    client_signing_key: object = None
-    client_signing_alg: Optional[str] = None
-    client_cert_chain: Optional[list] = None
-    trusted_server_keys: dict = field(default_factory=dict)
-    # x509 verification (server)
-    ca_file: Optional[str] = None
-    client_required_oid: Optional[str] = None
-    # resolved x509 request material (client)
-    client_cert_b64: Optional[str] = None
-    client_key_id: Optional[str] = None
-    # resolved ssh-agent signing material (client): the agent socket, the
-    # selected identity's SSH wire blob (sent as `public_key`), its `SHA256:`
-    # fingerprint (`client_signing_agent_key_id`, also used to pick the identity
-    # out of the agent) and the signing algorithm (shared `client_signing_alg`).
-    # `client_signing_key` stays None in this mode.
-    client_signing_agent_socket: Optional[str] = None
-    client_signing_agent_key_blob: Optional[bytes] = None
-    client_signing_agent_key_id: Optional[str] = None
+    acl: AclConfig | None = None
 
 
 def validate_security_config(config: dict) -> dict:
@@ -710,14 +834,14 @@ def validate_security_config(config: dict) -> dict:
     - `transport_encryption` defaults to `"mtls"` on `tcp` and `"none"` on
       `vsock`/`unix`; `mtls.enable = true` is treated as `"mtls"`.
     - Under `mtls`, **both** `client_auth` and `server_auth` are `"transport"`;
-      anything else (including an SSH/ssh-agent signature) is rejected.
+      anything else is rejected. mTLS is the only authentication mechanism left
+      (doc §7).
     - `client_auth = "transport"` / `server_auth = "transport"` require mTLS.
-    - `client_auth` is exactly one of `ssh`/`x509`/`transport`/`none` (never
-      both). `"none"` disables requester authentication, is rejected under
-      `mtls`, and is warned about loudly; pairing it with `acl.mode = "none"` is
-      enforced by `build_security`.
-    - `tcp` + `"none"` is permitted but warned as insecure; `server_auth =
-      "none"` is permitted but warned as not recommended.
+    - With `transport_encryption = "none"` there is no mechanism to fall back
+      on, so a missing knob is an **error**, not a silent `"none"`: turning
+      authentication off must be written down explicitly on both knobs. The
+      pairing with `acl.mode = "none"` is enforced by `build_security`.
+    - `tcp` + `"none"` is permitted but warned as insecure.
 
     Nothing here ever *downgrades*: the resolved values are final for the
     process and are never recomputed from the network.
@@ -752,55 +876,67 @@ def validate_security_config(config: dict) -> dict:
 
     client_auth = security.get("client_auth")
     server_auth = security.get("server_auth")
-    # A value that is not a single string (e.g. a list) is a configuration that
-    # asks for more than one method; reject rather than pick one (doc §7.3).
     if client_auth is not None and not isinstance(client_auth, str):
-        raise SecurityConfigError(
-            "client_auth must be exactly one of ssh/x509/transport, not a list"
-        )
-    if isinstance(client_auth, str) and "+" in client_auth:
-        raise SecurityConfigError(
-            f"client_auth {client_auth!r} mixes methods; use exactly one of ssh/x509"
-        )
+        raise SecurityConfigError("client_auth must be a single string")
     if server_auth is not None and not isinstance(server_auth, str):
         raise SecurityConfigError("server_auth must be a single string")
-
-    if client_auth is None:
-        client_auth = "transport" if transport_encryption == "mtls" else "ssh"
-    if server_auth is None:
-        server_auth = "transport" if transport_encryption == "mtls" else "signature"
-    if client_auth not in CLIENT_AUTH_METHODS:
-        raise SecurityConfigError(f"unknown client_auth {client_auth!r}")
-    if server_auth not in SERVER_AUTH_METHODS:
-        raise SecurityConfigError(f"unknown server_auth {server_auth!r}")
+    if client_auth is not None and client_auth not in CLIENT_AUTH_METHODS:
+        raise SecurityConfigError(
+            f"unknown client_auth {client_auth!r} "
+            f"(expected one of {', '.join(CLIENT_AUTH_METHODS)})"
+        )
+    if server_auth is not None and server_auth not in SERVER_AUTH_METHODS:
+        raise SecurityConfigError(
+            f"unknown server_auth {server_auth!r} "
+            f"(expected one of {', '.join(SERVER_AUTH_METHODS)})"
+        )
 
     if transport_encryption == "mtls":
-        if client_auth == "none":
+        if client_auth not in (None, "transport"):
             raise SecurityConfigError(
-                "client_auth = 'none' cannot be combined with "
-                "transport_encryption = 'mtls' (mTLS forces client_auth = 'transport')"
+                f"under transport_encryption = 'mtls', client_auth must be "
+                f"'transport', not {client_auth!r} (mTLS forces it)"
             )
-        if client_auth != "transport":
+        if server_auth not in (None, "transport"):
             raise SecurityConfigError(
-                "under transport_encryption = 'mtls', client_auth must be "
-                "'transport' (an SSH/ssh-agent signature is not layered on the "
-                "mTLS certificate)"
+                f"under transport_encryption = 'mtls', server_auth must be "
+                f"'transport', not {server_auth!r} (mTLS forces it)"
             )
-        if server_auth != "transport":
-            raise SecurityConfigError(
-                "under transport_encryption = 'mtls', server_auth must be 'transport'"
-            )
+        client_auth = "transport"
+        server_auth = "transport"
     else:
         if client_auth == "transport":
-            raise SecurityConfigError("client_auth = 'transport' requires transport_encryption = 'mtls'")
+            raise SecurityConfigError(
+                "client_auth = 'transport' requires transport_encryption = 'mtls'"
+            )
         if server_auth == "transport":
-            raise SecurityConfigError("server_auth = 'transport' requires transport_encryption = 'mtls'")
+            raise SecurityConfigError(
+                "server_auth = 'transport' requires transport_encryption = 'mtls'"
+            )
+        if client_auth is None or server_auth is None:
+            # There is no weak-but-working default left: the only value left to
+            # fall back on is "none", and silently disabling authentication is
+            # exactly what this design refuses to do (doc §7.5).
+            missing = [
+                name
+                for name, value in (
+                    ("client_auth", client_auth),
+                    ("server_auth", server_auth),
+                )
+                if value is None
+            ]
+            raise SecurityConfigError(
+                "transport_encryption = 'none' requires an explicit "
+                + " and ".join(f"{name} = 'none'" for name in missing)
+                + " (refusing to disable authentication implicitly; use "
+                "transport_encryption = 'mtls' to authenticate)"
+            )
 
     if transport_encryption == "none" and transport == "tcp":
         print(
             "sudo-auth-proxy: WARNING: transport_encryption = 'none' on tcp is "
-            "insecure (the channel is MITM-able); message signatures must remain "
-            "enabled",
+            "insecure (the channel is MITM-able and nothing authenticates the "
+            "decision)",
             file=sys.stderr,
         )
     if server_auth == "none":
@@ -871,11 +1007,12 @@ def load_acl_config(config: dict) -> AclConfig:
     Fail-closed defaults: no `[acl]` table at all is a valid deny-all `"list"`
     policy, so a server never starts open by accident. `mode` is exactly one of
     `"list"`/`"ca"`/`"none"`; mixing the modes (a `"ca"` mode with
-    `trusted_keys`, a `"list"` mode with `ca_file`/`required_oid`, or a `"none"`
-    mode with any trust material) is rejected rather than guessed. `"none"` is
-    only reachable because `client_auth = "none"` needs an explicit ACL that
-    deliberately authorizes unauthenticated requests (`build_security` enforces
-    the pairing). In `"ca"` mode the CA must be readable at load time.
+    `trusted_fingerprints`+`ca_file` omitted, a `"list"` mode with
+    `ca_file`/`required_oid`, or a `"none"` mode with any trust material) is
+    rejected rather than guessed. `"none"` is only reachable because
+    `client_auth = "none"` needs an explicit ACL that deliberately authorizes
+    unauthenticated requests (`build_security` enforces the pairing). In `"ca"`
+    mode the CA must be readable at load time.
     """
     raw = config.get("acl")
     if raw is None:
@@ -889,7 +1026,6 @@ def load_acl_config(config: dict) -> AclConfig:
             f"unknown acl.mode {mode!r} (expected one of {', '.join(ACL_MODES)})"
         )
 
-    trusted_keys = _fingerprint_set(raw.get("trusted_keys"), "trusted_keys")
     trusted_fingerprints = _fingerprint_set(
         raw.get("trusted_fingerprints"), "trusted_fingerprints"
     )
@@ -903,7 +1039,6 @@ def load_acl_config(config: dict) -> AclConfig:
         forbidden = [
             name
             for name, present in (
-                ("trusted_keys", bool(trusted_keys)),
                 ("trusted_fingerprints", bool(trusted_fingerprints)),
                 ("ca_file", bool(ca_file)),
                 ("required_oid", bool(required_oid)),
@@ -929,10 +1064,6 @@ def load_acl_config(config: dict) -> AclConfig:
     }
 
     if mode == "ca":
-        if trusted_keys:
-            raise SecurityConfigError(
-                "acl.mode = 'ca' must not set trusted_keys (no ca+list combination)"
-            )
         if not isinstance(ca_file, str) or not ca_file:
             raise SecurityConfigError("acl.mode = 'ca' requires acl.ca_file")
         if not isinstance(required_oid, str) or not required_oid:
@@ -948,7 +1079,6 @@ def load_acl_config(config: dict) -> AclConfig:
 
     return AclConfig(
         mode=mode,
-        trusted_keys=trusted_keys,
         trusted_fingerprints=trusted_fingerprints,
         ca_file=ca_file,
         required_oid=required_oid,
@@ -956,7 +1086,7 @@ def load_acl_config(config: dict) -> AclConfig:
     )
 
 
-def acl_allows_any(acl: Optional[AclConfig]) -> bool:
+def acl_allows_any(acl: AclConfig | None) -> bool:
     """True when an ACL could authorize at least one credential.
 
     Used only to warn at startup that a deny-all policy is in effect; it never
@@ -970,7 +1100,7 @@ def acl_allows_any(acl: Optional[AclConfig]) -> bool:
         return True
     if acl.mode == "ca":
         return bool(acl.ca_file and acl.required_oid)
-    return bool(acl.trusted_keys or acl.trusted_fingerprints)
+    return bool(acl.trusted_fingerprints)
 
 
 def authorize_request(
@@ -978,17 +1108,17 @@ def authorize_request(
     security: "SecurityConfig",
     verified_identity: str,
     *,
-    peer_cert_der: Optional[bytes] = None,
+    peer_cert_der: bytes | None = None,
 ) -> str:
     """Apply the `[acl]` to an already-authenticated request (doc §8).
 
     Called **after** `authenticate_request` and **before** the dialog. It reads
-    only the verified credential: the SSH fingerprint, the X.509/mTLS SPKI, or
-    the CA chain the transport already proved. Metadata fields
-    (`target_user`, `invoking_user`, `rhost`, `tty`, `guest_hint`, ...) are
-    never inspected, so no self-reported value can influence the decision
-    (review log S11). Returns the display label when one is configured, else
-    the verified fingerprint; raises `AuthError` (fail closed) otherwise.
+    only the verified credential: the mTLS leaf SPKI, or the CA chain the
+    transport already proved. Metadata fields (`target_user`, `invoking_user`,
+    `rhost`, `tty`, `guest_hint`, ...) are never inspected, so no self-reported
+    value can influence the decision (review log S11). Returns the display label
+    when one is configured, else the verified fingerprint; raises `AuthError`
+    (fail closed) otherwise.
 
     `acl.mode = "none"` is the one mode that inspects no credential at all: it
     authorizes every request because `client_auth = "none"` leaves nothing to
@@ -1018,32 +1148,27 @@ def authorize_request(
             "(an unauthenticated ACL cannot authorize a credential)"
         )
 
-    block = request.get("client_auth")
-    method = block.get("method") if isinstance(block, dict) else None
-
     if acl.mode == "list":
-        # SSH keys pin through trusted_keys; X.509 and mTLS through the leaf
-        # SPKI in trusted_fingerprints. An empty set denies everyone.
-        allowed = acl.trusted_keys if method == "ssh" else acl.trusted_fingerprints
-        if verified_identity not in allowed:
+        # The mTLS leaf SPKI is the only credential left; an empty set denies
+        # everyone.
+        if verified_identity not in acl.trusted_fingerprints:
             raise AuthError(
                 f"credential {verified_identity} is not in the authorization list"
             )
     else:  # acl.mode == "ca"
-        if method == "ssh":
-            raise AuthError("acl.mode = 'ca' does not authorize SSH keys")
-        ca_certs = _load_trusted_ca_certs(acl.ca_file)
-        if method == "x509":
-            chain = parse_cert_chain_b64(block.get("cert"))
-        elif method == "transport":
-            if not peer_cert_der:
-                raise AuthError(
-                    "mTLS peer certificate is required to authorize a transport credential"
-                )
-            chain = [_load_der_cert(peer_cert_der)]
-        else:
-            raise AuthError("no verifiable credential to authorize")
-        leaf = verify_x509_chain(chain, ca_certs, acl.required_oid)
+        ca_file = acl.ca_file
+        required_oid = acl.required_oid
+        if not ca_file or not required_oid:
+            # Unreachable through `load_acl_config`, which requires both; a
+            # caller that assembles the policy by hand fails closed here
+            # instead of raising somewhere deeper.
+            raise AuthError("acl.mode = 'ca' requires acl.ca_file and acl.required_oid")
+        if not peer_cert_der:
+            raise AuthError(
+                "mTLS peer certificate is required to authorize a transport credential"
+            )
+        ca_certs = _load_trusted_ca_certs(ca_file)
+        leaf = verify_x509_chain([_load_der_cert(peer_cert_der)], ca_certs, required_oid)
         if acl.trusted_fingerprints:
             # Optional additional pin on top of the CA chain.
             spki = spki_fingerprint(leaf.public_key())
@@ -1053,118 +1178,27 @@ def authorize_request(
     return acl.labels.get(verified_identity, verified_identity)
 
 
-def _keyring_lines(entry: str):
-    """Yield OpenSSH public-key lines from a path, directory or inline line.
-
-    A keyring is a list of trusted public keys (doc §7.8); the `key_id`
-    fingerprint is derived from each. A bare `SHA256:...` fingerprint cannot
-    validate a signature, so it is rejected with a clear error rather than
-    silently ignored.
-    """
-    if " " in entry:
-        yield entry
-        return
-    path = Path(entry)
-    if path.is_dir():
-        for candidate in sorted(path.glob("*.pub")):
-            yield from _read_pubkey_file(candidate)
-        return
-    if path.is_file():
-        yield from _read_pubkey_file(path)
-        return
-    if entry.startswith("SHA256:"):
-        raise SecurityConfigError(
-            "keyring entries must be public keys, not bare fingerprints "
-            f"({entry!r}); a fingerprint cannot verify a signature "
-            "(fingerprint pinning belongs in [acl])"
-        )
-    raise SecurityConfigError(f"keyring entry not found: {entry!r}")
-
-
-def _read_pubkey_file(path: Path):
-    try:
-        text = path.read_text()
-    except OSError as error:
-        raise SecurityConfigError(f"cannot read keyring file {path}: {error}") from error
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            yield stripped
-
-
-def _load_ssh_keyring(entries) -> dict:
-    """Build `{key_id: public_key}` from keyring entries (doc §7.8, Rank 6)."""
-    if isinstance(entries, str):
-        raise SecurityConfigError("keyring must be a list of public keys, not a single string")
-    keyring: dict = {}
-    for entry in entries:
-        if not isinstance(entry, str):
-            raise SecurityConfigError("keyring entries must be strings")
-        for line in _keyring_lines(entry):
-            public_key, key_id = parse_openssh_public_key(line)
-            keyring[key_id] = public_key
-    return keyring
-
-
-def _load_agent_public_key(entry: str) -> tuple:
-    """Load the single OpenSSH public key selected by `[security] ssh_key`.
-
-    `ssh_key` names the agent identity the client must use. The shared keyring
-    parser is reused (so `~` and inline OpenSSH lines work like elsewhere), but
-    unlike a keyring this must resolve to **exactly one** key: a directory or a
-    multi-key file is ambiguous and rejected rather than guessed.
-    """
-    if isinstance(entry, str) and " " not in entry and Path(entry).is_dir():
-        raise SecurityConfigError(
-            f"[security] ssh_key must name one public key, not the directory {entry!r}"
-        )
-    lines = list(_keyring_lines(entry))
-    if not lines:
-        raise SecurityConfigError(f"[security] ssh_key {entry!r} contains no public key")
-    if len(lines) > 1:
-        raise SecurityConfigError(
-            f"[security] ssh_key {entry!r} must name exactly one public key"
-        )
-    return parse_openssh_public_key(lines[0])
-
-
-def _resolve_ssh_agent_socket(raw: dict) -> str:
-    """Resolve the AF_UNIX path of the SSH agent (doc §7.9).
-
-    Precedence is the explicit `[security] ssh_agent_socket`, then the
-    `SSH_AUTH_SOCK` environment variable (the agent's own default). Missing both
-    is a fatal configuration error: silently signing nothing would leave the
-    request unauthenticated, which is never acceptable for `ssh`.
-    """
-    configured = raw.get("ssh_agent_socket")
-    if configured is not None and not isinstance(configured, str):
-        raise SecurityConfigError("[security] ssh_agent_socket must be a string path")
-    if configured:
-        return configured
-    env_socket = os.environ.get("SSH_AUTH_SOCK")
-    if env_socket:
-        return env_socket
-    raise SecurityConfigError(
-        "ssh_agent = true requires [security] ssh_agent_socket or the "
-        "SSH_AUTH_SOCK environment variable"
-    )
-
-
 def build_security(config: dict, role: str) -> SecurityConfig:
-    """Validate the config and load the keys needed for `role` (`client`/`server`).
+    """Validate the config and assemble the `SecurityConfig` for `role`.
 
-    Loaded lazily per process and cached on the config dict. A missing or
-    unreadable key is a fatal configuration error, never a "run unauthenticated"
-    path: the caller turns `SecurityConfigError` into a non-zero exit. The one
-    exception is the explicit `client_auth = "none"` / `acl.mode = "none"`
-    pairing, which the server refuses unless *both* knobs agree. For a client
-    `client_auth = "ssh"` may sign through the SSH agent (doc §7.9) instead of a
-    private key file; only the selected public key is read.
+    Loaded lazily per process and cached on the config dict. mTLS is the only
+    authentication mechanism (doc §7), so there is no key material to load here
+    any more: the TLS layer reads `[mtls]` itself, and the one thing that still
+    needs validating is the server's `[acl]` authorization policy and its XOR
+    pairing with `client_auth = "none"`. A configuration error is fatal, never a
+    "run unauthenticated" path: the caller turns `SecurityConfigError` into a
+    non-zero exit.
     """
     cached = config.get("_security")
     if isinstance(cached, SecurityConfig):
         return cached
 
+    # Exact schema first (doc §7.9): an unknown or misplaced key must be reported
+    # as itself, *before* `validate_security_config` can complain about the empty
+    # value it left behind -- a `[security]` key written above the `[security]`
+    # header is the classic case, and it used to be reported as "requires an
+    # explicit client_auth = 'none'" even though that key was right there.
+    validate_config_schema(config)
     normalized = validate_security_config(config)
     raw = config.get("security")
     if not isinstance(raw, dict):
@@ -1178,8 +1212,8 @@ def build_security(config: dict, role: str) -> SecurityConfig:
 
     if role == "server":
         # Authorization policy (doc §8). Loaded for every server and defaulting
-        # to deny-all `"list"`; the authentication code below only proves the
-        # credential, it never decides who may use the mechanism.
+        # to deny-all `"list"`; the mTLS handshake proves the credential, the
+        # ACL decides who may use the mechanism.
         security.acl = load_acl_config(config)
         # Disabling requester authentication must be an explicit, conscious
         # choice on *both* knobs: `client_auth = "none"` is meaningless (and
@@ -1196,222 +1230,51 @@ def build_security(config: dict, role: str) -> SecurityConfig:
                 "acl.mode = 'none' requires client_auth = 'none' "
                 "(an unauthenticated ACL cannot authorize a credential)"
             )
-        if security.acl.mode == "ca" and security.client_auth == "ssh":
-            raise SecurityConfigError(
-                "acl.mode = 'ca' cannot authorize client_auth = 'ssh' "
-                "(SSH keys do not chain to a CA)"
-            )
-        if security.client_auth == "x509":
-            security.ca_file = raw.get("ca_file")
-            security.client_required_oid = raw.get("client_required_oid")
-            if not security.ca_file or not security.client_required_oid:
-                raise SecurityConfigError(
-                    "client_auth = 'x509' requires [security] ca_file and client_required_oid"
-                )
-            # Fail fast if the CA cannot be read; per-request verification reloads it.
-            _load_trusted_ca_certs(security.ca_file)
-        if security.server_auth == "signature":
-            path = raw.get("server_signing_key")
-            if not path:
-                raise SecurityConfigError(
-                    "server_auth = 'signature' requires [security] server_signing_key"
-                )
-            security.server_signing_key = load_private_key_file(path)
-            # The host keyring is a set of OpenSSH public keys, so the host
-            # signature uses the SSH algorithm names and an SSH fingerprint
-            # key_id, keeping one convention across the keyring.
-            security.server_signing_alg = alg_for_key(security.server_signing_key, ssh=True)
-            security.server_key_id = ssh_fingerprint(security.server_signing_key.public_key())
-    else:
-        if security.client_auth == "ssh":
-            path = raw.get("ssh_signing_key")
-            ssh_agent = raw.get("ssh_agent", False)
-            if not isinstance(ssh_agent, bool):
-                raise SecurityConfigError("[security] ssh_agent must be a boolean")
-            agent_socket_configured = raw.get("ssh_agent_socket")
-            if path:
-                # File-based signing (unchanged): an explicit key file wins.
-                security.client_signing_key = load_private_key_file(path)
-                security.client_signing_alg = alg_for_key(security.client_signing_key, ssh=True)
-            elif ssh_agent or agent_socket_configured:
-                # ssh-agent signing (doc §7.9): no private key material touches
-                # the client. Resolve the agent and the *public* key naming the
-                # identity; the agent produces the signature at send time
-                # (`attach_client_auth`), which also discovers the identity and
-                # fails closed if it is not loaded.
-                security.client_signing_agent_socket = _resolve_ssh_agent_socket(raw)
-                key_entry = raw.get("ssh_key")
-                if not key_entry:
-                    raise SecurityConfigError(
-                        "client_auth = 'ssh' with ssh_agent = true requires "
-                        "[security] ssh_key (an OpenSSH public-key file or inline "
-                        "line selecting the agent identity)"
-                    )
-                if not isinstance(key_entry, str):
-                    raise SecurityConfigError("[security] ssh_key must be a string")
-                agent_public_key, agent_key_id = _load_agent_public_key(key_entry)
-                security.client_signing_agent_key_blob = ssh_public_blob(agent_public_key)
-                security.client_signing_agent_key_id = agent_key_id
-                security.client_signing_alg = alg_for_key(agent_public_key, ssh=True)
-            else:
-                raise SecurityConfigError(
-                    "client_auth = 'ssh' requires [security] ssh_signing_key, or "
-                    "ssh_agent = true with ssh_key"
-                )
-        elif security.client_auth == "x509":
-            cert_path = raw.get("client_cert")
-            key_path = raw.get("client_key")
-            if not cert_path or not key_path:
-                raise SecurityConfigError(
-                    "client_auth = 'x509' requires [security] client_cert and client_key"
-                )
-            security.client_signing_key = load_private_key_file(key_path)
-            security.client_signing_alg = alg_for_key(security.client_signing_key, ssh=False)
-            chain = list(parse_cert_chain_b64(_b64e(Path(cert_path).read_bytes())))
-            pem = "".join(c.public_bytes(_crypto().Encoding.PEM).decode() for c in chain)
-            security.client_cert_chain = chain
-            security.client_cert_b64 = _b64e(pem.encode())
-            leaf_public = chain[0].public_key().public_bytes(
-                _crypto().Encoding.DER, _crypto().PublicFormat.SubjectPublicKeyInfo
-            )
-            key_public = security.client_signing_key.public_key().public_bytes(
-                _crypto().Encoding.DER, _crypto().PublicFormat.SubjectPublicKeyInfo
-            )
-            if leaf_public != key_public:
-                raise SecurityConfigError("client_cert does not match client_key")
-            security.client_key_id = spki_fingerprint(chain[0].public_key())
-        if security.server_auth == "signature":
-            entries = raw.get("trusted_server_keys") or []
-            if not entries:
-                raise SecurityConfigError(
-                    "server_auth = 'signature' requires a non-empty [security] "
-                    "trusted_server_keys keyring"
-                )
-            security.trusted_server_keys = _load_ssh_keyring(entries)
 
     config["_security"] = security
     return security
 
 
 def attach_client_auth(request: dict, security: SecurityConfig) -> dict:
-    """Attach and sign the `client_auth` block on `request` (doc §6.4-§6.5).
+    """Attach the `client_auth` block on `request` (doc §6.4-§6.5).
 
-    The signature covers the canonical request with the (not yet present)
-    `signature` field removed, domain-separated per §6.4. Under mTLS the method
-    is `"transport"` and no signature is produced; the channel identity is the
-    credential.
-
-    For `ssh` the block carries `public_key`, the base64 of the OpenSSH wire
-    blob, so a server holding only a **fingerprint** allow-list can recompute
-    the fingerprint and verify the signature with the presented key (§8.2). The
-    key material is inside the signed transcript, so it cannot be swapped for
-    another key after signing.
-
-    With `ssh_agent` (doc §7.9) the same block is built from the configured
-    public key, but the signature is produced by the running agent over the
-    identical `signing_payload` transcript; the private key never enters this
-    process. Under `client_auth = "none"` the block is just `{"method": "none"}`
-    and no credential is carried.
+    There is nothing to sign any more: the block is a one-field marker naming
+    the mechanism. Under mTLS the method is `"transport"` and the credential is
+    the channel identity (the TLS client certificate); under the explicit
+    `client_auth = "none"` the block is `{"method": "none"}` and no credential
+    is carried at all. The server rejects any other method.
     """
     method = security.client_auth
-    if method == "transport":
-        request["client_auth"] = {"method": "transport"}
-        return request
-    if method == "none":
-        request["client_auth"] = {"method": "none"}
-        return request
-    if method == "ssh":
-        if security.client_signing_agent_socket:
-            block = {
-                "method": "ssh",
-                "alg": security.client_signing_alg,
-                "key_id": security.client_signing_agent_key_id,
-                "public_key": _b64e(security.client_signing_agent_key_blob),
-            }
-        else:
-            block = {
-                "method": "ssh",
-                "alg": security.client_signing_alg,
-                "key_id": ssh_fingerprint(security.client_signing_key.public_key()),
-                "public_key": _b64e(ssh_public_blob(security.client_signing_key.public_key())),
-            }
-    elif method == "x509":
-        block = {
-            "method": "x509",
-            "alg": security.client_signing_alg,
-            "key_id": security.client_key_id,
-            "cert": security.client_cert_b64,
-        }
-    else:  # pragma: no cover - validate_security_config guarantees the enum
+    if method not in ("transport", "none"):  # pragma: no cover - enum is validated
         raise AuthError(f"unknown client_auth method {method!r}")
-    request["client_auth"] = block
-    payload = signing_payload(request, "client_auth")
-    if method == "ssh" and security.client_signing_agent_socket:
-        agent_alg, signature = ssh_agent_sign(
-            security.client_signing_agent_socket,
-            security.client_signing_agent_key_id,
-            block["alg"],
-            payload,
-        )
-        if agent_alg != block["alg"]:
-            raise AuthError(
-                f"the SSH agent signed with {agent_alg!r}, expected {block['alg']!r}"
-            )
-        block["signature"] = _b64e(signature)
-    else:
-        block["signature"] = _b64e(
-            sign_bytes(security.client_signing_key, block["alg"], payload)
-        )
+    request["client_auth"] = {"method": method}
     return request
-
-
-def attach_server_auth(response: dict, security: SecurityConfig) -> dict:
-    """Attach and sign the `server_auth` block when `server_auth = "signature"`.
-
-    Under mTLS or `server_auth = "none"` the block is omitted: the channel or
-    the explicit operator choice is the authentication (doc §6.5).
-    """
-    if security.server_auth != "signature":
-        return response
-    block = {
-        "method": "signature",
-        "alg": security.server_signing_alg,
-        "key_id": security.server_key_id,
-    }
-    response["server_auth"] = block
-    block["signature"] = _b64e(
-        sign_bytes(security.server_signing_key, block["alg"], signing_payload(response, "server_auth"))
-    )
-    return response
 
 
 def authenticate_request(
     request: dict,
     security: SecurityConfig,
     *,
-    peer_cert_der: Optional[bytes] = None,
+    peer_cert_der: bytes | None = None,
 ) -> str:
     """Verify the requester credential on `request`; return the verified identity.
 
-    This is *authentication only*: proving the requester holds the key or the
-    certificate. Whether that identity may use the mechanism is decided
-    separately by `authorize_request` against the `[acl]` (doc §8); a valid
-    signature on an unlisted key is therefore necessary but never sufficient.
+    This is *authentication only*: proving the requester holds the certificate
+    the mTLS handshake accepted. Whether that identity may use the mechanism is
+    decided separately by `authorize_request` against the `[acl]` (doc §8); an
+    accepted handshake on an unlisted certificate is therefore necessary but
+    never sufficient.
 
     Fails closed (`AuthError`) on a missing block, a method that does not match
-    the configured `client_auth`, an absent/unknown `alg`, a `key_id` that does
-    not match the presented key, an unverifiable chain, or a bad signature.
+    the configured `client_auth`, or `client_auth = "transport"` without mTLS.
     There is no branch that returns success without verifying (doc §7.3).
 
-    For `ssh` the public key material is taken from the signed `public_key`
-    field and the returned identity is its recomputed `SHA256:` fingerprint:
-    the server no longer needs a keyring to authenticate. For `transport` the
-    mTLS handshake already verified the chain; when the peer certificate is
-    available its leaf SPKI fingerprint is returned so `mode = "list"` can pin
-    it (review log NF6). For `none` there is no credential to check: the method
-    can only match when `security.client_auth == "none"` (enforced just below),
-    and the fixed `NONE_IDENTITY` sentinel is returned. The ACL still runs and
-    must be the matching `"none"` mode.
+    For `transport` the mTLS handshake already verified the chain; the leaf SPKI
+    fingerprint is returned so `mode = "list"` can pin it (review log NF6). For
+    `none` there is no credential to check: the method can only match when
+    `security.client_auth == "none"` (enforced just below), and the fixed
+    `NONE_IDENTITY` sentinel is returned. The ACL still runs and must be the
+    matching `"none"` mode.
     """
     block = request.get("client_auth")
     if not isinstance(block, dict):
@@ -1426,51 +1289,12 @@ def authenticate_request(
         # to verify. The pairing with `acl.mode = "none"` is enforced by
         # `build_security` (and again by `authorize_request`).
         return NONE_IDENTITY
-    if method == "transport":
-        if security.transport_encryption != "mtls":
-            raise AuthError("client_auth = 'transport' requires transport_encryption = 'mtls'")
-        if peer_cert_der:
-            leaf = _load_der_cert(peer_cert_der)
-            return spki_fingerprint(leaf.public_key())
-        return "transport"
-
-    alg = block.get("alg")
-    if not isinstance(alg, str) or not alg:
-        raise AuthError("absent or invalid client_auth.alg")
-    allowed = SSH_SIGNATURE_ALGS if method == "ssh" else X509_SIGNATURE_ALGS
-    if alg not in allowed:
-        raise AuthError(f"unknown client_auth.alg {alg!r}")
-    signature = block.get("signature")
-    if not isinstance(signature, str) or not signature:
-        raise AuthError("missing client_auth.signature")
-    payload = signing_payload(request, "client_auth")
-
-    if method == "ssh":
-        # Verify with the *presented* key, then return its fingerprint. The
-        # caller must still authorize that fingerprint against the ACL; a key is
-        # never trusted merely because it verified a signature.
-        public_key = _presented_ssh_public_key(block)
-        fingerprint = ssh_fingerprint(public_key)
-        key_id = block.get("key_id")
-        if not secure_equals(key_id, fingerprint):
-            raise AuthError("client_auth.key_id does not match the presented public key")
-        verify_bytes(public_key, alg, payload, _b64d(signature))
-        return fingerprint
-
-    # x509: parse the chain, verify it to the configured CA + EKU, pin the SPKI,
-    # then verify the request signature with the leaf key.
-    cert_b64 = block.get("cert")
-    if not isinstance(cert_b64, str) or not cert_b64:
-        raise AuthError("missing client_auth.cert for x509")
-    chain = parse_cert_chain_b64(cert_b64)
-    leaf = verify_x509_chain(
-        chain, _load_trusted_ca_certs(security.ca_file), security.client_required_oid
-    )
-    expected = spki_fingerprint(leaf.public_key())
-    if block.get("key_id") != expected:
-        raise AuthError("client_auth.key_id does not match the certificate SPKI")
-    verify_bytes(leaf.public_key(), alg, payload, _b64d(signature))
-    return expected
+    if security.transport_encryption != "mtls":
+        raise AuthError("client_auth = 'transport' requires transport_encryption = 'mtls'")
+    if peer_cert_der:
+        leaf = _load_der_cert(peer_cert_der)
+        return spki_fingerprint(leaf.public_key())
+    return "transport"
 
 
 def _check_response_freshness(response: dict, security: SecurityConfig) -> None:
@@ -1492,15 +1316,17 @@ def verify_response(
     response: dict,
     request: dict,
     security: SecurityConfig,
-    consumed_nonces: Optional[set] = None,
+    consumed_nonces: set | None = None,
 ) -> str:
     """Verify an `auth_response` against the request and return the decision.
 
     Checks, in order: the response envelope, the nonce echo, the
-    `request_digest`, the decision, the freshness window, and — when
-    `server_auth = "signature"` — the `server_auth` signature against the pinned
-    keyring. `consumed_nonces` (if given) enforces the client's single-use nonce:
-    the second response for a nonce is rejected (doc §6.6, review log S9).
+    `request_digest`, the decision and the freshness window. The response is
+    authenticated by the mTLS channel when `server_auth = "transport"`; with the
+    explicit `server_auth = "none"` nothing authenticates it, which is exactly
+    what that setting asks for (and why it warns). `consumed_nonces` (if given)
+    enforces the client's single-use nonce: the second response for a nonce is
+    rejected (doc §6.6, review log S9).
     """
     validate_envelope(response, "auth_response")
     nonce = response.get("nonce")
@@ -1514,24 +1340,6 @@ def verify_response(
     if decision not in ("allow", "deny"):
         raise ProtocolError("missing or invalid 'decision'")
     _check_response_freshness(response, security)
-
-    if security.server_auth == "signature":
-        block = response.get("server_auth")
-        if not isinstance(block, dict):
-            raise AuthError("server_auth block is missing")
-        if block.get("method") != "signature":
-            raise AuthError(f"unexpected server_auth method {block.get('method')!r}")
-        alg = block.get("alg")
-        if not isinstance(alg, str) or alg not in SSH_SIGNATURE_ALGS:
-            raise AuthError(f"unknown or absent server_auth.alg {alg!r}")
-        key_id = block.get("key_id")
-        public_key = security.trusted_server_keys.get(key_id) if isinstance(key_id, str) else None
-        if public_key is None:
-            raise AuthError(f"server key {key_id!r} is not in the trusted keyring")
-        signature = block.get("signature")
-        if not isinstance(signature, str) or not signature:
-            raise AuthError("missing server_auth.signature")
-        verify_bytes(public_key, alg, signing_payload(response, "server_auth"), _b64d(signature))
 
     if consumed_nonces is not None:
         if nonce in consumed_nonces:
@@ -1562,9 +1370,15 @@ def expand_socket_path(path: str) -> str:
                 result = subprocess.run(
                     ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True
                 )
-                runtime_dir = result.stdout.strip() if result.returncode == 0 else "/tmp"
+                # `/tmp` is the documented macOS user-temp fallback when getconf
+                # cannot answer. Nothing sensitive is created here -- the path
+                # only ever holds this service's socket.
+                if result.returncode == 0:
+                    runtime_dir = result.stdout.strip()
+                else:
+                    runtime_dir = "/tmp"  # noqa: S108 -- macOS user-temp fallback
             except OSError:
-                runtime_dir = "/tmp"
+                runtime_dir = "/tmp"  # noqa: S108 -- getconf unavailable
         else:
             runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         return os.path.join(runtime_dir, path[3:])
@@ -1595,8 +1409,10 @@ def _positive_int(value: object, default: int) -> int:
     the cap into "refuse everything"; it falls back to the safe default (audit
     A3). The generated TOML always emits a positive int.
     """
+    if isinstance(value, bool) or value is None:
+        return default
     try:
-        parsed = int(value)
+        parsed = int(value)  # type: ignore[arg-type]  # runtime-guarded above
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
@@ -1608,8 +1424,10 @@ def _positive_float(value: object, default: float) -> float:
     Like `_positive_int`: a non-positive or malformed `server_read_timeout`
     falls back to the default rather than disabling the bound (audit A3).
     """
+    if isinstance(value, bool) or value is None:
+        return default
     try:
-        parsed = float(value)
+        parsed = float(value)  # type: ignore[arg-type]  # runtime-guarded above
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
@@ -1640,6 +1458,22 @@ def _load_x509():
     return _x509
 
 
+def _require_x509():
+    """Return the `cryptography.x509` module or raise (never return None).
+
+    `cryptography` is the one third-party dependency and is supplied by the
+    package's Python environment (`python3.withPackages`, see
+    `nix/packages/sudo-auth-proxy.nix`), so it is present at runtime; the
+    language server simply cannot see into that environment. Centralising the
+    "is it importable at all" decision here keeps the call sites free of
+    Optional handling.
+    """
+    x509_module = _load_x509()
+    if x509_module is None:  # pragma: no cover - deployment-dependent
+        raise AuthError("the cryptography library is required for certificate verification")
+    return x509_module
+
+
 # --- cryptographic primitives (doc §7) ------------------------------------
 #
 # `cryptography` is imported lazily, like x509 above: it is a Rust extension
@@ -1656,87 +1490,31 @@ def _crypto() -> types.SimpleNamespace:
     if _crypto_ns is None:
         try:
             from cryptography import x509 as x509_mod
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric import (
-                ec,
-                ed25519,
-                padding,
-                rsa,
-            )
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
             from cryptography.hazmat.primitives.serialization import (
                 Encoding,
-                NoEncryption,
-                PrivateFormat,
                 PublicFormat,
             )
         except ImportError as error:  # pragma: no cover - deployment-dependent
             raise AuthError(
-                "the cryptography library is required for authentication"
+                "the cryptography library is required for certificate verification"
             ) from error
         _crypto_ns = types.SimpleNamespace(
             x509=x509_mod,
             hashes=hashes,
-            serialization=serialization,
             ec=ec,
             ed25519=ed25519,
-            padding=padding,
             rsa=rsa,
             Encoding=Encoding,
-            NoEncryption=NoEncryption,
-            PrivateFormat=PrivateFormat,
             PublicFormat=PublicFormat,
         )
     return _crypto_ns
 
 
 def _b64e(data: bytes) -> str:
-    """Encode bytes as standard base64 (the wire form for all binary fields)."""
+    """Encode bytes as standard base64 (used for certificate fingerprints)."""
     return base64.b64encode(data).decode("ascii")
-
-
-def _b64d(text: str) -> bytes:
-    """Decode a base64 field or raise `AuthError` (never return garbage)."""
-    try:
-        return base64.b64decode(text, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise AuthError("invalid base64 in a signature or certificate field") from error
-
-
-def _ssh_string(data: bytes) -> bytes:
-    """An SSH wire `string`: 4-byte big-endian length, then the bytes."""
-    return struct.pack(">I", len(data)) + data
-
-
-def _ssh_mpint(value: int) -> bytes:
-    """An SSH wire `mpint`: big-endian two's-complement, minimal, zero-prefixed."""
-    if value == 0:
-        return struct.pack(">I", 0)
-    raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
-    if raw[0] & 0x80:
-        raw = b"\x00" + raw
-    return _ssh_string(raw)
-
-
-def ssh_public_blob(public_key) -> bytes:
-    """Encode an Ed25519/RSA public key as an SSH wire-format blob."""
-    c = _crypto()
-    if isinstance(public_key, c.ed25519.Ed25519PublicKey):
-        raw = public_key.public_bytes(c.Encoding.Raw, c.PublicFormat.Raw)
-        return _ssh_string(b"ssh-ed25519") + _ssh_string(raw)
-    if isinstance(public_key, c.rsa.RSAPublicKey):
-        numbers = public_key.public_numbers()
-        return _ssh_string(b"ssh-rsa") + _ssh_mpint(numbers.e) + _ssh_mpint(numbers.n)
-    raise AuthError("unsupported SSH public key type")
-
-
-def ssh_fingerprint(public_key) -> str:
-    """`SHA256:` fingerprint of an SSH key, with trailing `=` padding stripped.
-
-    This is exactly `ssh-keygen -lf`'s `SHA256:...` value: the SHA-256 of the
-    *decoded* SSH wire blob, base64-encoded, no padding.
-    """
-    digest = hashlib.sha256(ssh_public_blob(public_key)).digest()
-    return "SHA256:" + _b64e(digest).rstrip("=")
 
 
 def spki_fingerprint(public_key) -> str:
@@ -1744,300 +1522,6 @@ def spki_fingerprint(public_key) -> str:
     c = _crypto()
     der = public_key.public_bytes(c.Encoding.DER, c.PublicFormat.SubjectPublicKeyInfo)
     return "SHA256:" + _b64e(hashlib.sha256(der).digest()).rstrip("=")
-
-
-def parse_openssh_public_key(text: str) -> tuple:
-    """Parse an OpenSSH public-key line into `(public_key, key_id)`.
-
-    The fingerprint is computed over the decoded base64 blob (the SSH wire
-    encoding), matching `ssh-keygen -lf`. A malformed line raises `AuthError`.
-    """
-    c = _crypto()
-    parts = text.strip().split()
-    if len(parts) < 2:
-        raise AuthError("malformed OpenSSH public key line")
-    try:
-        blob = base64.b64decode(parts[1], validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise AuthError("malformed OpenSSH public key base64") from error
-    try:
-        public_key = c.serialization.load_ssh_public_key(
-            f"{parts[0]} {parts[1]}".encode()
-        )
-    except Exception as error:
-        raise AuthError(f"cannot parse OpenSSH public key: {error}") from error
-    return public_key, "SHA256:" + _b64e(hashlib.sha256(blob).digest()).rstrip("=")
-
-
-def load_ssh_public_key_blob(blob: bytes):
-    """Load an SSH public key from its binary OpenSSH wire blob.
-
-    `cryptography`'s `load_ssh_public_key` only accepts the textual one-line
-    form, so the key type is read from the blob's first SSH string and the line
-    is reconstructed. The blob is the exact byte string whose SHA-256 is the
-    `key_id`/fingerprint, which is why the client sends it verbatim.
-    """
-    if len(blob) < 4:
-        raise AuthError("SSH public-key blob is too short")
-    (length,) = struct.unpack(">I", blob[:4])
-    if length <= 0 or 4 + length > len(blob):
-        raise AuthError("SSH public-key blob has an invalid key-type length")
-    try:
-        key_type = blob[4 : 4 + length].decode("ascii")
-    except UnicodeDecodeError as error:
-        raise AuthError("SSH public-key blob key type is not ASCII") from error
-    c = _crypto()
-    try:
-        return c.serialization.load_ssh_public_key(
-            f"{key_type} {_b64e(blob)}".encode()
-        )
-    except Exception as error:
-        raise AuthError(f"cannot parse presented SSH public key: {error}") from error
-
-
-def _presented_ssh_public_key(block: dict):
-    """Decode `client_auth.public_key` and load the presented SSH key.
-
-    A missing or malformed field raises `AuthError`; there is no keyring
-    fallback, so a Phase-3 client that did not send its key material fails
-    closed rather than being silently accepted.
-    """
-    encoded = block.get("public_key")
-    if not isinstance(encoded, str) or not encoded:
-        raise AuthError("missing client_auth.public_key for ssh")
-    try:
-        blob = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise AuthError("client_auth.public_key is not valid base64") from error
-    return load_ssh_public_key_blob(blob)
-
-
-def load_private_key_file(path: str):
-    """Load an Ed25519/RSA private key from an OpenSSH or PEM file.
-
-    OpenSSH is tried first (the requester key is usually an SSH key), then PEM
-    (the host signing key / x509 client key are usually PEM). A failure raises
-    `AuthError`; there is no "continue without a key" branch.
-    """
-    c = _crypto()
-    try:
-        data = Path(path).read_bytes()
-    except OSError as error:
-        raise SecurityConfigError(f"cannot read private key {path}: {error}") from error
-    try:
-        return c.serialization.load_ssh_private_key(data, password=None)
-    except Exception:
-        try:
-            return c.serialization.load_pem_private_key(data, password=None)
-        except Exception as error:
-            raise AuthError(f"cannot load private key {path}: {error}") from error
-
-
-def alg_for_key(key, *, ssh: bool) -> str:
-    """Pick the signature algorithm name for a key (Ed25519 preferred, RSA SHA-256)."""
-    c = _crypto()
-    if isinstance(key, (c.ed25519.Ed25519PrivateKey, c.ed25519.Ed25519PublicKey)):
-        return "ssh-ed25519" if ssh else "ed25519"
-    if isinstance(key, (c.rsa.RSAPrivateKey, c.rsa.RSAPublicKey)):
-        return "rsa-sha2-256"
-    raise AuthError("unsupported key type for signing")
-
-
-def _rsa_hash(alg: str):
-    c = _crypto()
-    if alg == "rsa-sha2-256":
-        return c.hashes.SHA256()
-    if alg == "rsa-sha2-512":
-        return c.hashes.SHA512()
-    raise AuthError(f"unknown RSA algorithm {alg!r}")
-
-
-def sign_bytes(private_key, alg: str, data: bytes) -> bytes:
-    """Sign `data` using the named algorithm and key.
-
-    Ed25519 signs the bytes directly; RSA uses PKCS#1 v1.5 with SHA-256/512.
-    An unknown algorithm or a key/algorithm mismatch raises `AuthError`.
-    """
-    c = _crypto()
-    if alg in ("ssh-ed25519", "ed25519"):
-        if not isinstance(private_key, c.ed25519.Ed25519PrivateKey):
-            raise AuthError("algorithm/key mismatch: ed25519 algorithm with non-Ed25519 key")
-        return private_key.sign(data)
-    if alg in ("rsa-sha2-256", "rsa-sha2-512"):
-        if not isinstance(private_key, c.rsa.RSAPrivateKey):
-            raise AuthError("algorithm/key mismatch: RSA algorithm with non-RSA key")
-        return private_key.sign(data, c.padding.PKCS1v15(), _rsa_hash(alg))
-    raise AuthError(f"unknown signature algorithm {alg!r}")
-
-
-def verify_bytes(public_key, alg: str, data: bytes, signature: bytes) -> None:
-    """Verify a signature, raising `AuthError` on any failure.
-
-    Unknown/absent `alg` and key/algorithm mismatches raise too: the verifier
-    never falls back to a weaker check or skips the signature (review log NF1).
-    """
-    c = _crypto()
-    if alg in ("ssh-ed25519", "ed25519"):
-        if not isinstance(public_key, c.ed25519.Ed25519PublicKey):
-            raise AuthError("algorithm/key mismatch: ed25519 algorithm with non-Ed25519 key")
-        try:
-            public_key.verify(signature, data)
-        except Exception as error:
-            raise AuthError("signature verification failed") from error
-        return
-    if alg in ("rsa-sha2-256", "rsa-sha2-512"):
-        if not isinstance(public_key, c.rsa.RSAPublicKey):
-            raise AuthError("algorithm/key mismatch: RSA algorithm with non-RSA key")
-        try:
-            public_key.verify(signature, data, c.padding.PKCS1v15(), _rsa_hash(alg))
-        except Exception as error:
-            raise AuthError("signature verification failed") from error
-        return
-    raise AuthError(f"unknown signature algorithm {alg!r}")
-
-
-# --- SSH agent signing (doc §7.9) -----------------------------------------
-#
-# `client_auth = "ssh"` may delegate signing to a running SSH agent instead of
-# reading a private key file. The protocol is the standard length-prefixed agent
-# framing over AF_UNIX; every read is bounded (`SSH_AGENT_MAX_RESPONSE`) and the
-# socket carries `SSH_AGENT_TIMEOUT`, so a hostile or hung agent fails closed
-# rather than stalling `sudo` or exhausting memory.
-
-
-def _ssh_agent_recv_exact(sock, count: int) -> bytes:
-    """Read exactly `count` bytes from `sock`, failing closed on early EOF."""
-    buffer = bytearray()
-    while len(buffer) < count:
-        chunk = sock.recv(count - len(buffer))
-        if not chunk:
-            raise AuthError("SSH agent closed the connection before replying")
-        buffer += chunk
-    return bytes(buffer)
-
-
-def _ssh_agent_exchange(socket_path: str, payload: bytes) -> bytes:
-    """Send one length-prefixed SSH agent message and return the response body.
-
-    The agent protocol frames every message as a `uint32` big-endian length plus
-    that many payload bytes. The declared response length is checked *before*
-    the body is read, so a broken/hostile agent cannot force an unbounded
-    allocation; the socket timeout bounds a hung one. Any `OSError` (including
-    `socket.timeout` and a refused/missing socket) is turned into `AuthError`.
-    """
-    request = struct.pack(">I", len(payload)) + payload
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(SSH_AGENT_TIMEOUT)
-            sock.connect(socket_path)
-            sock.sendall(request)
-            (length,) = struct.unpack(">I", _ssh_agent_recv_exact(sock, 4))
-            if length > SSH_AGENT_MAX_RESPONSE:
-                raise AuthError(
-                    f"SSH agent response of {length} bytes exceeds the "
-                    f"{SSH_AGENT_MAX_RESPONSE}-byte limit"
-                )
-            return _ssh_agent_recv_exact(sock, length)
-    except AuthError:
-        raise
-    except OSError as error:
-        raise AuthError(
-            f"cannot talk to the SSH agent at {socket_path}: {error}"
-        ) from error
-
-
-def _ssh_agent_read_string(payload: bytes, offset: int) -> tuple:
-    """Read one SSH wire `string` from `payload` at `offset` (bounds-checked)."""
-    if offset + 4 > len(payload):
-        raise AuthError("truncated SSH agent message")
-    (length,) = struct.unpack(">I", payload[offset : offset + 4])
-    offset += 4
-    if length > len(payload) - offset:
-        raise AuthError("truncated SSH agent string")
-    return payload[offset : offset + length], offset + length
-
-
-def _ssh_agent_signature_alg(agent_alg: str) -> str:
-    """Map the agent's signature algorithm to a verifier wire value (doc §7.7).
-
-    Only the non-SHA-1 names the server accepts are allowed. An agent that
-    answers with `ssh-rsa` (SHA-1) is rejected explicitly rather than accepted
-    as a downgrade.
-    """
-    if agent_alg in SSH_SIGNATURE_ALGS:
-        return agent_alg
-    if agent_alg == "ssh-rsa":
-        raise AuthError("the SSH agent returned a SHA-1 ('ssh-rsa') signature; refusing")
-    raise AuthError(f"unsupported SSH agent signature algorithm {agent_alg!r}")
-
-
-def _ssh_agent_find_key(socket_path: str, expected_key_id: str) -> bytes:
-    """Return the loaded agent identity whose fingerprint is `expected_key_id`.
-
-    Lists the agent's identities and matches the configured `SHA256:`
-    fingerprint. An agent that refuses, answers with an unexpected type, or does
-    not hold the configured key raises `AuthError` (fail closed): the client
-    must never silently fall back to another identity.
-    """
-    answer = _ssh_agent_exchange(socket_path, bytes([SSH_AGENTC_REQUEST_IDENTITIES]))
-    if not answer:
-        raise AuthError("empty SSH agent identities answer")
-    if answer[0] == SSH_AGENT_FAILURE:
-        raise AuthError("the SSH agent refused to list its identities")
-    if answer[0] != SSH_AGENT_IDENTITIES_ANSWER:
-        raise AuthError(
-            f"unexpected SSH agent response {answer[0]} to a list-identities request"
-        )
-    if len(answer) < 5:
-        raise AuthError("truncated SSH agent identities answer")
-    (count,) = struct.unpack(">I", answer[1:5])
-    offset = 5
-    for _ in range(count):
-        key_blob, offset = _ssh_agent_read_string(answer, offset)
-        _comment, offset = _ssh_agent_read_string(answer, offset)
-        try:
-            fingerprint = ssh_fingerprint(load_ssh_public_key_blob(key_blob))
-        except AuthError:
-            continue
-        if secure_equals(fingerprint, expected_key_id):
-            return key_blob
-    raise AuthError(f"the SSH agent does not hold the configured key {expected_key_id}")
-
-
-def ssh_agent_sign(
-    socket_path: str, expected_key_id: str, alg: str, data: bytes
-) -> tuple:
-    """Sign `data` with the SSH agent identity matching `expected_key_id`.
-
-    Returns `(wire_alg, signature)`, where `wire_alg` is the verifier's name for
-    the algorithm the agent used. `data` is the domain-separated
-    `signing_payload` transcript. RSA is asked for SHA-256
-    (`SSH_AGENT_RSA_SHA2_256`), matching the file-based path; Ed25519 needs no
-    flag. A refusal, a malformed answer, or a SHA-1 signature raises `AuthError`.
-    """
-    key_blob = _ssh_agent_find_key(socket_path, expected_key_id)
-    flags = SSH_AGENT_RSA_SHA2_256 if alg in ("rsa-sha2-256", "rsa-sha2-512") else 0
-    request = (
-        bytes([SSH_AGENTC_SIGN_REQUEST])
-        + _ssh_string(key_blob)
-        + _ssh_string(data)
-        + struct.pack(">I", flags)
-    )
-    answer = _ssh_agent_exchange(socket_path, request)
-    if not answer:
-        raise AuthError("empty SSH agent sign response")
-    if answer[0] == SSH_AGENT_FAILURE:
-        raise AuthError("the SSH agent refused to sign the request")
-    if answer[0] != SSH_AGENT_SIGN_RESPONSE:
-        raise AuthError(f"unexpected SSH agent response {answer[0]} to a sign request")
-    signature_blob, _ = _ssh_agent_read_string(answer, 1)
-    agent_alg, offset = _ssh_agent_read_string(signature_blob, 0)
-    signature, _ = _ssh_agent_read_string(signature_blob, offset)
-    try:
-        agent_alg_text = agent_alg.decode("ascii")
-    except UnicodeDecodeError as error:
-        raise AuthError("SSH agent signature algorithm is not ASCII") from error
-    return _ssh_agent_signature_alg(agent_alg_text), signature
 
 
 def _cert_is_ca(cert) -> bool:
@@ -2050,7 +1534,7 @@ def _cert_is_ca(cert) -> bool:
     return bool(constraints.ca)
 
 
-def _cert_path_length(cert) -> Optional[int]:
+def _cert_path_length(cert) -> int | None:
     """The BasicConstraints `path_length`, or None when unset/unreadable."""
     c = _crypto()
     try:
@@ -2133,22 +1617,6 @@ def _verify_cert_signed_by(child, issuer_public_key) -> None:
         raise
     except Exception as error:
         raise AuthError("certificate signature verification failed") from error
-
-
-def parse_cert_chain_b64(pem_b64: str) -> list:
-    """Decode a base64-encoded PEM bundle (leaf first) into certificates."""
-    c = _crypto()
-    try:
-        pem = base64.b64decode(pem_b64, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise AuthError("client certificate is not valid base64") from error
-    try:
-        certs = c.x509.load_pem_x509_certificates(pem)
-    except Exception as error:
-        raise AuthError(f"cannot parse client certificate chain: {error}") from error
-    if not certs:
-        raise AuthError("empty client certificate chain")
-    return certs
 
 
 def _load_trusted_ca_certs(ca_file: str) -> list:
@@ -2234,7 +1702,7 @@ def verify_x509_chain(chain: list, ca_certs: list, required_oid: str, *, max_dep
 
 
 def _cert_has_oid(cert: "x509.Certificate", oid: str) -> bool:
-    x509 = _load_x509()
+    x509 = _require_x509()
     try:
         ekus = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
         return any(eku.dotted_string == oid for eku in ekus)
@@ -2243,9 +1711,7 @@ def _cert_has_oid(cert: "x509.Certificate", oid: str) -> bool:
 
 
 def verify_cert_file(path: str, oid: str, label: str) -> None:
-    x509 = _load_x509()
-    if x509 is None:
-        raise RuntimeError("cryptography library is required for OID verification")
+    x509 = _require_x509()
     with open(path, "rb") as f:
         cert = x509.load_pem_x509_certificate(f.read())
     if not _cert_has_oid(cert, oid):
@@ -2253,9 +1719,7 @@ def verify_cert_file(path: str, oid: str, label: str) -> None:
 
 
 def verify_cert_der(der: bytes, oid: str, label: str) -> None:
-    x509 = _load_x509()
-    if x509 is None:
-        raise RuntimeError("cryptography library is required for OID verification")
+    x509 = _require_x509()
     cert = x509.load_der_x509_certificate(der)
     if not _cert_has_oid(cert, oid):
         raise ValueError(f"{label} certificate missing required EKU OID {oid}")
@@ -2406,7 +1870,7 @@ def build_confirmation(
     label: str,
     request: dict,
     transport: str,
-    now: Optional[float] = None,
+    now: float | None = None,
 ) -> Confirmation:
     """Assemble and sanitise the context shown to the approver (doc §11.1).
 
@@ -2437,31 +1901,62 @@ def build_confirmation(
     )
 
 
-def confirmation_message(confirmation: Confirmation) -> str:
-    """Render the human-readable context block for a confirmation dialog.
+def confirmation_summary(confirmation: Confirmation) -> str:
+    """Render the condensed prompt shown by default (doc §11.4).
 
-    Every interpolated value has already been sanitised by
-    :func:`build_confirmation`; this function only arranges literals, so it can
-    never introduce attacker-controlled text. The command/argv is not shown:
-    it is spoofable and is not part of the protocol at all (doc §5.4, §11.1).
+    Two short lines: who is asking for what, and where it lands. Everything
+    else — tty, cwd, request id, timestamp, the verified fingerprint behind a
+    configured label — is *context*, not a decision input, so it moves to
+    :func:`confirmation_message` and is reached through the dialog's expand
+    affordance (or the server log) instead of being dumped at the approver.
+
+    The requester line degrades explicitly for an unauthenticated request
+    rather than printing the raw `NONE_IDENTITY` sentinel.
     """
     requester = confirmation.label or confirmation.identity
-    if confirmation.identity and requester != confirmation.identity:
-        requester = f"{requester} ({confirmation.identity})"
+    if confirmation.identity in ("", NONE_IDENTITY):
+        requester = "Unauthenticated requester"
+    where = confirmation.peer or "unknown peer"
+    if confirmation.rhost and confirmation.rhost != confirmation.peer:
+        where = f"{where} (from {confirmation.rhost})"
+    return "\n".join(
+        [
+            f"{requester} requests {confirmation.target_user} via {confirmation.service}",
+            f"on {where} ({confirmation.transport})",
+        ]
+    )
+
+
+def confirmation_message(confirmation: Confirmation) -> str:
+    """Render the full, field-labelled context block for a confirmation dialog.
+
+    This is the *detailed* view (doc §11.4): the label/value rows behind the
+    dialog's expand affordance, and the same text the server logs. Every
+    interpolated value has already been sanitised by :func:`build_confirmation`;
+    this function only arranges literals, so it can never introduce
+    attacker-controlled text. The command/argv is not shown: it is spoofable and
+    is not part of the protocol at all (doc §5.4, §11.1).
+    """
+    requester = confirmation.label or confirmation.identity
+    if confirmation.identity in ("", NONE_IDENTITY):
+        requester = "Unauthenticated requester"
+        identity = "unverified (client_auth = none)"
+    else:
+        identity = confirmation.identity or "unknown"
     lines = [
-        f"Privilege elevation requested on {confirmation.peer}.",
-        f"Requester: {requester}",
-        f"User: {confirmation.invoking_user} -> {confirmation.target_user}",
-        f"Service: {confirmation.service}",
-        f"TTY: {confirmation.tty}",
+        f"Requester  {requester}",
+        f"Identity   {identity}",
+        f"Request    {confirmation.invoking_user} -> {confirmation.target_user} via {confirmation.service}",
+        f"Peer       {confirmation.peer}",
+        f"Transport  {confirmation.transport}",
     ]
     if confirmation.rhost:
-        lines.append(f"Remote: {confirmation.rhost}")
-    lines.append(f"CWD: {confirmation.cwd}")
-    lines.append(
-        f"Request: {confirmation.request_id} "
-        f"({confirmation.timestamp}, {confirmation.transport})"
-    )
+        lines.append(f"Remote     {confirmation.rhost}")
+    if confirmation.tty:
+        lines.append(f"TTY        {confirmation.tty}")
+    if confirmation.cwd:
+        lines.append(f"CWD        {confirmation.cwd}")
+    lines.append(f"Request id {confirmation.request_id} ({confirmation.timestamp})")
     return "\n".join(lines)
 
 
@@ -2471,22 +1966,85 @@ def confirmation_message(confirmation: Confirmation) -> str:
 # two modal windows on the approver's desktop and makes the T11 wording true.
 _dialog_lock = threading.Lock()
 
+# The Details affordance on zenity (doc §11.4). zenity's extra button exits with
+# the **cancellation** code (1 in 3.x and 4.x: zenity's `util.c` keeps it "for
+# backwards compatibility with zenity <= 3.x"), so the exit code alone cannot
+# tell "show me more" from "deny" -- which is why this backend used to get the
+# summary with no way to expand it. What *is* unambiguous: zenity prints the
+# extra button's label on stdout when it is pressed and prints nothing for
+# OK/Cancel, so the label is the signal. That is the same stdout-based trick the
+# osascript path already uses for its three buttons.
+ZENITY_DETAILS_LABEL = "Details"
+
+# Explicit dialog width, in pixels (doc §11.4). zenity's own default is to wrap
+# the label at 60 characters (`gtk_label_set_max_width_chars (text, 60)` in its
+# `msg.c`), so the two-line summary and the ten-line field block both come out as
+# a narrow column -- taller than it is wide, which reads as a cramped prompt. A
+# width makes the text widget request that many pixels, so fewer lines wrap and
+# the dialog grows sideways instead of downwards; `--height` is deliberately not
+# passed, so it still fits its content. 520 matches the swiftDialog layout on
+# macOS, so both backends look like the same prompt.
+ZENITY_DIALOG_WIDTH = 520
+
+# Bound on the one-shot capability probe below. A prompt must never depend on a
+# subprocess that can hang: without a bound, a wedged `zenity --help-all` would
+# stall the PAM hook (the guest would see `unavailable`) instead of falling back
+# to the summary-only dialog.
+ZENITY_PROBE_TIMEOUT = 5.0
+_zenity_extra_button_support: bool | None = None
+
+
+def zenity_supports_extra_button() -> bool:
+    """Whether the `zenity` on PATH accepts `--extra-button` (probed once).
+
+    `--extra-button` exists in both zenity 3.x and 4.x, but the prompt must not
+    *depend* on it: an unknown option makes zenity exit non-zero with nothing on
+    stdout, which this module reads as a deny, so a backend without the flag
+    would deny every request. Probing keeps that case at today's behaviour (the
+    summary alone, the field block in the log) instead of a silent denial.
+
+    The answer is cached for the life of the process: the server is long-lived
+    and shows many prompts, while the client never shows a dialog at all. Any
+    failure to run zenity -- absent, not executable, or wedged -- counts as
+    "no", which degrades to exactly the old prompt rather than failing it.
+    """
+    global _zenity_extra_button_support
+    if _zenity_extra_button_support is None:
+        try:
+            probe = subprocess.run(
+                ["zenity", "--help-all"],
+                capture_output=True,
+                timeout=ZENITY_PROBE_TIMEOUT,
+            )
+            _zenity_extra_button_support = b"--extra-button" in probe.stdout
+        except (OSError, subprocess.SubprocessError):
+            _zenity_extra_button_support = False
+    return _zenity_extra_button_support
+
 
 def prompt_for_confirmation(confirmation: Confirmation, dialog_program: str) -> bool:
     """Ask the user to authorize a privilege-elevation request. Returns True if approved.
 
     `confirmation` carries only sanitised fields (doc §11.2) and `dialog_program`
     picks the confirmation mechanism explicitly (one of "swiftdialog",
-    "osascript", "zenity") -- set via config, not auto-detected. Each backend
-    renders the same context safely:
+    "osascript", "zenity") -- set via config, not auto-detected.
 
-    - ``zenity``: fields are separate argv entries (never a shell string) and
-      ``--no-markup`` disables Pango markup (doc §11.2).
-    - ``osascript``: the whole message is JSON-encoded (``json.dumps``) before
-      it is embedded in the AppleScript source, so quoting/newlines cannot break
-      out (doc §11.2).
-    - ``swiftdialog``: the message is markup-escaped *after* the allow-list pass
-      (review log NF2).
+    The prompt is shown as a two-line summary (doc §11.4). The full field block
+    stays reachable, never in the approver's face:
+
+    - ``swiftdialog``: summary in ``--message``, the details behind an info
+      button (``--info`` + ``--infobuttontext``).
+    - ``osascript``: summary with a third ``Details`` button that opens a second
+      dialog; the button pressed is read from stdout, so ``Details`` can never be
+      mistaken for a decision.
+    - ``zenity``: summary with a ``Details`` extra button when the installed
+      zenity accepts one (probed; see `zenity_supports_extra_button`). Pressing
+      it opens a second dialog showing the block, and only an explicit
+      ``Authorize`` there allows. The button is identified by the label zenity
+      prints on **stdout**, because its exit code for an extra button is the
+      cancellation code -- so like the osascript path, ``Details`` can never be
+      mistaken for a decision. Without the extra button the prompt is the
+      summary alone and the block stays in the server log (``debug = true``).
 
     Prompts are serialised by `_dialog_lock`, so one dialog is shown at a time
     (doc §11.3, T11; audit A13). There is deliberately no rate-limit, backoff,
@@ -2494,13 +2052,14 @@ def prompt_for_confirmation(confirmation: Confirmation, dialog_program: str) -> 
     (review log S12): every call shows a dialog, and a deny is always explicit
     and logged.
     """
-    message = confirmation_message(confirmation)
+    summary = confirmation_summary(confirmation)
+    details = confirmation_message(confirmation)
     with _dialog_lock:
-        return _prompt_for_confirmation(confirmation, message, dialog_program)
+        return _prompt_for_confirmation(confirmation, summary, details, dialog_program)
 
 
 def _prompt_for_confirmation(
-    confirmation: Confirmation, message: str, dialog_program: str
+    confirmation: Confirmation, summary: str, details: str, dialog_program: str
 ) -> bool:
     """Dispatch the (already serialised and rendered) prompt to its backend."""
     if dialog_program == "swiftdialog":
@@ -2508,14 +2067,17 @@ def _prompt_for_confirmation(
             [
                 "dialog",
                 "--title", "Privilege Elevation",
-                "--message", escape_swiftdialog_markup(message),
+                "--message", escape_swiftdialog_markup(summary),
+                # The expandable half: an info button holding the full block.
+                "--info", escape_swiftdialog_markup(details),
+                "--infobuttontext", "Details",
                 "--icon", "SF=lock.shield.fill,colour=accent,weight=medium",
                 "--iconsize", "80",
                 "--iconalttext", "Authentication required",
                 "--button1text", "Authorize",
                 "--button2text", "Deny",
                 "--width", "520",
-                "--height", "280",
+                "--height", "240",
                 "--ontop",
                 "--blurscreen",
                 "--messagefont", "size=16",
@@ -2529,33 +2091,91 @@ def _prompt_for_confirmation(
         return res.returncode == 0
 
     if dialog_program == "osascript":
-        script = (
-            f'display dialog {json.dumps(message)} '
-            f'with title {json.dumps(f"sudo authentication for {confirmation.peer}")} '
-            'with icon caution buttons {"No", "Yes"} default button "Yes" cancel button "No"'
-        )
-        res = subprocess.run(
-            ["osascript", "-e", script],
+        title = f"sudo authentication for {confirmation.peer}"
+        first = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display dialog {json.dumps(summary)} '
+                f'with title {json.dumps(title)} '
+                'with icon caution buttons {"Deny", "Details", "Authorize"} '
+                'default button "Authorize" cancel button "Deny"',
+            ],
             capture_output=True,
         )
-        return res.returncode == 0
+        if first.returncode != 0:
+            return False
+        if b"Details" in first.stdout:
+            # The approver asked for more context: show the field block and ask
+            # again. Only an explicit "Authorize" in this second dialog allows.
+            second = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    f'display dialog {json.dumps(details)} '
+                    f'with title {json.dumps(title)} '
+                    'with icon caution buttons {"Deny", "Authorize"} '
+                    'default button "Deny" cancel button "Deny"',
+                ],
+                capture_output=True,
+            )
+            return second.returncode == 0 and b"Authorize" in second.stdout
+        return b"Authorize" in first.stdout
 
     if dialog_program == "zenity":
-        return not subprocess.run(
+        title = f"sudo authentication for {confirmation.peer}"
+        argv = [
+            "zenity",
+            "--title",
+            title,
+            "--question",
+            "--no-markup",
+            "--width",
+            str(ZENITY_DIALOG_WIDTH),
+            "--text",
+            summary,
+            "--ok-label",
+            "Authorize",
+            "--cancel-label",
+            "Deny",
+        ]
+        if not zenity_supports_extra_button():
+            return not subprocess.run(argv).returncode
+
+        # Only *stdout* is captured: stderr stays inherited so a GTK/display error
+        # still reaches the journal, and the one thing parsed is the label zenity
+        # prints for an extra button.
+        first = subprocess.run(
+            argv + ["--extra-button", ZENITY_DETAILS_LABEL],
+            stdout=subprocess.PIPE,
+        )
+        if ZENITY_DETAILS_LABEL.encode("utf-8") not in first.stdout:
+            return first.returncode == 0
+
+        # The approver asked for more context: show the field block and ask again
+        # (doc §11.4). Only an explicit "Authorize" in this second dialog allows,
+        # and Deny takes the focus because the block is request metadata, not a
+        # decision input.
+        _debug(f"zenity: {ZENITY_DETAILS_LABEL} requested; showing the detail block")
+        second = subprocess.run(
             [
                 "zenity",
                 "--title",
-                f"sudo authentication for {confirmation.peer}",
+                f"{title} -- details",
                 "--question",
                 "--no-markup",
+                "--width",
+                str(ZENITY_DIALOG_WIDTH),
                 "--text",
-                message,
+                details,
                 "--ok-label",
                 "Authorize",
                 "--cancel-label",
                 "Deny",
+                "--default-cancel",
             ]
-        ).returncode
+        )
+        return second.returncode == 0
 
     raise ValueError(f"unknown dialog_program: {dialog_program!r}")
 
@@ -2583,7 +2203,7 @@ def resolve_default_gateway() -> str:
     raise RuntimeError("no default gateway found in /proc/net/route")
 
 
-def tartarus_name_for_id(vm_id: int) -> Optional[str]:
+def tartarus_name_for_id(vm_id: int) -> str | None:
     """id -> name via tartarus's own state dir (~/.local/state/tartarus/<name>/cid)."""
     if not TARTARUS_STATE_ROOT.is_dir():
         return None
@@ -2597,12 +2217,14 @@ def tartarus_name_for_id(vm_id: int) -> Optional[str]:
                     return entry.name
             except ValueError:
                 continue
-    except Exception:
-        pass
+    except Exception as error:  # noqa: BLE001 -- best-effort name lookup
+        # Any failure here (no state directory, permissions, races) just means
+        # the CID has no known name; resolution is cosmetic.
+        _debug(f"tartarus name lookup failed: {error!r}")
     return None
 
 
-def tartarus_id_for_ip(ip: str) -> Optional[int]:
+def tartarus_id_for_ip(ip: str) -> int | None:
     """Linux: static bridge subnet 10.200.0.<id>, no lookup needed. macOS:
     `arp -an` -> MAC -> last octet is the id (vmnet-shared gives guests a
     DHCP IP unknown ahead of time, so ARP is the only host-side way to
@@ -2629,7 +2251,7 @@ def tartarus_id_for_ip(ip: str) -> Optional[int]:
         return None
 
 
-def resolve_tartarus_name(peer) -> Optional[str]:
+def resolve_tartarus_name(peer) -> str | None:
     """`peer` is a VSOCK CID (int) or a TCP peer IP (str)."""
     if isinstance(peer, int):
         return tartarus_name_for_id(peer)
@@ -2665,7 +2287,7 @@ def get_resolution_mode(config: dict) -> str:
 LOCAL_PEERCRED = 0x001  # Darwin `SOL_LOCAL` socket option
 
 
-def _darwin_peer_uid(sock) -> Optional[int]:
+def _darwin_peer_uid(sock) -> int | None:
     """Best-effort uid of an AF_UNIX peer on Darwin (doc §9.1; residual R11).
 
     Darwin cannot give us `SO_PEERCRED`, only a uid/gid pair. `getpeereid(3)` is
@@ -2705,7 +2327,7 @@ def _darwin_peer_uid(sock) -> Optional[int]:
         return None
 
 
-def _unix_peer_cred(sock, *, platform: Optional[str] = None):
+def _unix_peer_cred(sock, *, platform: str | None = None):
     """Return `(pid, uid, gid)` for an AF_UNIX peer, or `None` if unavailable.
 
     Linux reads the authoritative `SO_PEERCRED` ucred. Darwin has no pid and
@@ -2732,7 +2354,7 @@ def _unix_peer_cred(sock, *, platform: Optional[str] = None):
     return None
 
 
-def _unix_peer_uid(sock) -> Optional[int]:
+def _unix_peer_uid(sock) -> int | None:
     """Best-effort uid of an AF_UNIX peer, or None when unavailable.
 
     Retained for the connection log. Authorization goes through
@@ -2744,8 +2366,8 @@ def _unix_peer_uid(sock) -> Optional[int]:
 
 
 def authorize_unix_peer(
-    sock, *, expected_uid: Optional[int] = None, platform: Optional[str] = None
-) -> Optional[int]:
+    sock, *, expected_uid: int | None = None, platform: str | None = None
+) -> int | None:
     """Refuse an AF_UNIX peer that is not the server user (doc §9.1; F12).
 
     Linux: `SO_PEERCRED` is authoritative, so a **missing credential or a
@@ -2836,9 +2458,9 @@ def verify_unix_peer_is_sshd(
     sock,
     proc_root: str = "/proc",
     *,
-    sshd_allowlist: Optional[frozenset] = None,
+    sshd_allowlist: frozenset | None = None,
     stat_fn=os.stat,
-) -> Optional[bool]:
+) -> bool | None:
     """Return True iff an AF_UNIX peer is a trusted local ``sshd`` process.
 
     Linux-only hardening against a same-UID process redirecting the client to a
@@ -2978,11 +2600,11 @@ class Transport:
     def address(self):
         raise NotImplementedError
 
-    def tls_server_name(self) -> Optional[str]:
+    def tls_server_name(self) -> str | None:
         """SNI/hostname for the client TLS wrap; None where there is no name."""
         return None
 
-    def read_timeouts(self) -> tuple[float, Optional[float]]:
+    def read_timeouts(self) -> tuple[float, float | None]:
         """The (first-frame, decision) bounds for the client's two frame reads."""
         return resolve_read_timeouts(self.config)
 
@@ -3017,13 +2639,13 @@ class Transport:
 
     # -- server side --
 
-    def server_base(self):
+    def server_base(self) -> type[BaseServer]:
         return UnixStreamServer
 
     def prepare_bind(self) -> None:
         """Check/clean the bind target before `bind()` (unix only)."""
 
-    def bind_umask(self) -> Optional[int]:
+    def bind_umask(self) -> int | None:
         """umask to hold across `bind()`, or None to leave it untouched."""
         return None
 
@@ -3094,7 +2716,7 @@ class Transport:
         """The VSOCK CID / IP used for `resolution = "tartarus"`, or None."""
         return None
 
-    def authorize_peer(self, sock) -> Optional[int]:
+    def authorize_peer(self, sock) -> int | None:
         """Authorize the accepted peer's OS identity; raise to refuse.
 
         Only the `unix` transport has a meaningful local-uid check (doc §9.1);
@@ -3103,7 +2725,7 @@ class Transport:
         """
         return None
 
-    def peer_uid(self, sock) -> Optional[int]:
+    def peer_uid(self, sock) -> int | None:
         return None
 
     def describe(self) -> str:
@@ -3155,10 +2777,10 @@ class CallbackTransport(Transport):
         # trade-off; `_gateway` above is resolved from /proc, not DNS.
         return (host, port)
 
-    def tls_server_name(self) -> Optional[str]:
-        return self.address()[0] if self.name == "tcp" else None
+    def tls_server_name(self) -> str | None:
+        return str(self.address()[0]) if self.name == "tcp" else None
 
-    def server_base(self):
+    def server_base(self) -> type[TCPServer]:
         return TCPServer
 
     def post_bind(self, server) -> None:
@@ -3190,12 +2812,12 @@ class UnixTransport(Transport):
     name = "unix"
     callback = False
 
-    def __init__(self, config: dict, path: Optional[str] = None) -> None:
+    def __init__(self, config: dict, path: str | None = None) -> None:
         super().__init__(config)
         if path is None:
             path = expand_socket_path(config.get("socket") or DEFAULT_SOCKET)
         self.path = path
-        self._bound_ino: Optional[int] = None
+        self._bound_ino: int | None = None
 
     def family(self) -> int:
         return socket.AF_UNIX
@@ -3203,7 +2825,7 @@ class UnixTransport(Transport):
     def address(self):
         return self.path
 
-    def tls_server_name(self) -> Optional[str]:
+    def tls_server_name(self) -> str | None:
         return None
 
     def server_base(self):
@@ -3213,7 +2835,7 @@ class UnixTransport(Transport):
         dir_mode = _parse_mode(self.config.get("socket_dir_mode"), DEFAULT_SOCKET_DIR_MODE)
         _prepare_unix_socket(self.path, dir_mode)
 
-    def bind_umask(self) -> Optional[int]:
+    def bind_umask(self) -> int | None:
         # 0177 leaves the freshly bound socket at 0600 before the explicit
         # chmod, so there is never a window where it is group/world-accessible.
         return 0o177
@@ -3240,10 +2862,8 @@ class UnixTransport(Transport):
             and info.st_ino == self._bound_ino
             and stat.S_ISSOCK(info.st_mode)
         ):
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(self.path)
-            except OSError:
-                pass
 
     def peer_label(self, sock) -> str:
         try:
@@ -3254,11 +2874,11 @@ class UnixTransport(Transport):
             return peer
         return "local"
 
-    def authorize_peer(self, sock) -> Optional[int]:
+    def authorize_peer(self, sock) -> int | None:
         """Refuse a local peer whose uid is not the server user (doc §9.1)."""
         return authorize_unix_peer(sock)
 
-    def peer_uid(self, sock) -> Optional[int]:
+    def peer_uid(self, sock) -> int | None:
         return _unix_peer_uid(sock)
 
     def describe(self) -> str:
@@ -3275,7 +2895,7 @@ def make_transport(config: dict) -> Transport:
     raise ValueError(f"unknown transport: {name!r}")
 
 
-def get_peer_name(sock, resolution: str, transport: Optional[Transport]) -> str:
+def get_peer_name(sock, resolution: str, transport: Transport | None) -> str:
     """Human label for a connection, honouring the configured resolution mode.
 
     The raw label comes from the transport (`cid N` for VSOCK, the address for
@@ -3309,7 +2929,7 @@ def get_peer_name(sock, resolution: str, transport: Optional[Transport]) -> str:
     return raw
 
 
-def create_ssl_context(config: dict, *, server: bool) -> Optional[ssl.SSLContext]:
+def create_ssl_context(config: dict, *, server: bool) -> ssl.SSLContext | None:
     """Build the mTLS context, or None when the channel is not encrypted.
 
     The decision is driven by the validated `transport_encryption`, not by the
@@ -3339,8 +2959,18 @@ def create_ssl_context(config: dict, *, server: bool) -> Optional[ssl.SSLContext
     cert_file = mtls.get("cert_file")
     key_file = mtls.get("key_file")
 
-    if not all([ca_file, cert_file, key_file]):
-        print("mTLS enabled but missing ca_file, cert_file, or key_file", file=sys.stderr)
+    if not (
+        isinstance(ca_file, str)
+        and ca_file
+        and isinstance(cert_file, str)
+        and cert_file
+        and isinstance(key_file, str)
+        and key_file
+    ):
+        print(
+            "mTLS enabled but ca_file, cert_file, and key_file must all be paths",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     required_oid = mtls.get("required_oid")
@@ -3385,10 +3015,8 @@ class Handler(StreamRequestHandler):
         sock = self.request
         read_timeout = getattr(server, "_server_read_timeout", None)
         if read_timeout is not None:
-            try:
+            with contextlib.suppress(OSError):
                 sock.settimeout(read_timeout)
-            except OSError:
-                pass
         ssl_context = getattr(server, "ssl_context", None)
         if ssl_context is not None:
             try:
@@ -3398,19 +3026,15 @@ class Handler(StreamRequestHandler):
                     f"SSL handshake failed from {self.client_address}: {error}",
                     file=sys.stderr,
                 )
-                try:
+                with contextlib.suppress(OSError):
                     sock.close()
-                except OSError:
-                    pass
                 raise
             # Hand the wrapped socket to the base setup so `rfile`/`wfile` are
             # built over it; re-apply the read timeout lost by the wrap.
             self.request = sock
             if read_timeout is not None:
-                try:
+                with contextlib.suppress(OSError):
                     sock.settimeout(read_timeout)
-                except OSError:
-                    pass
         super().setup()
 
     def handle(self) -> None:
@@ -3435,7 +3059,7 @@ class Handler(StreamRequestHandler):
         # peer's certificate/identity doesn't change across the requests a
         # connection may carry. The DER is kept for the ACL too: `mode = "list"`
         # pins the leaf SPKI and `mode = "ca"` re-validates the chain.
-        peer_cert_der: Optional[bytes] = None
+        peer_cert_der: bytes | None = None
         if use_cert and hasattr(self.request, "getpeercert"):
             peer_cert_der = self.request.getpeercert(binary_form=True)
             mtls = config.get("mtls", {})
@@ -3525,10 +3149,8 @@ class Handler(StreamRequestHandler):
                     security=security,
                     approver=config.get("approver") or os.environ.get("USER", ""),
                 )
-                try:
+                with contextlib.suppress(ProtocolError, OSError):
                     write_message(self.wfile, response)
-                except (ProtocolError, OSError):
-                    pass
                 break
             # The request is authenticated AND authorized: acknowledge it
             # immediately, *before* blocking on the human, so the client's
@@ -3592,10 +3214,8 @@ def server_process_request(self, request, client_address):
             file=sys.stderr,
             flush=True,
         )
-        try:
+        with contextlib.suppress(OSError):
             request.close()
-        except OSError:
-            pass
         return
     ThreadingMixIn.process_request(self, request, client_address)
 
@@ -3623,11 +3243,9 @@ def server_get_request(self):
     sock, addr = TCPServer.get_request(self)
     read_timeout = getattr(self, "_server_read_timeout", None)
     if read_timeout is not None:
-        try:
+        with contextlib.suppress(OSError):
             sock.settimeout(read_timeout)
-        except OSError:
-            pass
-    print(f"sudo-auth-proxy server: accepted TCP connection from {addr}", flush=True)
+        print(f"sudo-auth-proxy server: accepted TCP connection from {addr}", flush=True)
     return sock, addr
 
 
@@ -3661,7 +3279,11 @@ def run_server(config: dict) -> None:
         sys.exit(1)
     transport = make_transport(config)
     server = transport.listen(Handler)
-    server._security = security
+    # `listen` builds a dynamic `SudoAuthProxyServer` class, so `setattr` is the
+    # honest way to hang the per-listener security model on it: `Handler.handle`
+    # reads it back with `getattr`, and a static checker cannot see the attribute
+    # on a class that only exists at runtime.
+    setattr(server, "_security", security)  # noqa: B010 -- dynamic class attribute
     tls_enabled = getattr(server, "ssl_context", None) is not None
     if not acl_allows_any(security.acl):
         print(
@@ -3765,7 +3387,7 @@ def verify_selector_socket(path: str) -> None:
         )
 
 
-def _fail_unavailable(reason: str) -> None:
+def _fail_unavailable(reason: str) -> "NoReturn":
     """Print the `unavailable` reason and exit non-zero (doc §6.7).
 
     `pam_exec.so` collapses any non-zero exit to one generic failure, so the
@@ -3773,6 +3395,11 @@ def _fail_unavailable(reason: str) -> None:
     can, and is what the logs show. There is deliberately no separate exit
     code for `denied` (PAM could not act on it, and it would only invite
     false confidence).
+
+    The `NoReturn` annotation is load-bearing for more than typing: it is what
+    tells the type checker (and the reader) that every caller's `sock`,
+    `response` and `request` are bound after this call, which is exactly the
+    control flow this function implements.
     """
     print(f"sudo-auth-proxy client: unavailable: {reason}", file=sys.stderr)
     sys.exit(1)
@@ -3825,7 +3452,7 @@ def run_client(config: dict) -> None:
 
     try:
         sock = transport.connect()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 -- any connect failure means "unavailable"
         _debug(f"connection failed: {e!r}")
         _fail_unavailable(f"connection failed: {e}")
 
@@ -3838,8 +3465,8 @@ def run_client(config: dict) -> None:
         if peer_is_sshd is False:
             try:
                 sock.close()
-            except Exception:
-                pass
+            except Exception as error:  # noqa: BLE001 -- closing is best-effort
+                _debug(f"sock.close() failed: {error!r}")
             _debug("unix peer executable is not sshd; refusing to use the tunnel")
             print(
                 "sudo-auth-proxy client: connected unix peer is not sshd; refusing",
@@ -3904,8 +3531,8 @@ def run_client(config: dict) -> None:
     finally:
         try:
             sock.close()
-        except Exception:
-            pass
+        except Exception as error:  # noqa: BLE001 -- closing is best-effort
+            _debug(f"sock.close() failed: {error!r}")
 
     consumed_nonces: set = set()
     try:
@@ -3948,6 +3575,16 @@ def main() -> None:
         raise
     set_debug(config)
     _debug(f"config loaded: mode={config.get('mode')!r}")
+    # The whole file is validated against the exact schema first, so a typo or a
+    # key on the wrong side of a TOML table header is named here rather than
+    # surfacing as a missing-knob error further down (doc §7.9). This runs before
+    # the `mode` check so `Mode = "server"` reports the misspelled key instead of
+    # "missing required 'mode'".
+    try:
+        validate_config_schema(config, source=args.config)
+    except SecurityConfigError as error:
+        print(f"sudo-auth-proxy: {error}", file=sys.stderr)
+        sys.exit(1)
     # `mode` is required and fail-closed (audit A10): a hand-written config that
     # forgets it must not silently start a listener. The generated TOML always
     # emits a mode, so this only guards against operator error.

@@ -57,6 +57,15 @@
   # `tartarus.sudo-auth-proxy.security` and the extra server instance
   # (`tartarus.sudo-auth-proxy.extraServer.security`) share this exact shape
   # (doc §7). Extracted so the option shapes can never drift apart.
+  #
+  # mTLS is the ONLY authentication/signature mechanism (doc §7). The removed
+  # `ssh` / `x509` requester methods and the `signature` host-signing method
+  # took every key reference with them: there is no `sshSigningKey`,
+  # `sshAgent`, `sshKey`, `trustedKeys`, `trustedServerKeys`,
+  # `serverSigningKey`, `clientCert`, `clientKey`, `caFile` or
+  # `clientRequiredOid` left. mTLS carries its own `[mtls]` section and the ACL
+  # carries its own `caFile`/`requiredOid`, so nothing is shared or defaulted
+  # from here any more.
   mkSecurityOptions = {lib}: let
     inherit (lib) mkOption types;
   in {
@@ -70,139 +79,36 @@
         runtime fallback.
       '';
     };
-    serverAuth = mkOption {
-      type = types.enum ["signature" "transport" "none"];
-      default = "signature";
-      description = ''
-        How the client authenticates the server's messages (doc §7.2).
-        `transport` requires `transportEncryption = "mtls"` (and is then
-        forced).
-      '';
-    };
     clientAuth = mkOption {
-      type = types.enum ["ssh" "x509" "transport" "none"];
-      default = "ssh";
+      type = types.enum ["transport" "none"];
+      default = "transport";
       description = ''
-        How the server authenticates the requester (doc §7.3). Exactly one
-        method; `transport` requires `transportEncryption = "mtls"` (and is
-        then forced). Never `ssh` + `x509`. `none` disables requester
-        authentication entirely: it is an explicit, warned choice that the
-        Python only accepts when the server pairs it with
+        How the server authenticates the requester (doc §7.3). `transport`
+        means the identity comes from the mTLS handshake; `none` disables
+        requester authentication entirely: it is an explicit, warned choice
+        that the Python only accepts when the server pairs it with
         `acl.mode = "none"` (fail-closed XOR), and is rejected under
         `transportEncryption = "mtls"`. Use it only on a transport that is
         private by construction (vsock, SSH tunnel, local Unix socket).
+        Setting it to `none` is required — with `transport_encryption =
+        "none"` the Python refuses to run without an explicit `none` on both
+        auth knobs rather than silently disabling authentication.
       '';
     };
-    sshSigningKey = mkOption {
-      type = types.nullOr types.str;
-      default = null;
+    serverAuth = mkOption {
+      type = types.enum ["transport" "none"];
+      default = "transport";
       description = ''
-        Requester SSH private key the client signs requests with
-        (`client_auth = "ssh"`, doc §7.3). Never an `authorized_keys` entry;
-        the server trusts its fingerprint via `acl.trustedKeys`.
-        This is a **private key** and must be `0600` and owned by the
-        requester/login user (doc §9.2); the file is referenced by path and
-        is never copied into the Nix store (the store is world-readable).
+        How the client authenticates the server's messages (doc §7.2).
+        `transport` requires `transportEncryption = "mtls"` (and is then
+        forced); `none` means nothing authenticates the response and is only
+        accepted alongside `clientAuth = "none"`.
       '';
-    };
-    sshAgent = mkOption {
-      type = types.bool;
-      default = false;
-      description = ''
-        Sign `client_auth = "ssh"` requests through the running SSH agent
-        instead of a private key file (doc §7.9). The agent produces the
-        signature, so no private key material touches the client process;
-        `sshKey` selects which loaded identity to use. An explicit
-        `sshSigningKey` still wins (file-based signing takes precedence in
-        the Python). Mutually exclusive with mTLS, which is forced to
-        `client_auth = "transport"`.
-      '';
-    };
-    sshAgentSocket = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = ''
-        AF_UNIX path of the SSH agent to sign through (`client_auth =
-        "ssh"` with `sshAgent`, doc §7.9). When unset the client falls back
-        to the `SSH_AUTH_SOCK` environment variable; if neither is present
-        the Python refuses to start rather than send an unauthenticated
-        request. On the host-side PAM client the forwarded agent is reached
-        through the `SSH_AUTH_SOCK` kept by `security.sudo.extraConfig`.
-      '';
-    };
-    sshKey = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = ''
-        OpenSSH **public** key (a file path, or an inline `ssh-ed25519
-        AAAA...` line) naming the agent identity to sign with (`client_auth
-        = "ssh"` with `sshAgent`, doc §7.9). The agent identity is selected
-        by the public key's `SHA256:` fingerprint; RSA is asked for
-        `rsa-sha2-256`, and `ssh-rsa`/SHA-1 is refused. Must resolve to
-        exactly one key (a multi-key file or a directory is rejected). This
-        is a public key, so an inline line or a store path is safe.
-      '';
-    };
-    trustedKeys = mkOption {
-      type = types.listOf types.str;
-      default = [];
-      description = ''
-        Deprecated and no longer emitted: the server authorizes requester
-        SSH keys through `acl.trustedKeys` (fingerprints), and
-        authentication uses the key material the client presents in the
-        signed request (doc §8.2; redesign Phase 4). Retained only so
-        existing configurations keep evaluating; migrate entries to
-        `acl.trustedKeys` as `SHA256:...` fingerprints.
-      '';
-    };
-    trustedServerKeys = mkOption {
-      type = types.listOf types.str;
-      default = [];
-      description = ''
-        Client trust root for `server_auth = "signature"`: a keyring of
-        trusted host signing public keys (doc §7.2, §7.8). Prefer a keyring
-        so rotation needs no rebuild.
-      '';
-    };
-    serverSigningKey = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = ''
-        Dedicated host signing private key used for `server_auth =
-        "signature"` (Ed25519 preferred, RSA supported). Treat as
-        CA-sensitive (doc §7.7–§7.8) and keep it `0600`, owned by the
-        server user. It is referenced by path, never copied into the
-        world-readable Nix store.
-      '';
-    };
-    clientCert = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = "Requester X.509 certificate chain for `client_auth = \"x509\"`.";
-    };
-    clientKey = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = ''
-        Requester X.509 private key matching `clientCert`. `ca.py` generates
-        it `0600` (doc §9.2; review log F12); a hand-provisioned key must be
-        `0600` and owned by the requester/login user.
-      '';
-    };
-    caFile = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = "Trusted CA certificate used to verify an X.509 requester (`client_auth = \"x509\"`).";
-    };
-    clientRequiredOid = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = "EKU OID an X.509 requester certificate must carry (doc §7.6).";
     };
     responseTtl = mkOption {
       type = types.int;
       default = 30;
-      description = "Seconds a signed response remains valid (doc §6.6).";
+      description = "Seconds a response remains valid (doc §6.6).";
     };
     clockSkew = mkOption {
       type = types.int;
@@ -386,43 +292,35 @@
           description = ''
             How requester credentials are authorized (doc §8.1). Exactly one
             mode; there is no `ca`+`list` combination. `list` accepts only
-            credentials whose fingerprint is explicitly listed; `ca` accepts
-            any credential that chains to `caFile` with `requiredOid`.
-            `none` deliberately authorizes every request because there is no
-            credential to authorize; it is accepted only when paired with
-            `security.clientAuth = "none"` (fail-closed XOR enforced by the
-            Python) and must not carry any trust material (`trustedKeys`,
-            `trustedFingerprints`, `caFile`, `requiredOid`).
-          '';
-        };
-        trustedKeys = mkOption {
-          type = types.listOf types.str;
-          default = [];
-          description = ''
-            `mode = "list"`: SSH requester key fingerprints (`SHA256:...`,
-            as produced by `ssh-keygen -lf`) allowed to use the mechanism.
-            These are FINGERPRINTS, not public keys: the client presents its
-            key in the signed request and the server recomputes the
-            fingerprint. An empty list denies every SSH requester.
+            credentials whose SPKI fingerprint is explicitly listed; `ca`
+            accepts any credential that chains to `caFile` with
+            `requiredOid`. `none` deliberately authorizes every request
+            because there is no credential to authorize; it is accepted only
+            when paired with `security.clientAuth = "none"` (fail-closed XOR
+            enforced by the Python) and must not carry any trust material
+            (`trustedFingerprints`, `caFile`, `requiredOid`).
           '';
         };
         trustedFingerprints = mkOption {
           type = types.listOf types.str;
           default = [];
           description = ''
-            `mode = "list"`: X.509 / mTLS leaf SubjectPublicKeyInfo
-            fingerprints (`SHA256:...`) allowed to use the mechanism. In
-            `mode = "ca"` it optionally additionally pins the leaf SPKI on
-            top of the CA chain. An empty list pins nothing.
+            `mode = "list"`: mTLS leaf SubjectPublicKeyInfo fingerprints
+            (`SHA256:...`) allowed to use the mechanism. In `mode = "ca"` it
+            optionally additionally pins the leaf SPKI on top of the CA chain.
+            An empty list pins nothing.
           '';
         };
+        # `mode = "ca"` needs a readable CA; it is no longer defaulted from
+        # `security.caFile` (that option belonged to the removed x509
+        # requester method), so it must be set here explicitly.
         caFile = mkOption {
           type = types.nullOr types.str;
           default = null;
           description = ''
             `mode = "ca"`: trusted CA certificate (PEM) the requester chain
-            must reach. Defaults to `security.caFile` when that is set.
-            Relative paths resolve against the config file directory.
+            must reach. Relative paths resolve against the config file
+            directory.
           '';
         };
         requiredOid = mkOption {
@@ -430,7 +328,6 @@
           default = null;
           description = ''
             `mode = "ca"`: EKU OID the requester certificate must carry.
-            Defaults to `security.clientRequiredOid` when that is set.
           '';
         };
       };
@@ -693,41 +590,17 @@
       then "transport"
       else cfg.security.serverAuth;
 
-    securitySettings =
-      {
-        transport_encryption = effectiveTransportEncryption;
-        server_auth = effectiveServerAuth;
-        client_auth = effectiveClientAuth;
-        response_ttl = cfg.security.responseTtl;
-        clock_skew = cfg.security.clockSkew;
-      }
-      // optionalAttrs (cfg.security.sshSigningKey != null) {
-        ssh_signing_key = cfg.security.sshSigningKey;
-      }
-      // optionalAttrs cfg.security.sshAgent {
-        ssh_agent = true;
-      }
-      // optionalAttrs (cfg.security.sshAgentSocket != null) {
-        ssh_agent_socket = cfg.security.sshAgentSocket;
-      }
-      // optionalAttrs (cfg.security.sshKey != null) {
-        ssh_key = cfg.security.sshKey;
-      }
-      // optionalAttrs (cfg.security.trustedServerKeys != []) {
-        trusted_server_keys = cfg.security.trustedServerKeys;
-      }
-      // optionalAttrs (cfg.security.clientCert != null) {
-        client_cert = cfg.security.clientCert;
-      }
-      // optionalAttrs (cfg.security.clientKey != null) {
-        client_key = cfg.security.clientKey;
-      }
-      // optionalAttrs (cfg.security.caFile != null) {
-        ca_file = cfg.security.caFile;
-      }
-      // optionalAttrs (cfg.security.clientRequiredOid != null) {
-        client_required_oid = cfg.security.clientRequiredOid;
-      };
+    # No key/keyring paths are emitted under `[security]` any more: mTLS reads
+    # its own `[mtls]` section, and the removed ssh/x509/signature methods took
+    # every `ssh_signing_key` / `trusted_server_keys` / `client_cert` /
+    # `server_signing_key` / `ca_file` / `client_required_oid` key with them.
+    securitySettings = {
+      transport_encryption = effectiveTransportEncryption;
+      server_auth = effectiveServerAuth;
+      client_auth = effectiveClientAuth;
+      response_ttl = cfg.security.responseTtl;
+      clock_skew = cfg.security.clockSkew;
+    };
 
     connectionSettings =
       {
@@ -810,6 +683,27 @@
     imports = [optionsModule];
 
     config = mkIf cfg.enable {
+      # Fail at evaluation time, not inside PAM. With `transport_encryption =
+      # "none"` there is no authentication mechanism left to fall back on, and
+      # the `clientAuth`/`serverAuth` defaults are the secure `"transport"`
+      # value: emitting that combination would make the Python refuse to start
+      # at `sudo` time, which `pam_exec` turns into a silent fall-through.
+      # Requiring the explicit `"none"` here keeps the decision visible in the
+      # config (doc §7.5).
+      assertions = [
+        {
+          assertion =
+            effectiveTransportEncryption != "none"
+            || (cfg.security.clientAuth == "none" && cfg.security.serverAuth == "none");
+          message = ''
+            tartarus.sudo-auth-proxy: transport_encryption = "none" requires
+            security.clientAuth = "none" and security.serverAuth = "none".
+            Authentication is never disabled implicitly; set both explicitly, or
+            use transport_encryption = "mtls".
+          '';
+        }
+      ];
+
       # `pam_exec.so` runs this PAM helper as the invoking user, which must be
       # able to read the config and the mTLS cert/key paths it references. The
       # directory is `0750 root <group>` (doc §9.2), not the historic
@@ -834,22 +728,15 @@
       );
 
       # `sudo`'s default `env_reset` strips the selector and the recursion
-      # guard before the `pam_exec` helper runs, and (for agent signing) the
-      # forwarded agent socket too. Append the `env_keep` lines to the tail of
-      # `/etc/sudoers` with `mkAfter`, exactly as the guest module does, so a
-      # later `sudoers.d` fragment cannot negate them (doc §4.3, §10.4).
-      security.sudo.extraConfig = lib.mkAfter (
-        lib.optionalString (cfg.transport == "unix") ''
-          Defaults env_keep += "SUDO_AUTH_PROXY_SOCK"
-          Defaults env_keep += "SUDO_AUTH_PROXY_ACTIVE"
-        ''
-        # `client_auth = "ssh"` may sign through a forwarded agent
-        # (`sshAgent`/`sshAgentSocket`, doc §7.9); the PAM helper runs under
-        # `sudo`, so keep the socket variable. Valid on any transport.
-        + lib.optionalString (cfg.security.clientAuth == "ssh") ''
-          Defaults env_keep += "SSH_AUTH_SOCK"
-        ''
-      );
+      # guard before the `pam_exec` helper runs. Append the `env_keep` lines to
+      # the tail of `/etc/sudoers` with `mkAfter`, exactly as the guest module
+      # does, so a later `sudoers.d` fragment cannot negate them (doc §4.3,
+      # §10.4). Nothing else needs keeping: signer keys and agent sockets went
+      # with the removed ssh/x509 methods.
+      security.sudo.extraConfig = mkIf (cfg.transport == "unix") (lib.mkAfter ''
+        Defaults env_keep += "SUDO_AUTH_PROXY_SOCK"
+        Defaults env_keep += "SUDO_AUTH_PROXY_ACTIVE"
+      '');
 
       # The first auth rule: a verified `allow` (exit 0) finishes the stack
       # (`success=done`); every non-zero exit -- including a human `deny` and
@@ -927,47 +814,28 @@
         then "transport"
         else security.serverAuth;
 
-      securitySettings =
-        {
-          transport_encryption = effectiveTransportEncryption;
-          server_auth = effectiveServerAuth;
-          client_auth = effectiveClientAuth;
-          response_ttl = security.responseTtl;
-          clock_skew = security.clockSkew;
-        }
-        // optionalAttrs (security.serverSigningKey != null) {
-          server_signing_key = security.serverSigningKey;
-        }
-        // optionalAttrs (security.caFile != null) {
-          ca_file = security.caFile;
-        }
-        // optionalAttrs (security.clientRequiredOid != null) {
-          client_required_oid = security.clientRequiredOid;
-        };
+      # The extra server instance carries its own `security`; the ACL uses its
+      # own `caFile`/`requiredOid` (no `security.caFile` fallback any more).
+      securitySettings = {
+        transport_encryption = effectiveTransportEncryption;
+        server_auth = effectiveServerAuth;
+        client_auth = effectiveClientAuth;
+        response_ttl = security.responseTtl;
+        clock_skew = security.clockSkew;
+      };
 
-      aclCaFile =
-        if server.acl.caFile != null
-        then server.acl.caFile
-        else security.caFile;
-      aclRequiredOid =
-        if server.acl.requiredOid != null
-        then server.acl.requiredOid
-        else security.clientRequiredOid;
       aclSettings =
         {
           mode = server.acl.mode;
         }
-        // optionalAttrs (server.acl.trustedKeys != []) {
-          trusted_keys = server.acl.trustedKeys;
-        }
         // optionalAttrs (server.acl.trustedFingerprints != []) {
           trusted_fingerprints = server.acl.trustedFingerprints;
         }
-        // optionalAttrs (server.acl.mode == "ca" && aclCaFile != null) {
-          ca_file = aclCaFile;
+        // optionalAttrs (server.acl.mode == "ca" && server.acl.caFile != null) {
+          ca_file = server.acl.caFile;
         }
-        // optionalAttrs (server.acl.mode == "ca" && aclRequiredOid != null) {
-          required_oid = aclRequiredOid;
+        // optionalAttrs (server.acl.mode == "ca" && server.acl.requiredOid != null) {
+          required_oid = server.acl.requiredOid;
         };
 
       settings =
@@ -1099,55 +967,30 @@
       then "transport"
       else cfg.security.serverAuth;
 
-    securitySettings =
-      {
-        transport_encryption = effectiveTransportEncryption;
-        server_auth = effectiveServerAuth;
-        client_auth = effectiveClientAuth;
-        response_ttl = cfg.security.responseTtl;
-        clock_skew = cfg.security.clockSkew;
-      }
-      // optionalAttrs (cfg.security.serverSigningKey != null) {
-        server_signing_key = cfg.security.serverSigningKey;
-      }
-      # `cfg.security.trustedKeys` is intentionally NOT emitted any more: the
-      # server authorizes through `server.acl.trustedKeys` (fingerprints), and
-      # authentication now uses the key material presented in the signed
-      # request (doc §8.2; redesign Phase 4). The option is kept for source
-      # compatibility only.
-      // optionalAttrs (cfg.security.caFile != null) {
-        ca_file = cfg.security.caFile;
-      }
-      // optionalAttrs (cfg.security.clientRequiredOid != null) {
-        client_required_oid = cfg.security.clientRequiredOid;
-      };
+    # No key/keyring paths are emitted under `[security]` any more (see the
+    # client module); the ACL reads its own `caFile`/`requiredOid`.
+    securitySettings = {
+      transport_encryption = effectiveTransportEncryption;
+      server_auth = effectiveServerAuth;
+      client_auth = effectiveClientAuth;
+      response_ttl = cfg.security.responseTtl;
+      clock_skew = cfg.security.clockSkew;
+    };
 
     # The server's authorization table (doc §8). `mode` is always emitted, so
-    # the deny-all default is explicit rather than an absent table. The CA
-    # fields fall back to the `[security]` x509 trust roots for convenience.
-    aclCaFile =
-      if server.acl.caFile != null
-      then server.acl.caFile
-      else cfg.security.caFile;
-    aclRequiredOid =
-      if server.acl.requiredOid != null
-      then server.acl.requiredOid
-      else cfg.security.clientRequiredOid;
+    # the deny-all default is explicit rather than an absent table.
     aclSettings =
       {
         mode = server.acl.mode;
       }
-      // optionalAttrs (server.acl.trustedKeys != []) {
-        trusted_keys = server.acl.trustedKeys;
-      }
       // optionalAttrs (server.acl.trustedFingerprints != []) {
         trusted_fingerprints = server.acl.trustedFingerprints;
       }
-      // optionalAttrs (server.acl.mode == "ca" && aclCaFile != null) {
-        ca_file = aclCaFile;
+      // optionalAttrs (server.acl.mode == "ca" && server.acl.caFile != null) {
+        ca_file = server.acl.caFile;
       }
-      // optionalAttrs (server.acl.mode == "ca" && aclRequiredOid != null) {
-        required_oid = aclRequiredOid;
+      // optionalAttrs (server.acl.mode == "ca" && server.acl.requiredOid != null) {
+        required_oid = server.acl.requiredOid;
       };
 
     settings =
@@ -1195,6 +1038,27 @@
     imports = [optionsModule namedServersModule];
 
     config = mkIf (cfg.enable || server.enable) (mkMerge [
+      # Fail at evaluation time, not inside the server. With
+      # `transport_encryption = "none"` the `clientAuth`/`serverAuth` defaults
+      # are the secure `"transport"` value, which the Python rejects under
+      # `none`; requiring the explicit `"none"` here keeps the decision visible
+      # in the config instead of on the server's stderr (doc §7.5).
+      {
+        assertions = [
+          {
+            assertion =
+              effectiveTransportEncryption != "none"
+              || (cfg.security.clientAuth == "none" && cfg.security.serverAuth == "none");
+            message = ''
+              tartarus.sudo-auth-proxy.server: transport_encryption = "none"
+              requires security.clientAuth = "none" and
+              security.serverAuth = "none". Authentication is never disabled
+              implicitly; set both explicitly, or use
+              transport_encryption = "mtls".
+            '';
+          }
+        ];
+      }
       (mkService {
         name = "sudo-auth-proxy";
         description = "sudo authentication proxy server (${server.transport})";

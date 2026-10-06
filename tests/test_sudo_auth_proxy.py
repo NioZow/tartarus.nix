@@ -1,5 +1,15 @@
 """Tests for ``sudo-auth-proxy`` (redesign Phases 1-6).
 
+**Authentication is mTLS-only.** The SSH-key, ssh-agent and application-layer
+X.509 request signatures and the host-signed responses were removed, together
+with their Nix options, TOML keys, keyrings and wire fields; the three security
+knobs are now `transport_encryption` plus `client_auth`/`server_auth`, each of
+which is `"transport"` or `"none"`. Tests that need an authenticated credential
+drive the mTLS path (a real CA-issued leaf certificate passed as the peer DER,
+or the pinned leaf SPKI); tests that only need to exercise framing, routing and
+timing use the explicit unauthenticated pairing (`"none"` on all three knobs
+with the matching `acl.mode = "none"`).
+
 Behaviours covered:
 
 1. the NDJSON framing -- newline-delimited compact JSON (doc §6.1): one object
@@ -33,7 +43,10 @@ Behaviours covered:
    ``authorize_unix_peer`` fails closed on a foreign uid (Linux) and degrades
    with a documented weaker guarantee on Darwin, and ``src/tartarus/ca.py``
    emits client private keys ``0600`` rather than the historic ``0644``;
-7. Phase 6 fast-fail/timeout semantics (doc §10.1-§10.5, §6.7; review logs
+7. authorization (Phase 4, doc §8) -- `acl.mode` resolution and validation,
+   `mode = "list"` SPKI pinning, `mode = "ca"` chain + EKU enforcement, the
+   `"none"` XOR with `client_auth`, and the ACL running *before* any dialog;
+8. Phase 6 fast-fail/timeout semantics (doc §10.1-§10.5, §6.7; review logs
    NF4, Rank 5/R7, F5) -- ``resolve_read_timeouts`` maps ``decision_timeout =
    0`` to an unbounded tail, a silent Unix peer is bounded by ``recv_timeout``
    rather than hanging until the decision, an unreachable/closed peer fails
@@ -72,6 +85,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import types
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -124,6 +138,17 @@ def _isolate_sudo_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SUDO_UID", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _reset_zenity_probe(monkeypatch: pytest.MonkeyPatch, sap: types.ModuleType) -> None:
+    """Forget the cached `--extra-button` probe before each test.
+
+    The probe is cached for the life of a *server* process, and one pytest run
+    hosts many of them: without this reset the first zenity test would answer for
+    every later one, including the tests that simulate an older zenity.
+    """
+    monkeypatch.setattr(sap, "_zenity_extra_button_support", None)
+
+
 # --- NDJSON framing helpers -----------------------------------------------
 
 
@@ -158,57 +183,88 @@ def _decode(sap: types.ModuleType, raw: bytes) -> dict:
     return sap.read_message(io.BytesIO(raw))
 
 
-# --- Phase 3 security helpers ----------------------------------------------
+# --- security helpers ------------------------------------------------------
+#
+# Authentication is mTLS-only: the three knobs are `transport_encryption` plus
+# the two auths, and the only two values an auth knob can take are "transport"
+# and "none". Most tests here exercise the *unauthenticated* pairing (a private
+# transport, `client_auth = "none"` + `acl.mode = "none"`), because it needs no
+# certificates and keeps the focus on framing, routing and timeouts; the mTLS
+# path is covered by the dedicated helpers and tests below.
 
 
-def _server_security(keys: Any, **overrides: Any) -> dict:
-    """A valid server-side ``[security]`` block trusting the test requester key."""
+def _server_security(*_unused: Any, **overrides: Any) -> dict:
+    """A valid server-side ``[security]`` block for a private callback transport."""
     security: dict[str, Any] = {
         "transport_encryption": "none",
-        "client_auth": "ssh",
-        "server_auth": "signature",
-        "trusted_keys": [keys.client_public],
-        "server_signing_key": keys.server_private,
+        "client_auth": "none",
+        "server_auth": "none",
     }
     security.update(overrides)
     return security
 
 
-def _client_security(keys: Any, **overrides: Any) -> dict:
-    """A valid client-side ``[security]`` block carrying the test requester key."""
+def _client_security(*_unused: Any, **overrides: Any) -> dict:
+    """A valid client-side ``[security]`` block for a private callback transport."""
     security: dict[str, Any] = {
         "transport_encryption": "none",
-        "client_auth": "ssh",
-        "server_auth": "signature",
-        "ssh_signing_key": keys.client_private,
-        "trusted_server_keys": [keys.server_public],
+        "client_auth": "none",
+        "server_auth": "none",
     }
     security.update(overrides)
     return security
 
 
-def _signed_request(sap: types.ModuleType, keys: Any, **overrides: Any) -> dict:
-    """Build a request and attach a real SSH ``client_auth`` signature."""
+def _mtls_server_security(**overrides: Any) -> dict:
+    """The mTLS server-side block (both auths are forced to ``transport``)."""
+    security: dict[str, Any] = {
+        "transport_encryption": "mtls",
+        "client_auth": "transport",
+        "server_auth": "transport",
+    }
+    security.update(overrides)
+    return security
+
+
+def _authed_request(sap: types.ModuleType, **overrides: Any) -> dict:
+    """Build a request and attach its ``client_auth`` marker block.
+
+    No key material is involved: the block is a one-field marker (`"transport"`
+    or `"none"`), because mTLS is the only authentication mechanism (doc §6.5).
+    """
     request = _request_obj(sap, **overrides)
-    security = sap.build_security(_client_config(keys), "client")
+    security = sap.build_security(_client_config(), "client")
     sap.attach_client_auth(request, security)
     return request
 
 
-def _fingerprint(sap: types.ModuleType, public_line: str) -> str:
-    """The ``SHA256:...`` fingerprint of an OpenSSH public-key line."""
-    return sap.parse_openssh_public_key(public_line)[1]
+def _mtls_client_config(**overrides: Any) -> dict:
+    """A client config whose credential is the (channel) mTLS certificate."""
+    config: dict[str, Any] = {
+        "transport": "unix",
+        "security": _mtls_server_security(),
+    }
+    config.update(overrides)
+    return config
+
+
+def _spki(sap: types.ModuleType, cert: Any) -> str:
+    """The ``SHA256:...`` leaf SPKI fingerprint a ``mode = "list"`` ACL pins."""
+    return sap.spki_fingerprint(cert.public_key())
 
 
 def _acl_list(*fingerprints: str) -> dict:
     """A ``mode = "list"`` ACL; no arguments is an intentional deny-all list."""
-    return {"mode": "list", "trusted_keys": list(fingerprints)}
+    return {"mode": "list", "trusted_fingerprints": list(fingerprints)}
 
 
-def _acl_for(sap: types.ModuleType, keys: Any) -> dict:
-    """The default allow-list ACL used by the server-side exchange helpers."""
-    return _acl_list(_fingerprint(sap, keys.client_public))
+def _acl_for(sap: types.ModuleType, keys: Any = None) -> dict:
+    """The default allow-any ACL used by the unauthenticated exchange helpers.
 
+    `client_auth = "none"` has no credential to authorize, so the matching ACL
+    is `mode = "none"`; the Python enforces that pairing as a fail-closed XOR.
+    """
+    return {"mode": "none"}
 
 
 def test_request_round_trips_as_one_compact_line(sap: types.ModuleType) -> None:
@@ -359,13 +415,24 @@ def test_invalid_decision_rejected(sap: types.ModuleType, decision: Any) -> None
 
 
 class _FakeRequestSocket:
-    """Minimal stand-in for the accepted socket, enough for peer resolution."""
+    """Minimal stand-in for the accepted socket, enough for peer resolution.
 
-    def __init__(self, peer: tuple[str, int]) -> None:
+    `peer_cert_der` makes it look like an mTLS-wrapped socket: the handler reads
+    the verified peer certificate from it exactly as it would from a real
+    `ssl.SSLSocket`, so the mTLS credential path is exercised without a channel.
+    """
+
+    def __init__(self, peer: tuple[str, int], peer_cert_der: bytes | None = None) -> None:
         self._peer = peer
+        self._peer_cert_der = peer_cert_der
 
     def getpeername(self) -> tuple[str, int]:
         return self._peer
+
+    def getpeercert(self, binary_form: bool = False):
+        if not binary_form:
+            raise AssertionError("the handler must ask for the DER form")
+        return self._peer_cert_der
 
 
 class _FakeWriter:
@@ -387,9 +454,12 @@ def _exchange(
     monkeypatch: pytest.MonkeyPatch,
     decisions: Sequence[bool],
     request_bytes: bytes,
-    keys: Any,
+    keys: Any = None,
     acl: Any = None,
-) -> tuple[list[bytes], list[tuple[str, str]]]:
+    *,
+    security: Any = None,
+    peer_cert_der: bytes | None = None,
+) -> tuple[list[bytes], list[tuple[Any, str]]]:
     """Drive the real server-side ``Handler`` over fake request/file objects.
 
     No socket is bound and no connection is made: the handler reads the request
@@ -410,7 +480,7 @@ def _exchange(
         "resolution": "none",
         "dialog_program": "zenity",
         "transport": "tcp",
-        "security": _server_security(keys),
+        "security": security if security is not None else _server_security(keys),
         "acl": _acl_for(sap, keys) if acl is None else acl,
     }
     fake_server = types.SimpleNamespace(
@@ -428,7 +498,7 @@ def _exchange(
     monkeypatch.setattr(sap, "prompt_for_confirmation", fake_prompt)
 
     handler = object.__new__(sap.Handler)
-    handler.request = _FakeRequestSocket((FAKE_PEER, 12345))
+    handler.request = _FakeRequestSocket((FAKE_PEER, 12345), peer_cert_der)
     handler.client_address = (FAKE_PEER, 12345)
     handler.server = fake_server
     handler.rfile = io.BytesIO(request_bytes)
@@ -450,12 +520,9 @@ def test_handler_answers_auth_request(
     monkeypatch: pytest.MonkeyPatch,
     approved: bool,
     expected_decision: str,
-    keymaterial: Any,
 ) -> None:
-    request = _signed_request(sap, keymaterial)
-    frames, prompts = _exchange(
-        sap, monkeypatch, [approved], _frame(sap, request), keymaterial
-    )
+    request = _authed_request(sap)
+    frames, prompts = _exchange(sap, monkeypatch, [approved], _frame(sap, request))
 
     # audit A2: the first frame is the immediate pre-dialog ack, the second the
     # signed decision. Both echo the request nonce.
@@ -470,53 +537,73 @@ def test_handler_answers_auth_request(
     assert parsed["decision"] == expected_decision
     assert parsed["request_digest"] == sap.compute_request_digest(request)
     assert sap.parse_response(parsed, request["nonce"]) == expected_decision
-    # the response is signed by the configured host key
-    assert parsed["server_auth"]["method"] == "signature"
+    # no `server_auth` block: the response is authenticated by the mTLS channel,
+    # or explicitly not at all (doc §6.5)
+    assert "server_auth" not in parsed
 
     assert len(prompts) == 1
     confirmation, program = prompts[0]
     assert program == "zenity"
-    # the dialog context carries the verified identity and metadata. The
-    # identity is sanitised before rendering (doc §11.2), and the random test
-    # fingerprint may contain `+`/`/`, which the allow-list maps to `?` -- so
-    # compare against the sanitiser's output, never the raw key_id.
+    # the dialog context carries the verified identity and metadata. With
+    # `client_auth = "none"` there is no credential, so the identity is the
+    # fixed NONE_IDENTITY sentinel -- which the summary renders as
+    # "Unauthenticated requester" rather than printing the sentinel (doc §11.4).
     assert confirmation.peer == FAKE_PEER
-    assert confirmation.identity == sap.sanitize_field(request["client_auth"]["key_id"])
+    assert confirmation.identity == sap.NONE_IDENTITY
+    assert "Unauthenticated requester" in sap.confirmation_summary(confirmation)
     assert confirmation.target_user == "root"
     assert confirmation.transport == "tcp"
 
 
 def test_handler_malformed_frame_fails_closed(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, keymaterial: Any
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    frames, prompts = _exchange(sap, monkeypatch, [], b"not-json\n", keymaterial)
+    frames, prompts = _exchange(sap, monkeypatch, [], b"not-json\n")
 
     assert frames == []
     assert prompts == []
 
 
 def test_handler_oversize_frame_fails_closed(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, keymaterial: Any
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     oversize = b"{" + b"a" * (sap.MAX_MESSAGE_BYTES + 10) + b"}\n"
-    frames, prompts = _exchange(sap, monkeypatch, [], oversize, keymaterial)
+    frames, prompts = _exchange(sap, monkeypatch, [], oversize)
 
     assert frames == []
     assert prompts == []
 
+
+# --- unix transport (real single listener) ---
+
+def _client_config() -> dict:
+    """The client-side counterpart of :func:`_unix_server`."""
+    return {
+        "transport": "unix",
+        "resolution": "none",
+        "dialog_program": "zenity",
+        "connect_timeout": 0.5,
+        # Generous bounds so a legitimate client/server round-trip is never
+        # tripped by the first-byte timeout; the timing tests override these
+        # with small explicit values.
+        "recv_timeout": 5.0,
+        "decision_timeout": 5,
+        "security": _client_security(),
+    }
 
 # --- unix transport (real single listener) --------------------------------
 
 
 @contextlib.contextmanager
 def _unix_server(
-    sap: types.ModuleType, sock_path: Path, keys: Any
+    sap: types.ModuleType, sock_path: Path
 ) -> Iterator[tuple[Any, Any]]:
     """Start a real single-socket unix server under ``sock_path``.
 
-    The server validates an SSH requester credential and signs its response
-    (``server_auth = "signature"``), so the round-trip tests exercise the real
-    Phase 3 authentication path, not a bypass.
+    The config is the unauthenticated pairing (`transport_encryption = "none"`,
+    `client_auth`/`server_auth` = `"none"` and the matching `acl.mode = "none"`),
+    so the round-trip tests exercise the real request/response path over a real
+    socket without needing certificates. The mTLS path is covered separately.
     """
     config = {
         "transport": "unix",
@@ -525,8 +612,8 @@ def _unix_server(
         "socket_mode": "0600",
         "resolution": "none",
         "dialog_program": "zenity",
-        "security": _server_security(keys),
-        "acl": _acl_for(sap, keys),
+        "security": _server_security(),
+        "acl": _acl_for(sap),
     }
     transport = sap.UnixTransport(config)
     server = transport.listen(sap.Handler)
@@ -544,23 +631,8 @@ def _unix_server(
         transport.cleanup()
 
 
-def _client_config(keys: Any) -> dict:
-    return {
-        "transport": "unix",
-        "resolution": "none",
-        "dialog_program": "zenity",
-        "connect_timeout": 0.5,
-        # Generous Phase 6 bounds so a legitimate client/server round-trip is
-        # never tripped by the first-byte timeout; the timing tests override
-        # these with small explicit values.
-        "recv_timeout": 5.0,
-        "decision_timeout": 5,
-        "security": _client_security(keys),
-    }
-
-
 def test_unix_server_round_trip(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     sock_path = tmp_path / "run" / "server.sock"
     monkeypatch.setattr(sap, "prompt_for_confirmation", lambda _peer, _program: True)
@@ -568,38 +640,38 @@ def test_unix_server_round_trip(
     # peer-process check (it is exercised directly further down).
     monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
 
-    with _unix_server(sap, sock_path, keymaterial):
+    with _unix_server(sap, sock_path):
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_path))
         with pytest.raises(SystemExit) as exc:
-            sap.run_client(_client_config(keymaterial))
+            sap.run_client(_client_config())
 
     assert exc.value.code == 0
 
 
 def test_unix_server_deny_exits_nonzero(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     sock_path = tmp_path / "run" / "server.sock"
     monkeypatch.setattr(sap, "prompt_for_confirmation", lambda _peer, _program: False)
     monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
 
-    with _unix_server(sap, sock_path, keymaterial):
+    with _unix_server(sap, sock_path):
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_path))
         with pytest.raises(SystemExit) as exc:
-            sap.run_client(_client_config(keymaterial))
+            sap.run_client(_client_config())
 
     assert exc.value.code == 1
 
 
 def test_unix_client_without_selector_fails_closed(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # A config `socket` must never be used as a client fallback: without the
     # selector the client fails before opening anything.
     monkeypatch.delenv("SUDO_AUTH_PROXY_SOCK", raising=False)
     monkeypatch.setattr(sap, "prompt_for_confirmation", lambda _peer, _program: True)
 
-    config = _client_config(keymaterial)
+    config = _client_config()
     config["socket"] = str(tmp_path / "should-not-be-used.sock")
     with pytest.raises(SystemExit) as exc:
         sap.run_client(config)
@@ -609,7 +681,7 @@ def test_unix_client_without_selector_fails_closed(
 
 
 def test_unix_server_one_listener_serves_concurrent_sessions(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     sock_path = tmp_path / "run" / "server.sock"
     monkeypatch.setattr(sap, "prompt_for_confirmation", lambda _peer, _program: True)
@@ -619,13 +691,13 @@ def test_unix_server_one_listener_serves_concurrent_sessions(
     # so the concurrency of the *listener* is what is under test.
     monkeypatch.setattr(sap, "recursion_guard_active", lambda: False)
 
-    with _unix_server(sap, sock_path, keymaterial):
+    with _unix_server(sap, sock_path):
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_path))
         results: list[Any] = []
 
         def run_one() -> None:
             try:
-                sap.run_client(_client_config(keymaterial))
+                sap.run_client(_client_config())
                 results.append("no-exit")
             except SystemExit as exc:
                 results.append(exc.code)
@@ -640,11 +712,11 @@ def test_unix_server_one_listener_serves_concurrent_sessions(
 
 
 def test_unix_socket_and_directory_permissions(
-    sap: types.ModuleType, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, tmp_path: Path
 ) -> None:
     sock_path = tmp_path / "run" / "server.sock"
 
-    with _unix_server(sap, sock_path, keymaterial):
+    with _unix_server(sap, sock_path):
         socket_info = os.lstat(sock_path)
         directory_info = os.lstat(sock_path.parent)
 
@@ -669,7 +741,9 @@ def test_unix_refuses_symlink_bind(
     link = tmp_path / "link.sock"
     link.symlink_to(real)
 
-    transport = sap.UnixTransport({"transport": "unix", "socket": str(link)})
+    transport = sap.UnixTransport(
+        {"transport": "unix", "socket": str(link), "security": _server_security()}
+    )
     with pytest.raises(RuntimeError, match="symlink"):
         transport.listen(sap.Handler)
 
@@ -681,7 +755,9 @@ def test_unix_refuses_regular_file_bind(
     target.parent.mkdir(parents=True)
     target.write_text("not a socket")
 
-    transport = sap.UnixTransport({"transport": "unix", "socket": str(target)})
+    transport = sap.UnixTransport(
+        {"transport": "unix", "socket": str(target), "security": _server_security()}
+    )
     with pytest.raises(RuntimeError, match="not a socket"):
         transport.listen(sap.Handler)
 
@@ -705,7 +781,9 @@ def test_unix_refuses_non_owned_bind(
             return info
 
         monkeypatch.setattr(sap.os, "lstat", fake_lstat)
-        transport = sap.UnixTransport({"transport": "unix", "socket": str(target)})
+        transport = sap.UnixTransport(
+            {"transport": "unix", "socket": str(target), "security": _server_security()}
+        )
         with pytest.raises(RuntimeError, match=f"not owned by uid {os.getuid()}"):
             transport.listen(sap.Handler)
     finally:
@@ -732,32 +810,32 @@ def test_run_client_recursion_guard_blocks_reentry(
 
 
 def test_run_client_sets_recursion_guard_while_running(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     sock_path = tmp_path / "run" / "server.sock"
     monkeypatch.setattr(sap, "prompt_for_confirmation", lambda _peer, _program: True)
     monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
 
-    with _unix_server(sap, sock_path, keymaterial):
+    with _unix_server(sap, sock_path):
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_path))
         with pytest.raises(SystemExit) as exc:
-            sap.run_client(_client_config(keymaterial))
+            sap.run_client(_client_config())
 
     assert exc.value.code == 0
     assert os.environ.get("SUDO_AUTH_PROXY_ACTIVE") == "1"
 
 
 def test_run_client_refuses_non_sshd_peer(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     sock_path = tmp_path / "run" / "server.sock"
     monkeypatch.setattr(sap, "prompt_for_confirmation", lambda _peer, _program: True)
     monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: False)
 
-    with _unix_server(sap, sock_path, keymaterial):
+    with _unix_server(sap, sock_path):
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_path))
         with pytest.raises(SystemExit) as exc:
-            sap.run_client(_client_config(keymaterial))
+            sap.run_client(_client_config())
 
     assert exc.value.code == 1
 
@@ -1096,8 +1174,11 @@ def test_authorize_unix_peer_refuses_real_foreign_uid(sap: types.ModuleType) -> 
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         listener.bind(str(sock_path))
-        os.chmod(work, 0o711)
-        os.chmod(sock_path, 0o777)
+        # Deliberately reachable by another uid: the child below must be able to
+        # connect as `nobody` for the authorization check to have anything to
+        # refuse. The socket lives in a private pytest temp dir, not a shared one.
+        os.chmod(work, 0o711)  # noqa: S103 -- traverse-only, so the child can reach it
+        os.chmod(sock_path, 0o777)  # noqa: S103 -- connectable, then refused
         listener.listen(1)
 
         child = os.fork()
@@ -1109,7 +1190,7 @@ def test_authorize_unix_peer_refuses_real_foreign_uid(sap: types.ModuleType) -> 
                 client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 client.connect(str(sock_path))
                 client.close()
-            except BaseException:
+            except BaseException:  # noqa: BLE001, S110 -- the child exits either way
                 pass
             finally:
                 os._exit(0)
@@ -1133,46 +1214,6 @@ def test_authorize_unix_peer_refuses_real_foreign_uid(sap: types.ModuleType) -> 
 def crypto() -> types.ModuleType:
     """Skip the crypto tests cleanly when ``cryptography`` is not installed."""
     return pytest.importorskip("cryptography")
-
-
-def _write_ed25519_keypair(directory: Path, name: str):
-    """Generate an Ed25519 keypair; return ``(private_path, public_line)``."""
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-
-    key = ed25519.Ed25519PrivateKey.generate()
-    private_bytes = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    )
-    private_path = directory / f"{name}.key"
-    private_path.write_bytes(private_bytes)
-    public_line = key.public_key().public_bytes(
-        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
-    ).decode()
-    return str(private_path), public_line
-
-
-@pytest.fixture(scope="session")
-def keymaterial(crypto: types.ModuleType, tmp_path_factory: pytest.TempPathFactory):
-    """Ed25519 requester + host signing keys shared by the Phase 3 tests.
-
-    The requester private key is written as PEM (the loader also accepts
-    OpenSSH); the public lines are inline OpenSSH keys so they can be used
-    directly as a keyring entry. ``keymaterial`` is session-scoped so the
-    key-generation cost is paid once.
-    """
-    directory = tmp_path_factory.mktemp("sap-keys")
-    client_private, client_public = _write_ed25519_keypair(directory, "client")
-    server_private, server_public = _write_ed25519_keypair(directory, "server")
-    return types.SimpleNamespace(
-        client_private=client_private,
-        client_public=client_public,
-        server_private=server_private,
-        server_public=server_public,
-    )
-
 
 
 def _build_cert(oid: str | None):
@@ -1269,21 +1310,70 @@ RunCall = tuple[Sequence[str], dict[str, Any]]
 
 
 def _install_fake_run(
-    monkeypatch: pytest.MonkeyPatch, returncode: int
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    *,
+    stdout: bytes = b"",
+    stdout_sequence: Sequence[bytes] | None = None,
+    returncode_sequence: Sequence[int] | None = None,
+    extra_button: bool = True,
 ) -> list[RunCall]:
-    """Replace ``subprocess.run`` with a recorder; never spawn a dialog."""
+    """Replace ``subprocess.run`` with a recorder; never spawn a dialog.
+
+    ``returncode`` is used for every call unless ``stdout_sequence`` /
+    ``returncode_sequence`` are given, in which case call *n* takes the *n*-th
+    entry of each. The ``osascript`` backend decides what the approver pressed by
+    reading ``button returned:<name>`` from stdout, and the ``zenity`` backend
+    reads the label zenity prints for its extra button, so those tests drive both
+    backends from here.
+
+    ``extra_button`` answers the zenity capability probe (``--help-all``): a
+    modern zenity advertises ``--extra-button``, an older one does not. Probe
+    calls are recorded but never consume the sequences -- the sequences describe
+    the *dialogs*, which is what the tests are about.
+    """
     calls: list[RunCall] = []
+    stdout_by_call = list(stdout_sequence) if stdout_sequence is not None else None
+    returncode_by_call = (
+        list(returncode_sequence) if returncode_sequence is not None else None
+    )
 
     def fake_run(
         argv: Sequence[str], *args: Any, **kwargs: Any
     ) -> types.SimpleNamespace:
         calls.append((list(argv), dict(kwargs)))
-        return types.SimpleNamespace(returncode=returncode)
+        if "--help-all" in argv:
+            probe_out = b"--extra-button\n" if extra_button else b""
+            return types.SimpleNamespace(returncode=0, stdout=probe_out)
+
+        index = len(calls) - 1 - _probe_count(calls, exclude_last=True)
+        out = (
+            stdout_by_call[index]
+            if stdout_by_call is not None and index < len(stdout_by_call)
+            else stdout
+        )
+        code = (
+            returncode_by_call[index]
+            if returncode_by_call is not None and index < len(returncode_by_call)
+            else returncode
+        )
+        return types.SimpleNamespace(returncode=code, stdout=out)
 
     # the script calls ``subprocess.run`` through the module-level name, so
     # patching the shared ``subprocess`` module object is what it observes.
     monkeypatch.setattr(subprocess, "run", fake_run)
     return calls
+
+
+def _probe_count(calls: list[RunCall], *, exclude_last: bool = False) -> int:
+    """How many recorded calls are zenity capability probes."""
+    recorded = calls[:-1] if exclude_last else calls
+    return sum(1 for argv, _kwargs in recorded if "--help-all" in argv)
+
+
+def _dialog_calls(calls: list[RunCall]) -> list[RunCall]:
+    """The dialog invocations, i.e. everything but the capability probe."""
+    return [call for call in calls if "--help-all" not in call[0]]
 
 
 def _confirmation(
@@ -1332,15 +1422,26 @@ def test_swiftdialog_argument_construction(
     assert (
         "--title" in argv and argv[argv.index("--title") + 1] == "Privilege Elevation"
     )
+    # the prompt itself is the condensed summary (doc §11.4)
     message = argv[argv.index("--message") + 1]
-    # the verified identity, its label and the session metadata are shown
-    assert "SHA256:AbCdEf" in message
-    assert "vault" in message
-    assert "user -> root" in message
-    assert "Service: sudo" in message
-    # ...and the command/argv is absent (review log S5)
+    assert message == sap.escape_swiftdialog_markup(
+        sap.confirmation_summary(confirmation)
+    )
+    assert "vault requests root via sudo" in message
+    assert "on vault" in message
+    # ...and the full field block is reachable behind the info button
+    assert argv[argv.index("--infobuttontext") + 1] == "Details"
+    details = argv[argv.index("--info") + 1]
+    # swiftDialog interprets its own markup, so the block is escaped for it
+    assert details == sap.escape_swiftdialog_markup(
+        sap.confirmation_message(confirmation)
+    )
+    assert "SHA256:AbCdEf" in details
+    assert "user -> root" in details
+    # the command/argv is absent from both (review log S5)
     assert "command" not in message.lower()
     assert "cmdline" not in message.lower()
+    assert "command" not in details.lower()
     assert kwargs.get("capture_output") is True
 
 
@@ -1354,7 +1455,13 @@ def test_osascript_argument_construction(
     returncode: int,
     approved: bool,
 ) -> None:
-    calls = _install_fake_run(monkeypatch, returncode)
+    """The first dialog shows the summary; only `Authorize` allows.
+
+    `returncode` drives the dialog: 0 means a button was pressed (the button
+    name is read from stdout), 1 means it was cancelled/closed.
+    """
+    stdout = b"button returned:Authorize\n" if returncode == 0 else b""
+    calls = _install_fake_run(monkeypatch, returncode, stdout=stdout)
     confirmation = _confirmation(sap)
 
     assert sap.prompt_for_confirmation(confirmation, "osascript") is approved
@@ -1363,11 +1470,51 @@ def test_osascript_argument_construction(
     assert argv[0] == "osascript"
     assert argv[1] == "-e"
     script = argv[2]
-    # the message is JSON-encoded before it is embedded in the AppleScript
-    assert json.dumps(sap.confirmation_message(confirmation)) in script
+    # the summary is JSON-encoded before it is embedded in the AppleScript
+    assert json.dumps(sap.confirmation_summary(confirmation)) in script
     assert json.dumps("sudo authentication for vault") in script
-    assert "SHA256:AbCdEf" in json.dumps(sap.confirmation_message(confirmation))
+    assert json.dumps(sap.confirmation_message(confirmation)) not in script
+    # a third button opens the detail block rather than deciding anything
+    assert "Details" in script
     assert kwargs.get("capture_output") is True
+
+
+def test_osascript_details_button_shows_the_block_then_decides(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Details` must never be mistaken for a decision (doc §11.4)."""
+    calls = _install_fake_run(
+        monkeypatch,
+        0,
+        stdout_sequence=[
+            b"button returned:Details\n",
+            b"button returned:Deny\n",
+        ],
+    )
+    confirmation = _confirmation(sap)
+
+    assert sap.prompt_for_confirmation(confirmation, "osascript") is False
+
+    assert len(calls) == 2
+    details_script = calls[1][0][2]
+    assert json.dumps(sap.confirmation_message(confirmation)) in details_script
+    assert "display dialog" in details_script
+
+
+def test_osascript_details_then_authorize_allows(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_fake_run(
+        monkeypatch,
+        0,
+        stdout_sequence=[
+            b"button returned:Details\n",
+            b"button returned:Authorize\n",
+        ],
+    )
+    confirmation = _confirmation(sap)
+
+    assert sap.prompt_for_confirmation(confirmation, "osascript") is True
 
 
 @pytest.mark.parametrize(
@@ -1385,7 +1532,7 @@ def test_zenity_argument_construction(
 
     assert sap.prompt_for_confirmation(confirmation, "zenity") is approved
 
-    argv, kwargs = calls[0]
+    (argv, kwargs) = _dialog_calls(calls)[0]
     assert argv[0] == "zenity"
     assert "--question" in argv
     # markup is explicitly disabled (doc §11.2)
@@ -1396,12 +1543,153 @@ def test_zenity_argument_construction(
     )
     assert "--text" in argv
     text = argv[argv.index("--text") + 1]
-    assert text == sap.confirmation_message(confirmation)
-    assert "SHA256:AbCdEf" in text
-    assert "user -> root" in text
+    # The default view stays the condensed summary; the field block is behind
+    # Details (doc §11.4).
+    assert text == sap.confirmation_summary(confirmation)
+    assert "vault requests root via sudo" in text
     assert "command" not in text.lower()
-    # zenity is not invoked with capture_output (its dialog is seen, not parsed).
-    assert "capture_output" not in kwargs
+    # An explicit width keeps the prompt wider than it is tall: zenity otherwise
+    # wraps at 60 characters and produces a narrow, cramped column. The height is
+    # deliberately left to the content.
+    assert argv[argv.index("--width") + 1] == str(sap.ZENITY_DIALOG_WIDTH)
+    assert "--height" not in argv
+    # The Details affordance is offered, unambiguous by stdout (see the flow
+    # tests below), and only its label -- never a decision -- rides on it.
+    assert argv[argv.index("--extra-button") + 1] == sap.ZENITY_DETAILS_LABEL
+    assert argv[argv.index("--ok-label") + 1] == "Authorize"
+    assert "stderr" not in kwargs
+
+
+def test_zenity_details_button_shows_the_block_then_decides(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pressing Details opens a second dialog carrying the full block (doc §11.4).
+
+    The reported gap: the summary names the peer but not the terminal, so there
+    was no way to see *which* pty was asking. zenity prints an extra button's
+    label on stdout (its exit code is the cancellation code), so the label is
+    what identifies the press.
+    """
+    calls = _install_fake_run(
+        monkeypatch,
+        returncode=1,
+        stdout_sequence=[b"Details\n", b""],
+        returncode_sequence=[1, 0],
+    )
+    confirmation = _confirmation(sap, tty="/dev/pts/7", cwd="/home/user")
+
+    assert sap.prompt_for_confirmation(confirmation, "zenity") is True
+
+    dialogs = _dialog_calls(calls)
+    assert len(dialogs) == 2
+    first, _second = dialogs
+    assert first[1].get("stdout") is subprocess.PIPE
+    assert first[0][first[0].index("--text") + 1] == sap.confirmation_summary(confirmation)
+
+    argv, _kwargs = dialogs[1]
+    text = argv[argv.index("--text") + 1]
+    assert text == sap.confirmation_message(confirmation)
+    assert "TTY        /dev/pts/7" in text  # the pty the summary does not show
+    assert "CWD        /home/user" in text
+    # The field block gets the same explicit width as the prompt, so the labelled
+    # rows read across instead of stacking into a column.
+    assert argv[argv.index("--width") + 1] == str(sap.ZENITY_DIALOG_WIDTH)
+    assert "--height" not in argv
+    # Deny takes the focus in the detail dialog: the block is request metadata.
+    assert "--default-cancel" in argv
+    assert argv[argv.index("--ok-label") + 1] == "Authorize"
+
+
+def test_zenity_details_never_authorizes_by_itself(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Details is not a decision, even if the exit code says otherwise.
+
+    zenity exits 1 for the extra button, but the code must not *rely* on that: a
+    zero code alongside the Details label still means "show me more", so the
+    second dialog decides. Here the second dialog denies.
+    """
+    calls = _install_fake_run(
+        monkeypatch,
+        returncode=1,
+        stdout_sequence=[b"Details\n", b""],
+        returncode_sequence=[0, 1],
+    )
+
+    assert sap.prompt_for_confirmation(_confirmation(sap), "zenity") is False
+    assert len(_dialog_calls(calls)) == 2
+
+
+def test_zenity_details_carries_only_sanitised_fields(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The block behind Details went through the same allow-list (doc §11.2)."""
+    calls = _install_fake_run(
+        monkeypatch,
+        returncode=1,
+        stdout_sequence=[b"Details\n", b""],
+        returncode_sequence=[1, 0],
+    )
+    confirmation = _confirmation(sap, tty="/dev/pts/0\nevil: injected")
+
+    assert sap.prompt_for_confirmation(confirmation, "zenity") is True
+
+    text = _dialog_calls(calls)[1][0]
+    detail_text = text[text.index("--text") + 1]
+    lines = detail_text.split("\n")
+    # The injected newline became `?`, so the TTY stays on its own single label
+    # line: a field can never forge a second line of the block.
+    assert "TTY        /dev/pts/0?evil: injected" in lines
+    assert sum(1 for line in lines if line.startswith("TTY")) == 1
+
+
+def test_zenity_without_extra_button_keeps_the_summary_only_prompt(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zenity that cannot add a button still prompts exactly as it always did.
+
+    An unknown option would make zenity exit non-zero with empty stdout, which
+    this module reads as a deny -- so a summary-only backend must never be sent
+    `--extra-button`.
+    """
+    calls = _install_fake_run(monkeypatch, returncode=0, extra_button=False)
+
+    assert sap.prompt_for_confirmation(_confirmation(sap), "zenity") is True
+
+    dialogs = _dialog_calls(calls)
+    assert len(dialogs) == 1
+    argv, kwargs = dialogs[0]
+    assert "--extra-button" not in argv
+    assert argv[argv.index("--text") + 1] == sap.confirmation_summary(_confirmation(sap))
+    # unchanged from before the affordance existed: no output is parsed at all
+    assert kwargs == {}
+
+
+def test_zenity_probe_is_cached_and_absence_is_not_fatal(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The capability probe runs once per process and degrades on any failure."""
+    calls = _install_fake_run(monkeypatch, returncode=0)
+
+    sap.prompt_for_confirmation(_confirmation(sap), "zenity")
+    sap.prompt_for_confirmation(_confirmation(sap), "zenity")
+
+    probes = [call for call in calls if "--help-all" in call[0]]
+    assert len(probes) == 1
+
+    # A zenity that cannot even be executed (or hangs past the probe bound) is
+    # "no support", which is the old prompt rather than a denial.
+    monkeypatch.setattr(sap, "_zenity_extra_button_support", None)
+
+    def explode(argv: Sequence[str], *args: Any, **kwargs: Any) -> Any:
+        if "--help-all" in argv:
+            raise FileNotFoundError("zenity")
+        return types.SimpleNamespace(returncode=0, stdout=b"")
+
+    monkeypatch.setattr(subprocess, "run", explode)
+
+    assert sap.prompt_for_confirmation(_confirmation(sap), "zenity") is True
+    assert sap.zenity_supports_extra_button() is False
 
 
 def test_unknown_dialog_program_raises(
@@ -1494,7 +1782,8 @@ def test_hostile_fields_never_reach_dialog_argv(
 
     sap.prompt_for_confirmation(confirmation, program)
 
-    argv, _ = calls[0]
+    # The dialog invocation, not the zenity capability probe that precedes it.
+    argv, _ = _dialog_calls(calls)[0]
     joined = "\n".join(argv)
     # the hostile code points are gone...
     assert "\r" not in joined
@@ -1515,22 +1804,20 @@ def test_hostile_fields_never_reach_dialog_argv(
 def test_request_fields_are_sanitized_before_logging(
     sap: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
-    keymaterial: Any,
     capsys: pytest.CaptureFixture,
 ) -> None:
     """The server's debug log carries only sanitised fields (review log NF8)."""
     monkeypatch.setenv("SUDO_AUTH_PROXY_DEBUG", "1")
     # `set_debug` mutates the module global; record and restore it.
     monkeypatch.setattr(sap, "debug_enabled", False)
-    request = _signed_request(
+    request = _authed_request(
         sap,
-        keymaterial,
         tty="/dev/pts/0\nEVIL\r\x1b[31m",
         invoking_user="user\u202e",
         guest_hint="hi\nthere",
     )
 
-    _exchange(sap, monkeypatch, [True], _frame(sap, request), keymaterial)
+    _exchange(sap, monkeypatch, [True], _frame(sap, request))
     err = capsys.readouterr().err
 
     # a newline in a field cannot start a forged log record
@@ -1566,15 +1853,21 @@ def test_confirmation_shows_verified_identity_and_omits_command(
     )
 
     message = sap.confirmation_message(confirmation)
+    summary = sap.confirmation_summary(confirmation)
 
-    assert "alice-laptop (SHA256:abc)" in message
+    # the summary names the requester by its label and stays two lines long
+    assert summary.splitlines()[0] == "alice-laptop requests root via sudo"
+    assert len(summary.splitlines()) == 2
+    # the detailed block still carries the verified identity separately
+    assert "Requester  alice-laptop" in message
+    assert "Identity   SHA256:abc" in message
     assert "user -> root" in message
-    assert "Service: sudo" in message
-    assert "TTY: /dev/pts/0" in message
-    assert "CWD: /home/user" in message
+    assert "TTY        /dev/pts/0" in message
+    assert "CWD        /home/user" in message
     assert "2023-11-14T22:13:20Z" in message
     assert confirmation.request_id in message
     assert "command" not in message.lower()
+    assert "command" not in summary.lower()
     assert "cmdline" not in message.lower()
 
 
@@ -1623,34 +1916,304 @@ def test_canonical_bytes_are_sorted_and_compact(sap: types.ModuleType) -> None:
     assert sap.canonical_bytes({"b": 1, "a": {"z": 2, "y": 3}}) == b'{"a":{"y":3,"z":2},"b":1}'
 
 
-def test_domain_label_is_the_project_label(sap: types.ModuleType) -> None:
-    assert sap.DOMAIN_LABEL == b"tartarus/sudo-auth-proxy/v1"
-    assert b"SAP-v1" not in sap.DOMAIN_LABEL
+def test_signature_machinery_is_gone(sap: types.ModuleType) -> None:
+    """The removed signature layer must not linger as dead code or state.
+
+    mTLS is the only authentication mechanism, so there is no signing key, no
+    domain-separation label and no signature transcript any more (doc §6.4).
+    """
+    for attribute in (
+        "DOMAIN_LABEL",
+        "SSH_SIGNATURE_ALGS",
+        "X509_SIGNATURE_ALGS",
+        "signing_payload",
+        "without_signature",
+        "sign_bytes",
+        "verify_bytes",
+        "ssh_fingerprint",
+        "load_private_key_file",
+        "ssh_agent_sign",
+        "parse_cert_chain_b64",
+    ):
+        assert not hasattr(sap, attribute), attribute
 
 
-def test_request_digest_ignores_the_signature_field(sap: types.ModuleType) -> None:
+def test_request_digest_covers_the_whole_request(sap: types.ModuleType) -> None:
+    """Nothing is stripped before hashing: there is no signature field to strip."""
     request = {
         "v": 1,
         "type": "auth_request",
         "nonce": _nonce(),
-        "client_auth": {"method": "ssh", "alg": "ssh-ed25519", "key_id": "k", "signature": "AAA"},
+        "client_auth": {"method": "transport"},
     }
     tampered = copy.deepcopy(request)
-    tampered["client_auth"]["signature"] = "BBB"
+    tampered["client_auth"]["method"] = "none"
 
-    assert sap.compute_request_digest(request) == sap.compute_request_digest(tampered)
+    assert sap.compute_request_digest(request) != sap.compute_request_digest(tampered)
+
+
+# --- configuration schema (exact keys, doc §7.9/§15.1) ---------------------
+#
+# The reported failure this covers: a config whose `transport_encryption`,
+# `client_auth` and `server_auth` lines sit *above* the `[security]` header has
+# no `[security]` knobs at all (TOML scopes a key to the nearest preceding table
+# header). Under the old "unknown keys are ignored" policy that was reported as
+# `transport_encryption = 'none' requires an explicit client_auth = 'none'`,
+# naming exactly what the operator had already written. The schema check runs
+# first and names the real problem: the key and the table it belongs to.
+
+EXAMPLE_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1] / "examples" / "sudo-auth-proxy-server.toml"
+)
+
+
+def _flat_unauthenticated_config() -> dict:
+    """The reported config: the auth knobs written above the `[security]` header."""
+    return {
+        "mode": "server",
+        "transport": "vsock",
+        "cid": 2,
+        "port": 65012,
+        "dialog_program": "zenity",
+        "transport_encryption": "none",
+        "client_auth": "none",
+        "server_auth": "none",
+        "response_ttl": 30,
+        "clock_skew": 5,
+        "acl": {"mode": "none"},
+    }
+
+
+def test_schema_flags_a_security_key_written_above_its_table(
+    sap: types.ModuleType,
+) -> None:
+    """A flattened `[security]` block is a placement error, not a missing knob."""
+    with pytest.raises(sap.SecurityConfigError) as exc:
+        sap.validate_config_schema(
+            _flat_unauthenticated_config(),
+            source="/etc/sudo-auth-proxy/config.toml",
+        )
+
+    message = str(exc.value)
+    assert "client_auth" in message
+    assert "[security]" in message
+    assert "top level" in message
+    assert "/etc/sudo-auth-proxy/config.toml" in message
+
+
+def test_build_security_reports_the_placement_before_the_knob(
+    sap: types.ModuleType,
+) -> None:
+    """The regression: the misleading "requires an explicit client_auth" is gone.
+
+    Both knobs *are* written in this config, so complaining that they are missing
+    (and never mentioning where they went) is the failure mode under test.
+    """
+    with pytest.raises(sap.SecurityConfigError) as exc:
+        sap.build_security(_flat_unauthenticated_config(), "server")
+
+    assert "[security]" in str(exc.value)
+    assert "refusing to disable authentication implicitly" not in str(exc.value)
+
+
+def test_schema_accepts_the_same_config_with_a_security_table(
+    sap: types.ModuleType,
+) -> None:
+    """Moving those five lines under `[security]` is the whole fix."""
+    config = _flat_unauthenticated_config()
+    security = {
+        key: config.pop(key)
+        for key in (
+            "transport_encryption",
+            "client_auth",
+            "server_auth",
+            "response_ttl",
+            "clock_skew",
+        )
+    }
+    config["security"] = security
+
+    sap.validate_config_schema(config)
+    resolved = sap.build_security(config, "server")
+
+    assert resolved.transport_encryption == "none"
+    assert resolved.client_auth == "none"
+    assert resolved.acl.mode == "none"
+
+
+def test_schema_rejects_an_unknown_key_and_suggests_the_real_one(
+    sap: types.ModuleType,
+) -> None:
+    config = {"mode": "server", "transport": "vsock", "max_connection": 64}
+
+    with pytest.raises(sap.SecurityConfigError, match="max_connections"):
+        sap.validate_config_schema(config)
+
+
+def test_schema_rejects_a_top_level_key_inside_a_table(
+    sap: types.ModuleType,
+) -> None:
+    """The mirror image: a top-level key belongs above every table header."""
+    config = {
+        "mode": "server",
+        "transport": "vsock",
+        "security": dict(_server_security(), socket="/run/sudo-auth-proxy/x.sock"),
+    }
+
+    with pytest.raises(sap.SecurityConfigError) as exc:
+        sap.validate_config_schema(config)
+
+    message = str(exc.value)
+    assert "socket" in message
+    assert "top level" in message
+
+
+@pytest.mark.parametrize(
+    ("table", "key"),
+    [
+        ("security", "ssh_signing_key"),
+        ("security", "server_signing_key"),
+        ("acl", "trusted_keys"),
+        ("mtls", "client_required_oid"),
+    ],
+)
+def test_schema_rejects_removed_keys(
+    sap: types.ModuleType, table: str, key: str
+) -> None:
+    """Removed mechanisms leave no live keys; a stale one is never ignored."""
+    config = {"mode": "server", "transport": "vsock", table: {key: "x"}}
+
+    with pytest.raises(sap.SecurityConfigError, match=key):
+        sap.validate_config_schema(config)
+
+
+def test_schema_rejects_a_non_table_sub_table(sap: types.ModuleType) -> None:
+    with pytest.raises(sap.SecurityConfigError, match=r"\[security\] must be a table"):
+        sap.validate_config_schema({"mode": "server", "security": "none"})
+
+
+def test_schema_allows_the_acl_labels_map(sap: types.ModuleType) -> None:
+    """`acl.labels` is the one free-form table: fingerprints -> display labels."""
+    fingerprint = "SHA256:" + base64.b64encode(b"x" * 32).decode()
+    config = {
+        "mode": "server",
+        "transport": "tcp",
+        "security": _mtls_server_security(),
+        "acl": {
+            "mode": "list",
+            "trusted_fingerprints": [fingerprint],
+            "labels": {fingerprint: "vault"},
+        },
+    }
+
+    sap.validate_config_schema(config)
+    # labels are keyed by the *normalised* fingerprint (base64 padding stripped),
+    # which is what `spki_fingerprint` produces when it verifies a credential.
+    assert sap.build_security(config, "server").acl.labels == {
+        fingerprint.rstrip("="): "vault"
+    }
+
+
+def test_schema_accepts_a_full_server_and_client_config(
+    sap: types.ModuleType,
+) -> None:
+    """Every key the Nix modules emit is in the schema (they must not drift)."""
+    server = {
+        "mode": "server",
+        "transport": "vsock",
+        "cid": 2,
+        "port": 65012,
+        "socket": "%t/sudo-auth-proxy/server.sock",
+        "socket_dir_mode": "0700",
+        "socket_mode": "0600",
+        "connect_timeout": 0.2,
+        "decision_timeout": 120,
+        "recv_timeout": 0.5,
+        "max_connections": 64,
+        "server_read_timeout": 10.0,
+        "dialog_program": "zenity",
+        "resolution": "tartarus",
+        "debug": False,
+        "security": _server_security(),
+        "acl": _acl_for(sap),
+        "mtls": {
+            "enable": True,
+            "ca_file": "/etc/tartarus/x509/ca.crt",
+            "cert_file": "/etc/tartarus/x509/server.crt",
+            "key_file": "/etc/tartarus/x509/server.key",
+            "required_oid": "1.3.6.1.4.1.99999.1.1",
+            "peer_required_oid": "1.3.6.1.4.1.99999.1.2",
+        },
+    }
+    client = {
+        "mode": "client",
+        "transport": "vsock",
+        "cid": 2,
+        "port": 65012,
+        "socket": "%t/sudo-auth-proxy/server.sock",
+        "socket_dir_mode": "0700",
+        "socket_mode": "0600",
+        "connect_timeout": 0.2,
+        "decision_timeout": 120,
+        "recv_timeout": 0.5,
+        "approver": "user",
+        "client_version": "1",
+        "guest_hint": "vault",
+        "debug": False,
+        "security": _client_security(),
+    }
+
+    sap.validate_config_schema(server)
+    sap.validate_config_schema(client)
+
+
+def test_shipped_example_config_matches_the_schema(sap: types.ModuleType) -> None:
+    """The copy-me example in `examples/` must stay copy-pasteable.
+
+    It is the file the standalone-server instructions tell an operator to install
+    as `~/.config/sudo-auth-proxy/config.toml` (doc §15.1), so a key it drops or
+    misspells would be a startup failure on a machine with no Nix to rebuild it.
+    """
+    with open(EXAMPLE_CONFIG_PATH, "rb") as handle:
+        config = tomllib.load(handle)
+
+    sap.validate_config_schema(config, source=str(EXAMPLE_CONFIG_PATH))
+    security = sap.build_security(config, "server")
+
+    # The example is the unauthenticated standalone pairing: it may only run if
+    # it says so on all three knobs and pairs `client_auth = "none"` with
+    # `acl.mode = "none"`.
+    assert security.transport_encryption == "none"
+    assert security.client_auth == "none"
+    assert security.server_auth == "none"
+    assert security.acl.mode == "none"
 
 
 # --- config validation (fail closed, no downgrade) ------------------------
 
 
-def test_security_defaults_for_unix_and_vsock(sap: types.ModuleType) -> None:
+def test_security_none_requires_explicit_auth_knobs(sap: types.ModuleType) -> None:
+    """Turning authentication off must be written down, not inherited.
+
+    Before the mTLS-only refactor an unset knob defaulted to the working
+    `ssh`/`signature` pair. There is no working pair to default to any more,
+    and defaulting to "no authentication" would be a silent downgrade.
+    """
     for transport in ("unix", "vsock"):
-        assert sap.validate_security_config({"transport": transport}) == {
-            "transport_encryption": "none",
-            "client_auth": "ssh",
-            "server_auth": "signature",
-        }
+        with pytest.raises(
+            sap.SecurityConfigError, match="refusing to disable authentication implicitly"
+        ):
+            sap.validate_security_config({"transport": transport})
+
+    with pytest.raises(
+        sap.SecurityConfigError, match="refusing to disable authentication implicitly"
+    ):
+        sap.validate_security_config(
+            {
+                "transport": "unix",
+                "security": {"transport_encryption": "none", "client_auth": "none"},
+            }
+        )
 
 
 def test_security_defaults_tcp_to_mtls(sap: types.ModuleType) -> None:
@@ -1661,67 +2224,101 @@ def test_security_defaults_tcp_to_mtls(sap: types.ModuleType) -> None:
     }
 
 
+def test_security_explicit_none_pair_is_accepted(sap: types.ModuleType) -> None:
+    for transport in ("unix", "vsock"):
+        assert sap.validate_security_config(
+            {
+                "transport": transport,
+                "security": {
+                    "transport_encryption": "none",
+                    "client_auth": "none",
+                    "server_auth": "none",
+                },
+            }
+        ) == {
+            "transport_encryption": "none",
+            "client_auth": "none",
+            "server_auth": "none",
+        }
+
+
 def test_security_mtls_forces_both_auths_to_transport(sap: types.ModuleType) -> None:
     resolved = sap.validate_security_config(
-        {
-            "transport": "tcp",
-            "security": {
-                "transport_encryption": "mtls",
-                "client_auth": "transport",
-                "server_auth": "transport",
-            },
-        }
+        {"transport": "tcp", "security": {"transport_encryption": "mtls"}}
     )
+
     assert resolved["client_auth"] == "transport"
     assert resolved["server_auth"] == "transport"
 
 
-def test_security_mtls_rejects_server_signature(sap: types.ModuleType) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="server_auth must be 'transport'"):
+def test_security_mtls_rejects_a_non_transport_server_auth(sap: types.ModuleType) -> None:
+    with pytest.raises(sap.SecurityConfigError, match="server_auth must be"):
         sap.validate_security_config(
             {
                 "transport": "tcp",
                 "security": {
                     "transport_encryption": "mtls",
                     "client_auth": "transport",
-                    "server_auth": "signature",
+                    "server_auth": "none",
                 },
             }
         )
 
 
-def test_security_mtls_rejects_ssh_signature_layered_on_certificate(sap: types.ModuleType) -> None:
+def test_security_mtls_rejects_a_non_transport_client_auth(sap: types.ModuleType) -> None:
     with pytest.raises(sap.SecurityConfigError, match="client_auth must be"):
         sap.validate_security_config(
             {
                 "transport": "tcp",
                 "security": {
                     "transport_encryption": "mtls",
-                    "client_auth": "ssh",
+                    "client_auth": "none",
                     "server_auth": "transport",
                 },
             }
         )
 
 
-def test_security_rejects_ssh_plus_x509_list(sap: types.ModuleType) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="exactly one"):
+def test_security_rejects_the_removed_auth_methods(sap: types.ModuleType) -> None:
+    """`ssh`/`x509`/`signature` are gone, not merely deprecated."""
+    for method in ("ssh", "x509", "signature"):
+        with pytest.raises(sap.SecurityConfigError, match="client_auth"):
+            sap.validate_security_config(
+                {"transport": "unix", "security": {"client_auth": method}}
+            )
+        with pytest.raises(sap.SecurityConfigError, match="server_auth"):
+            sap.validate_security_config(
+                {"transport": "unix", "security": {"server_auth": method}}
+            )
+
+
+def test_security_enum_values_are_the_mtls_pair(sap: types.ModuleType) -> None:
+    assert sap.CLIENT_AUTH_METHODS == ("transport", "none")
+    assert sap.SERVER_AUTH_METHODS == ("transport", "none")
+
+
+def test_security_rejects_a_non_string_client_auth(sap: types.ModuleType) -> None:
+    with pytest.raises(sap.SecurityConfigError, match="client_auth must be a single string"):
         sap.validate_security_config(
-            {"transport": "unix", "security": {"client_auth": ["ssh", "x509"]}}
+            {"transport": "unix", "security": {"client_auth": ["transport", "none"]}}
         )
-
-
-def test_security_rejects_mixed_client_auth_string(sap: types.ModuleType) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="mixes methods"):
+    with pytest.raises(sap.SecurityConfigError, match="server_auth must be a single string"):
         sap.validate_security_config(
-            {"transport": "unix", "security": {"client_auth": "ssh+x509"}}
+            {"transport": "unix", "security": {"server_auth": ["transport"]}}
         )
 
 
 def test_security_transport_auth_requires_mtls(sap: types.ModuleType) -> None:
     with pytest.raises(sap.SecurityConfigError, match="requires transport_encryption"):
         sap.validate_security_config(
-            {"transport": "unix", "security": {"client_auth": "transport"}}
+            {
+                "transport": "unix",
+                "security": {
+                    "transport_encryption": "none",
+                    "client_auth": "transport",
+                    "server_auth": "none",
+                },
+            }
         )
 
 
@@ -1746,8 +2343,8 @@ def test_security_tcp_none_is_permitted_but_warns(
             "transport": "tcp",
             "security": {
                 "transport_encryption": "none",
-                "client_auth": "ssh",
-                "server_auth": "signature",
+                "client_auth": "none",
+                "server_auth": "none",
             },
         }
     )
@@ -1761,7 +2358,14 @@ def test_security_server_auth_none_warns(
     sap: types.ModuleType, capsys: pytest.CaptureFixture
 ) -> None:
     sap.validate_security_config(
-        {"transport": "unix", "security": {"server_auth": "none"}}
+        {
+            "transport": "unix",
+            "security": {
+                "transport_encryption": "none",
+                "client_auth": "none",
+                "server_auth": "none",
+            },
+        }
     )
 
     assert "server_auth = 'none' is not recommended" in capsys.readouterr().err
@@ -1784,162 +2388,162 @@ def test_security_no_runtime_downgrade_leaves_values_fixed(sap: types.ModuleType
     assert "transport_encryption" not in config["security"]
 
 
-# --- SSH requester auth ----------------------------------------------------
+# --- response freshness, digest binding and replay -------------------------
+#
+# There is no response signature any more (mTLS is the only authentication
+# mechanism), but the *binding* checks are what stop a decision from being
+# re-pointed at another request or replayed, so they are still covered here.
 
 
-def test_ssh_ed25519_round_trip(sap: types.ModuleType, keymaterial: Any) -> None:
-    client = sap.build_security(_client_config(keymaterial), "client")
-    server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial)}, "server"
+def _response_pair(sap: types.ModuleType, security: Any = None):
+    """A (client security, request, response) triple with no signature involved."""
+    security = security or sap.build_security(
+        {"transport": "vsock", "security": _client_security()}, "client"
     )
     request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-
-    block = request["client_auth"]
-    assert block["method"] == "ssh"
-    assert block["alg"] == "ssh-ed25519"
-    assert block["key_id"] == sap.ssh_fingerprint(
-        sap.load_private_key_file(keymaterial.client_private).public_key()
+    sap.attach_client_auth(request, security)
+    response = sap.build_response(
+        request["nonce"], "allow", request=request, security=security, approver="host-user"
     )
-    assert sap.authenticate_request(request, server) == block["key_id"]
+    return security, request, response
 
 
-def test_ssh_tampered_request_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client = sap.build_security(_client_config(keymaterial), "client")
-    server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial)}, "server"
+def test_response_carries_no_authentication_block(sap: types.ModuleType) -> None:
+    """The removed `server_auth` signature must not reappear on the wire."""
+    _, _, response = _response_pair(sap)
+
+    assert "server_auth" not in response
+    assert "signature" not in response
+
+
+def test_response_round_trip(sap: types.ModuleType) -> None:
+    client, request, response = _response_pair(sap)
+
+    assert sap.verify_response(response, request, client, set()) == "allow"
+
+
+def test_response_tampered_decision_rejected(sap: types.ModuleType) -> None:
+    """The decision itself is what arrives; nothing re-authenticates it."""
+    client, request, response = _response_pair(sap)
+    response["decision"] = "maybe"
+
+    with pytest.raises(sap.ProtocolError, match="invalid 'decision'"):
+        sap.verify_response(response, request, client, set())
+
+
+def test_response_tampered_digest_rejected(sap: types.ModuleType) -> None:
+    client, request, response = _response_pair(sap)
+    response["request_digest"] = "0" * 64
+
+    with pytest.raises(sap.ProtocolError, match="request_digest"):
+        sap.verify_response(response, request, client, set())
+
+
+def test_response_digest_binds_every_request_field(sap: types.ModuleType) -> None:
+    """A response for one request must not verify against a mutated one."""
+    client, request, response = _response_pair(sap)
+    mutated = dict(request, service="su")
+
+    with pytest.raises(sap.ProtocolError, match="request_digest"):
+        sap.verify_response(response, mutated, client, set())
+
+
+def test_response_wrong_nonce_rejected(sap: types.ModuleType) -> None:
+    client, request, response = _response_pair(sap)
+    response["nonce"] = base64.b64encode(b"other" * 8).decode()
+
+    with pytest.raises(sap.ProtocolError, match="nonce does not match"):
+        sap.verify_response(response, request, client, set())
+
+
+def test_response_expired_rejected(sap: types.ModuleType) -> None:
+    client, request, response = _response_pair(sap)
+    response["issued_at"] = 1
+    response["expires_at"] = 2
+
+    with pytest.raises(sap.ProtocolError, match="expired"):
+        sap.verify_response(response, request, client, set())
+
+
+def test_response_replay_rejected(sap: types.ModuleType) -> None:
+    client, request, response = _response_pair(sap)
+    consumed: set = set()
+
+    assert sap.verify_response(response, request, client, consumed) == "allow"
+    # A second response for the same nonce is refused (single-use nonce).
+    with pytest.raises(sap.AuthError, match="already been consumed"):
+        sap.verify_response(response, request, client, consumed)
+
+
+# --- X.509 chain building (intermediate CAs) -------------------------------
+
+
+def _issue_ca(parent_cert, parent_key, *, path_length=None, cn: str = "sap-intermediate"):
+    """Issue a CA certificate (BasicConstraints CA:true) from `parent_cert`."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.x509.oid import NameOID
+
+    key = ed25519.Ed25519PrivateKey.generate()
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(parent_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=path_length), critical=True)
+        .sign(parent_key, None)
     )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-    request["cwd"] = "/somewhere/else"  # changed after signing
-
-    with pytest.raises(sap.AuthError, match="signature verification failed"):
-        sap.authenticate_request(request, server)
+    return cert, key
 
 
-def test_ssh_wrong_key_id_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client = sap.build_security(_client_config(keymaterial), "client")
-    server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial)}, "server"
-    )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-    request["client_auth"]["key_id"] = "SHA256:not-a-trusted-key"
-
-    with pytest.raises(sap.AuthError, match="does not match the presented public key"):
-        sap.authenticate_request(request, server)
-
-
-def test_ssh_missing_presented_public_key_rejected(
-    sap: types.ModuleType, keymaterial: Any
+def test_x509_intermediate_chain_accepted(
+    sap: types.ModuleType, crypto: types.ModuleType
 ) -> None:
-    # A Phase-3 client that relied on the server keyring and did not send its
-    # key material must fail closed now that authorization is fingerprint-based.
-    client = sap.build_security(_client_config(keymaterial), "client")
-    server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial)}, "server"
+    """`verify_x509_chain` still walks an explicit multi-cert chain to the root."""
+    root, root_key = _make_ca()
+    intermediate, intermediate_key = _issue_ca(root, root_key)
+    leaf, _leaf_key = _issue_leaf(intermediate, intermediate_key, oid=REQUIRED_OID)
+
+    assert (
+        sap.verify_x509_chain([leaf, intermediate], [root], REQUIRED_OID).subject
+        == leaf.subject
     )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-    del request["client_auth"]["public_key"]
-
-    with pytest.raises(sap.AuthError, match="missing client_auth.public_key"):
-        sap.authenticate_request(request, server)
 
 
-def test_ssh_absent_alg_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client = sap.build_security(_client_config(keymaterial), "client")
-    server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial)}, "server"
-    )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-    del request["client_auth"]["alg"]
+def test_x509_intermediate_chain_requires_the_intermediate(
+    sap: types.ModuleType, crypto: types.ModuleType
+) -> None:
+    """mTLS supplies the peer LEAF only, so a multi-tier CA cannot validate.
 
-    with pytest.raises(sap.AuthError, match="absent or invalid client_auth.alg"):
-        sap.authenticate_request(request, server)
+    `ssl` exposes just the peer certificate, which is why `acl.mode = "ca"` is
+    documented as single-tier (audit A12). This pins that limitation: given the
+    leaf alone, the verifier refuses to guess the intermediate.
+    """
+    root, root_key = _make_ca()
+    intermediate, intermediate_key = _issue_ca(root, root_key)
+    leaf, _leaf_key = _issue_leaf(intermediate, intermediate_key, oid=REQUIRED_OID)
 
-
-def test_ssh_unknown_alg_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client = sap.build_security(_client_config(keymaterial), "client")
-    server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial)}, "server"
-    )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-    request["client_auth"]["alg"] = "ssh-rsa"  # SHA-1: never accepted
-
-    with pytest.raises(sap.AuthError, match="unknown client_auth.alg"):
-        sap.authenticate_request(request, server)
+    with pytest.raises(sap.AuthError, match="no trusted issuer"):
+        sap.verify_x509_chain([leaf], [root], REQUIRED_OID)
 
 
-def test_ssh_rsa_round_trip(sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path) -> None:
+def _crypto_pem():
     from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    private_path = tmp_path / "rsa.key"
-    private_path.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
-    public_line = key.public_key().public_bytes(
-        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
-    ).decode()
-    client = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "ssh",
-                "server_auth": "none",
-                "ssh_signing_key": str(private_path),
-            },
-        },
-        "client",
-    )
-    server = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "ssh",
-                "server_auth": "none",
-                "trusted_keys": [public_line],
-            },
-        },
-        "server",
-    )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-
-    assert request["client_auth"]["alg"] == "rsa-sha2-256"
-    assert sap.authenticate_request(request, server) == request["client_auth"]["key_id"]
+    return serialization.Encoding.PEM
 
 
-def test_ssh_fingerprint_matches_ssh_keygen(
-    sap: types.ModuleType, keymaterial: Any, tmp_path: Path
-) -> None:
-    ssh_keygen = shutil.which("ssh-keygen")
-    if ssh_keygen is None:
-        pytest.skip("ssh-keygen is not available")
-    public_path = tmp_path / "requester.pub"
-    public_path.write_text(keymaterial.client_public + "\n")
-    result = subprocess.run(
-        [ssh_keygen, "-lf", str(public_path)], capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        pytest.skip(f"ssh-keygen cannot read the key: {result.stderr.strip()}")
-
-    theirs = result.stdout.split()[1]
-    ours = sap.parse_openssh_public_key(keymaterial.client_public)[1]
-    assert theirs == ours
-
-
-# --- X.509 requester auth --------------------------------------------------
+# --- certificate material (mTLS) ------------------------------------------
+#
+# The ACL and EKU tests need a real CA plus a leaf that chains to it, written
+# to disk so the `[acl] ca_file` / `[mtls]` paths can be exercised as configured.
 
 
 def _make_ca():
@@ -2042,348 +2646,12 @@ def x509_material(crypto: types.ModuleType, tmp_path: Path):
         leaf_cert=leaf_cert,
         leaf_key=leaf_key,
     )
-
-
-def _x509_security(material: Any, oid: str = REQUIRED_OID) -> tuple[dict, dict]:
-    server = {
-        "transport_encryption": "none",
-        "client_auth": "x509",
-        "server_auth": "none",
-        "ca_file": str(material.tmp_path / "ca.crt"),
-        "client_required_oid": oid,
-    }
-    client = {
-        "transport_encryption": "none",
-        "client_auth": "x509",
-        "server_auth": "none",
-        "client_cert": str(material.tmp_path / "client.crt"),
-        "client_key": str(material.tmp_path / "client.key"),
-    }
-    return server, client
-
-
-def test_x509_round_trip(sap: types.ModuleType, x509_material: Any) -> None:
-    server_sec, client_sec = _x509_security(x509_material)
-    client = sap.build_security({"transport": "unix", "security": client_sec}, "client")
-    server = sap.build_security({"transport": "unix", "security": server_sec}, "server")
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-
-    assert request["client_auth"]["method"] == "x509"
-    assert request["client_auth"]["alg"] == "ed25519"
-    assert sap.authenticate_request(request, server) == request["client_auth"]["key_id"]
-
-
-def test_x509_tampered_request_rejected(sap: types.ModuleType, x509_material: Any) -> None:
-    server_sec, client_sec = _x509_security(x509_material)
-    client = sap.build_security({"transport": "unix", "security": client_sec}, "client")
-    server = sap.build_security({"transport": "unix", "security": server_sec}, "server")
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-    request["service"] = "su"
-
-    with pytest.raises(sap.AuthError, match="signature verification failed"):
-        sap.authenticate_request(request, server)
-
-
-def test_x509_wrong_ca_rejected(sap: types.ModuleType, x509_material: Any) -> None:
-    other_ca, other_key = _make_ca()
-    other_path = x509_material.tmp_path / "other-ca.crt"
-    _write_pem(other_path, other_ca)
-    server_sec, client_sec = _x509_security(x509_material)
-    server_sec = dict(server_sec)
-    server_sec["ca_file"] = str(other_path)
-    client = sap.build_security({"transport": "unix", "security": client_sec}, "client")
-    server = sap.build_security({"transport": "unix", "security": server_sec}, "server")
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-
-    with pytest.raises(sap.AuthError, match="no trusted issuer"):
-        sap.authenticate_request(request, server)
-
-
-def test_x509_missing_eku_rejected(sap: types.ModuleType, tmp_path: Path) -> None:
-    ca_cert, ca_key = _make_ca()
-    leaf_cert, leaf_key = _issue_leaf(ca_cert, ca_key, oid=None)
-    _write_pem(tmp_path / "ca.crt", ca_cert)
-    _write_pem(tmp_path / "client.crt", leaf_cert)
-    _write_key(tmp_path / "client.key", leaf_key)
-    server = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "x509",
-                "server_auth": "none",
-                "ca_file": str(tmp_path / "ca.crt"),
-                "client_required_oid": REQUIRED_OID,
-            },
-        },
-        "server",
-    )
-    client = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "x509",
-                "server_auth": "none",
-                "client_cert": str(tmp_path / "client.crt"),
-                "client_key": str(tmp_path / "client.key"),
-            },
-        },
-        "client",
-    )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-
-    with pytest.raises(sap.AuthError, match="missing required EKU OID"):
-        sap.authenticate_request(request, server)
-
-
-# --- response signing, freshness and replay --------------------------------
-
-
-def _response_pair(sap: types.ModuleType, keymaterial: Any):
-    client = sap.build_security(_client_config(keymaterial), "client")
-    server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial)}, "server"
-    )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-    response = sap.build_response(
-        request["nonce"], "allow", request=request, security=server, approver="host-user"
-    )
-    return client, request, response
-
-
-def test_response_sign_verify_round_trip(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-
-    assert response["server_auth"]["method"] == "signature"
-    assert sap.verify_response(response, request, client, set()) == "allow"
-
-
-def test_response_tampered_decision_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    response["decision"] = "deny"
-
-    with pytest.raises(sap.AuthError, match="signature verification failed"):
-        sap.verify_response(response, request, client, set())
-
-
-def test_response_tampered_digest_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    response["request_digest"] = "0" * 64
-
-    with pytest.raises(sap.ProtocolError, match="request_digest"):
-        sap.verify_response(response, request, client, set())
-
-
-def test_response_wrong_nonce_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    response["nonce"] = base64.b64encode(b"other" * 8).decode()
-
-    with pytest.raises(sap.ProtocolError, match="nonce does not match"):
-        sap.verify_response(response, request, client, set())
-
-
-def test_response_expired_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    response["issued_at"] = 1
-    response["expires_at"] = 2
-
-    with pytest.raises(sap.ProtocolError, match="expired"):
-        sap.verify_response(response, request, client, set())
-
-
-def test_response_replay_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    consumed: set = set()
-
-    assert sap.verify_response(response, request, client, consumed) == "allow"
-    # A second response for the same nonce is refused (single-use nonce).
-    with pytest.raises(sap.AuthError, match="already been consumed"):
-        sap.verify_response(response, request, client, consumed)
-
-
-def test_response_unknown_alg_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    response["server_auth"]["alg"] = "ssh-rsa"
-
-    with pytest.raises(sap.AuthError, match="unknown or absent server_auth.alg"):
-        sap.verify_response(response, request, client, set())
-
-
-def test_response_absent_alg_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    del response["server_auth"]["alg"]
-
-    with pytest.raises(sap.AuthError, match="unknown or absent server_auth.alg"):
-        sap.verify_response(response, request, client, set())
-
-
-def test_response_wrong_key_id_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    response["server_auth"]["key_id"] = "SHA256:not-the-host-key"
-
-    with pytest.raises(sap.AuthError, match="not in the trusted keyring"):
-        sap.verify_response(response, request, client, set())
-
-
-def test_response_missing_signature_rejected(sap: types.ModuleType, keymaterial: Any) -> None:
-    client, request, response = _response_pair(sap, keymaterial)
-    del response["server_auth"]["signature"]
-
-    with pytest.raises(sap.AuthError, match="missing server_auth.signature"):
-        sap.verify_response(response, request, client, set())
-
-
-# --- X.509 chain building (intermediate CAs) -------------------------------
-
-
-def _issue_ca(parent_cert, parent_key, *, path_length=None, cn: str = "sap-intermediate"):
-    """Issue a CA certificate (BasicConstraints CA:true) from `parent_cert`."""
-    import datetime
-
-    from cryptography import x509
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.x509.oid import NameOID
-
-    key = ed25519.Ed25519PrivateKey.generate()
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-    now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(parent_cert.subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=1))
-        .not_valid_after(now + datetime.timedelta(days=1))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=path_length), critical=True)
-        .sign(parent_key, None)
-    )
-    return cert, key
-
-
-def test_x509_intermediate_chain_accepted(sap: types.ModuleType, tmp_path: Path) -> None:
-    root, root_key = _make_ca()
-    intermediate, intermediate_key = _issue_ca(root, root_key)
-    leaf, leaf_key = _issue_leaf(intermediate, intermediate_key, oid=REQUIRED_OID)
-    # The client sends leaf + intermediate; the root is the trust anchor.
-    chain_pem = b"".join(
-        cert.public_bytes(_crypto_pem()) for cert in (leaf, intermediate)
-    )
-    (tmp_path / "ca.crt").write_bytes(root.public_bytes(_crypto_pem()))
-    (tmp_path / "client.crt").write_bytes(chain_pem)
-    _write_key(tmp_path / "client.key", leaf_key)
-
-    server = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "x509",
-                "server_auth": "none",
-                "ca_file": str(tmp_path / "ca.crt"),
-                "client_required_oid": REQUIRED_OID,
-            },
-        },
-        "server",
-    )
-    client = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "x509",
-                "server_auth": "none",
-                "client_cert": str(tmp_path / "client.crt"),
-                "client_key": str(tmp_path / "client.key"),
-            },
-        },
-        "client",
-    )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
-
-    assert sap.authenticate_request(request, server) == request["client_auth"]["key_id"]
-
-
-def _crypto_pem():
-    from cryptography.hazmat.primitives import serialization
-
-    return serialization.Encoding.PEM
-
-
-# --- fail-closed configuration / key material ------------------------------
-
-
-def test_build_security_missing_signing_key_fails_closed(
-    sap: types.ModuleType, tmp_path: Path
-) -> None:
-    config = {
-        "transport": "unix",
-        "security": {
-            "transport_encryption": "none",
-            "client_auth": "ssh",
-            "server_auth": "none",
-            "ssh_signing_key": str(tmp_path / "absent.key"),
-        },
-    }
-
-    with pytest.raises(sap.SecurityConfigError, match="cannot read private key"):
-        sap.build_security(config, "client")
-
-
-def test_build_security_rejects_bare_fingerprint_keyring(
-    sap: types.ModuleType, keymaterial: Any
-) -> None:
-    # A fingerprint cannot verify a host signature, so the `[security]`
-    # host-key keyring still rejects bare fingerprints; fingerprints belong in
-    # the `[acl]`, which is an authorization list, not a verification keyring.
-    config = {
-        "transport": "unix",
-        "security": {
-            "transport_encryption": "none",
-            "client_auth": "ssh",
-            "server_auth": "signature",
-            "ssh_signing_key": keymaterial.client_private,
-            "trusted_server_keys": ["SHA256:AbCdEf123"],
-        },
-    }
-
-    with pytest.raises(sap.SecurityConfigError, match="not bare"):
-        sap.build_security(config, "client")
-
-
-def test_run_client_missing_signing_key_exits_nonzero(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(sap, "recursion_guard_active", lambda: False)
-    config = {
-        "transport": "tcp",
-        "security": {
-            "transport_encryption": "none",
-            "client_auth": "ssh",
-            "server_auth": "none",
-            "ssh_signing_key": "/nonexistent/sap/key",
-        },
-    }
-
-    with pytest.raises(SystemExit) as exc:
-        sap.run_client(config)
-
-    assert exc.value.code == 1
-
-
 # --- Phase 4: authorization / trust roots (ACL) ----------------------------
 #
 # The `[acl]` decides who may use the mechanism. It is evaluated AFTER the
 # cryptographic verification of `client_auth` and BEFORE any dialog, and it
-# matches ONLY the verified credential (SSH fingerprint, X.509/mTLS SPKI, or a
-# CA chain + EKU). Metadata (`target_user`, `rhost`, `tty`, `guest_hint`, ...)
+# matches ONLY the verified credential: the mTLS leaf SPKI fingerprint, or a
+# CA chain + EKU. Metadata (`target_user`, `rhost`, `tty`, `guest_hint`, ...)
 # never influences the decision (doc §8; review logs S11/NF6).
 
 # a syntactically valid fingerprint of a 32-byte SHA-256 digest that no test
@@ -2391,32 +2659,32 @@ def test_run_client_missing_signing_key_exits_nonzero(
 _UNLISTED_FINGERPRINT = "SHA256:" + base64.b64encode(b"\x00" * 32).decode().rstrip("=")
 
 
-def _server_with_acl(
-    sap: types.ModuleType, keys: Any, acl: dict, security: Any = None
-) -> Any:
-    """Build a server `SecurityConfig` with the given `[acl]` (default ssh)."""
-    config = {
-        "transport": "unix",
-        "security": _server_security(keys) if security is None else security,
-        "acl": acl,
-    }
+def _server_with_acl(sap: types.ModuleType, _material: Any, acl: dict) -> Any:
+    """Build a server `SecurityConfig` whose credential is the mTLS peer cert."""
+    config = {"transport": "unix", "security": _mtls_server_security(), "acl": acl}
     return sap.build_security(config, "server")
 
 
 def _transport_server(sap: types.ModuleType, acl: dict) -> Any:
     """A server whose requester credential is the mTLS transport certificate."""
-    security = {
-        "transport_encryption": "mtls",
-        "client_auth": "transport",
-        "server_auth": "transport",
-    }
-    return sap.build_security(
-        {"transport": "unix", "security": security, "acl": acl}, "server"
-    )
+    return _server_with_acl(sap, None, acl)
 
 
 def _ca_path(material: Any) -> str:
     return str(material.tmp_path / "ca.crt")
+
+
+def _leaf_der(material: Any) -> bytes:
+    from cryptography.hazmat.primitives.serialization import Encoding
+
+    return material.leaf_cert.public_bytes(Encoding.DER)
+
+
+def _mtls_request(sap: types.ModuleType, **overrides: Any) -> dict:
+    """An mTLS request: the channel certificate is the credential."""
+    request = _request_obj(sap, **overrides)
+    request["client_auth"] = {"method": "transport"}
+    return request
 
 
 # -- ACL config validation ---------------------------------------------------
@@ -2426,8 +2694,9 @@ def test_acl_absent_is_deny_all_list(sap: types.ModuleType) -> None:
     acl = sap.load_acl_config({})
 
     assert acl.mode == "list"
-    assert acl.trusted_keys == frozenset()
     assert acl.trusted_fingerprints == frozenset()
+    assert acl.ca_file is None
+    assert acl.required_oid is None
     assert sap.acl_allows_any(acl) is False
 
 
@@ -2442,7 +2711,9 @@ def test_acl_ca_requires_ca_file(sap: types.ModuleType) -> None:
         sap.load_acl_config({"acl": {"mode": "ca", "required_oid": REQUIRED_OID}})
 
 
-def test_acl_ca_requires_required_oid(sap: types.ModuleType, tmp_path: Path) -> None:
+def test_acl_ca_requires_required_oid(
+    sap: types.ModuleType, tmp_path: Path, crypto: types.ModuleType
+) -> None:
     ca_cert, _ = _make_ca()
     ca_path = tmp_path / "ca.crt"
     _write_pem(ca_path, ca_cert)
@@ -2451,22 +2722,29 @@ def test_acl_ca_requires_required_oid(sap: types.ModuleType, tmp_path: Path) -> 
         sap.load_acl_config({"acl": {"mode": "ca", "ca_file": str(ca_path)}})
 
 
-def test_acl_ca_rejects_trusted_keys(sap: types.ModuleType, tmp_path: Path) -> None:
-    ca_cert, _ = _make_ca()
-    ca_path = tmp_path / "ca.crt"
-    _write_pem(ca_path, ca_cert)
+def test_acl_rejects_the_removed_trusted_keys(sap: types.ModuleType) -> None:
+    """`[acl] trusted_keys` (SSH fingerprints) went with `client_auth = "ssh"`
 
-    # no `ca` + `list` combination: a CA mode must not also carry SSH pins
-    with pytest.raises(sap.SecurityConfigError, match="no ca.list combination"):
-        sap.load_acl_config(
+It is no longer *ignored*, which is what used to make a stale key a silent
+no-op: the schema refuses it, so the operator is told to migrate the entry to
+`trusted_fingerprints` instead of left believing it still authorizes someone.
+"""
+    with pytest.raises(sap.SecurityConfigError, match="trusted_keys"):
+        sap.build_security(
             {
-                "acl": {
-                    "mode": "ca",
-                    "ca_file": str(ca_path),
-                    "required_oid": REQUIRED_OID,
-                    "trusted_keys": [_UNLISTED_FINGERPRINT],
-                }
-            }
+                "transport": "unix",
+                "security": _server_security(),
+                "acl": {"mode": "list", "trusted_keys": ["SHA256:x"]},
+            },
+            "server",
+        )
+
+    # What the schema-clean spelling of that list means: an empty one denies.
+    acl = sap.load_acl_config({"acl": {"mode": "list"}})
+    assert acl.trusted_fingerprints == frozenset()
+    with pytest.raises(sap.AuthError, match="not in the authorization list"):
+        sap.authorize_request(
+            _mtls_request(sap), _server_with_acl(sap, None, _acl_list()), "SHA256:x"
         )
 
 
@@ -2482,18 +2760,20 @@ def test_acl_list_rejects_ca_file(sap: types.ModuleType, tmp_path: Path) -> None
     ["MD5:abcd", "SHA256:", "SHA256:notbase64!!", "SHA256:AAAA", 123],
 )
 def test_acl_rejects_malformed_fingerprint(sap: types.ModuleType, entry: Any) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="trusted_keys"):
-        sap.load_acl_config({"acl": {"mode": "list", "trusted_keys": [entry]}})
+    with pytest.raises(sap.SecurityConfigError, match="trusted_fingerprints"):
+        sap.load_acl_config(
+            {"acl": {"mode": "list", "trusted_fingerprints": [entry]}}
+        )
 
 
 def test_acl_normalizes_padded_fingerprint(sap: types.ModuleType) -> None:
     body = base64.b64encode(b"\x01" * 32).decode().rstrip("=")
 
     acl = sap.load_acl_config(
-        {"acl": {"mode": "list", "trusted_keys": [f"SHA256:{body}="]}}
+        {"acl": {"mode": "list", "trusted_fingerprints": [f"SHA256:{body}="]}}
     )
 
-    assert acl.trusted_keys == frozenset({f"SHA256:{body}"})
+    assert acl.trusted_fingerprints == frozenset({f"SHA256:{body}"})
 
 
 def test_acl_labels_must_be_string_map(sap: types.ModuleType) -> None:
@@ -2503,80 +2783,69 @@ def test_acl_labels_must_be_string_map(sap: types.ModuleType) -> None:
         )
 
 
-def test_acl_ca_with_ssh_client_auth_rejected(
-    sap: types.ModuleType, keymaterial: Any, tmp_path: Path
-) -> None:
-    ca_cert, _ = _make_ca()
-    ca_path = tmp_path / "ca.crt"
-    _write_pem(ca_path, ca_cert)
-
-    with pytest.raises(sap.SecurityConfigError, match="cannot authorize client_auth = 'ssh'"):
-        _server_with_acl(
-            sap,
-            keymaterial,
-            {"mode": "ca", "ca_file": str(ca_path), "required_oid": REQUIRED_OID},
-        )
-
-
 # -- mode = "list" -----------------------------------------------------------
 
 
-def test_acl_list_allows_listed_ssh_fingerprint(
-    sap: types.ModuleType, keymaterial: Any
+def test_acl_list_allows_listed_mtls_spki(
+    sap: types.ModuleType, x509_material: Any
 ) -> None:
-    fingerprint = _fingerprint(sap, keymaterial.client_public)
-    server = _server_with_acl(sap, keymaterial, _acl_list(fingerprint))
-    request = _signed_request(sap, keymaterial)
+    spki = _spki(sap, x509_material.leaf_cert)
+    server = _server_with_acl(sap, x509_material, _acl_list(spki))
+    request = _mtls_request(sap)
+    der = _leaf_der(x509_material)
 
-    verified = sap.authenticate_request(request, server)
+    verified = sap.authenticate_request(request, server, peer_cert_der=der)
 
-    assert verified == fingerprint
-    assert sap.authorize_request(request, server, verified) == fingerprint
+    assert verified == spki
+    assert sap.authorize_request(request, server, verified, peer_cert_der=der) == spki
 
 
-def test_acl_list_denies_unlisted_but_valid_signature(
-    sap: types.ModuleType, keymaterial: Any
+def test_acl_list_denies_unlisted_but_valid_certificate(
+    sap: types.ModuleType, x509_material: Any
 ) -> None:
-    # The signature is genuine, but the key is not listed: authentication
-    # succeeds and authorization still refuses (a verified key is not trusted).
-    server = _server_with_acl(sap, keymaterial, _acl_list(_UNLISTED_FINGERPRINT))
-    request = _signed_request(sap, keymaterial)
+    # The certificate is genuine and chains to nothing in particular, but its
+    # SPKI is not listed: authentication succeeds and authorization refuses.
+    server = _server_with_acl(sap, x509_material, _acl_list(_UNLISTED_FINGERPRINT))
+    request = _mtls_request(sap)
+    der = _leaf_der(x509_material)
 
-    verified = sap.authenticate_request(request, server)
+    verified = sap.authenticate_request(request, server, peer_cert_der=der)
     with pytest.raises(sap.AuthError, match="not in the authorization list"):
-        sap.authorize_request(request, server, verified)
+        sap.authorize_request(request, server, verified, peer_cert_der=der)
 
 
-def test_acl_list_empty_denies_everyone(sap: types.ModuleType, keymaterial: Any) -> None:
-    server = _server_with_acl(sap, keymaterial, _acl_list())
-    request = _signed_request(sap, keymaterial)
+def test_acl_list_empty_denies_everyone(sap: types.ModuleType, x509_material: Any) -> None:
+    server = _server_with_acl(sap, x509_material, _acl_list())
+    request = _mtls_request(sap)
+    der = _leaf_der(x509_material)
 
-    verified = sap.authenticate_request(request, server)
+    verified = sap.authenticate_request(request, server, peer_cert_der=der)
     with pytest.raises(sap.AuthError, match="not in the authorization list"):
-        sap.authorize_request(request, server, verified)
+        sap.authorize_request(request, server, verified, peer_cert_der=der)
 
 
-def test_acl_label_is_display_only(sap: types.ModuleType, keymaterial: Any) -> None:
-    fingerprint = _fingerprint(sap, keymaterial.client_public)
+def test_acl_label_is_display_only(sap: types.ModuleType, x509_material: Any) -> None:
+    spki = _spki(sap, x509_material.leaf_cert)
     acl = {
         "mode": "list",
-        "trusted_keys": [fingerprint],
-        "labels": {fingerprint: "vault"},
+        "trusted_fingerprints": [spki],
+        "labels": {spki: "vault"},
     }
-    server = _server_with_acl(sap, keymaterial, acl)
-    request = _signed_request(sap, keymaterial)
+    server = _server_with_acl(sap, x509_material, acl)
+    request = _mtls_request(sap)
+    der = _leaf_der(x509_material)
 
-    verified = sap.authenticate_request(request, server)
+    verified = sap.authenticate_request(request, server, peer_cert_der=der)
 
-    assert sap.authorize_request(request, server, verified) == "vault"
+    assert sap.authorize_request(request, server, verified, peer_cert_der=der) == "vault"
 
 
 def test_acl_decision_ignores_request_metadata(
-    sap: types.ModuleType, keymaterial: Any
+    sap: types.ModuleType, x509_material: Any
 ) -> None:
-    fingerprint = _fingerprint(sap, keymaterial.client_public)
-    allow_server = _server_with_acl(sap, keymaterial, _acl_list(fingerprint))
-    deny_server = _server_with_acl(sap, keymaterial, _acl_list())
+    spki = _spki(sap, x509_material.leaf_cert)
+    allow_server = _server_with_acl(sap, x509_material, _acl_list(spki))
+    deny_server = _server_with_acl(sap, x509_material, _acl_list())
     metadata = {
         "target_user": "daemon",
         "invoking_user": "mallory",
@@ -2584,53 +2853,88 @@ def test_acl_decision_ignores_request_metadata(
         "tty": "/dev/pts/7",
         "guest_hint": "evil",
     }
-    request = _signed_request(sap, keymaterial, **metadata)
+    request = _mtls_request(sap, **metadata)
+    der = _leaf_der(x509_material)
 
-    verified = sap.authenticate_request(request, allow_server)
-    assert sap.authorize_request(request, allow_server, verified) == fingerprint
+    verified = sap.authenticate_request(request, allow_server, peer_cert_der=der)
+    assert sap.authorize_request(request, allow_server, verified, peer_cert_der=der) == spki
 
-    # the same metadata must not rescue an unlisted credential either
-    denied = sap.authenticate_request(request, deny_server)
+    # the same metadata must not rescue an unlisted certificate either
+    denied = sap.authenticate_request(request, deny_server, peer_cert_der=der)
     with pytest.raises(sap.AuthError, match="not in the authorization list"):
-        sap.authorize_request(request, deny_server, denied)
+        sap.authorize_request(request, deny_server, denied, peer_cert_der=der)
 
 
 # -- ACL is enforced before the dialog ---------------------------------------
 
 
-def test_handler_acl_denial_is_signed_and_never_prompts(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, keymaterial: Any
+def test_handler_acl_denial_is_never_prompted(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, x509_material: Any
 ) -> None:
-    request = _signed_request(sap, keymaterial)
-    frames, prompts = _exchange(
-        sap, monkeypatch, [], _frame(sap, request), keymaterial, acl=_acl_list()
-    )
-
-    assert prompts == []
-    # A denial is answered without a dialog, so there is no `auth_pending`; the
-    # sole frame is the signed deny (audit A2).
-    assert len(frames) == 1
-    parsed = _decode(sap, frames[0])
-    assert parsed["type"] == "auth_response"
-    assert parsed["decision"] == "deny"
-    assert parsed["nonce"] == request["nonce"]
-    assert parsed["server_auth"]["method"] == "signature"
-    # the deny is a genuine, request-bound signed response
-    client = sap.build_security(_client_config(keymaterial), "client")
-    assert sap.verify_response(parsed, request, client, set()) == "deny"
-
-
-def test_handler_untrusted_but_valid_signature_no_prompt(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, keymaterial: Any
-) -> None:
-    request = _signed_request(sap, keymaterial)
+    """An authenticated-but-unauthorized mTLS request is denied without a dialog."""
+    der = _leaf_der(x509_material)
+    request = _mtls_request(sap)
     frames, prompts = _exchange(
         sap,
         monkeypatch,
         [],
         _frame(sap, request),
-        keymaterial,
+        acl=_acl_list(),
+        security=_mtls_server_security(),
+        peer_cert_der=der,
+    )
+
+    assert prompts == []
+    # A denial is answered without a dialog, so there is no `auth_pending`; the
+    # sole frame is the deny (audit A2).
+    assert len(frames) == 1
+    parsed = _decode(sap, frames[0])
+    assert parsed["type"] == "auth_response"
+    assert parsed["decision"] == "deny"
+    assert parsed["nonce"] == request["nonce"]
+    # the deny is a genuine, request-bound response
+    client = sap.build_security(_mtls_client_config(), "client")
+    assert sap.verify_response(parsed, request, client, set()) == "deny"
+
+
+def test_handler_acl_allows_listed_mtls_certificate_and_prompts(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, x509_material: Any
+) -> None:
+    """The full mTLS flow: a verified, authorized request reaches the dialog."""
+    der = _leaf_der(x509_material)
+    spki = _spki(sap, x509_material.leaf_cert)
+    request = _mtls_request(sap)
+    frames, prompts = _exchange(
+        sap,
+        monkeypatch,
+        [True],
+        _frame(sap, request),
+        acl=_acl_list(spki),
+        security=_mtls_server_security(),
+        peer_cert_der=der,
+    )
+
+    assert len(prompts) == 1
+    confirmation, _program = prompts[0]
+    # the dialog shows the *verified* SPKI (sanitised) as the requester
+    assert confirmation.identity == sap.sanitize_field(spki)
+    assert _decode(sap, frames[1])["decision"] == "allow"
+
+
+def test_handler_wrong_mtls_certificate_never_prompts(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, x509_material: Any
+) -> None:
+    """A genuine certificate whose SPKI is not pinned is denied, silently."""
+    der = _leaf_der(x509_material)
+    request = _mtls_request(sap)
+    frames, prompts = _exchange(
+        sap,
+        monkeypatch,
+        [],
+        _frame(sap, request),
         acl=_acl_list(_UNLISTED_FINGERPRINT),
+        security=_mtls_server_security(),
+        peer_cert_der=der,
     )
 
     assert prompts == []
@@ -2638,89 +2942,62 @@ def test_handler_untrusted_but_valid_signature_no_prompt(
     assert _decode(sap, frames[0])["decision"] == "deny"
 
 
-def test_handler_authentication_failure_never_prompts(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, keymaterial: Any
-) -> None:
-    request = _signed_request(sap, keymaterial)
-    request["cwd"] = "/tampered"  # signature no longer covers the body
-    frames, prompts = _exchange(
-        sap, monkeypatch, [], _frame(sap, request), keymaterial
-    )
-
-    # authentication runs before the ACL; a bad signature is never answered
-    assert frames == []
-    assert prompts == []
-
-
 # -- mode = "ca" -------------------------------------------------------------
 
 
-def test_acl_ca_allows_chained_cert(
-    sap: types.ModuleType, x509_material: Any
-) -> None:
-    server_sec, client_sec = _x509_security(x509_material)
+def test_acl_ca_allows_chained_cert(sap: types.ModuleType, x509_material: Any) -> None:
     server = _server_with_acl(
         sap,
         x509_material,
         {"mode": "ca", "ca_file": _ca_path(x509_material), "required_oid": REQUIRED_OID},
-        security=server_sec,
     )
-    client = sap.build_security({"transport": "unix", "security": client_sec}, "client")
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
+    request = _mtls_request(sap)
+    der = _leaf_der(x509_material)
 
-    verified = sap.authenticate_request(request, server)
+    verified = sap.authenticate_request(request, server, peer_cert_der=der)
 
-    assert sap.authorize_request(request, server, verified) == verified
+    assert sap.authorize_request(request, server, verified, peer_cert_der=der) == verified
 
 
 def test_acl_ca_denies_wrong_ca(sap: types.ModuleType, x509_material: Any) -> None:
     other_ca, _ = _make_ca()
     other_path = x509_material.tmp_path / "other-ca.crt"
     _write_pem(other_path, other_ca)
-    server_sec, client_sec = _x509_security(x509_material)
     server = _server_with_acl(
         sap,
         x509_material,
         {"mode": "ca", "ca_file": str(other_path), "required_oid": REQUIRED_OID},
-        security=server_sec,
     )
-    client = sap.build_security({"transport": "unix", "security": client_sec}, "client")
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
+    request = _mtls_request(sap)
+    der = _leaf_der(x509_material)
 
-    verified = sap.authenticate_request(request, server)
+    verified = sap.authenticate_request(request, server, peer_cert_der=der)
     with pytest.raises(sap.AuthError, match="no trusted issuer"):
-        sap.authorize_request(request, server, verified)
+        sap.authorize_request(request, server, verified, peer_cert_der=der)
 
 
 def test_acl_ca_denies_missing_eku_at_acl_layer(
     sap: types.ModuleType, x509_material: Any
 ) -> None:
-    # The security layer requires REQUIRED_OID (the leaf has it), so
-    # authentication passes; the ACL requires a *different* OID and refuses.
-    server_sec, client_sec = _x509_security(x509_material)
+    # The transport layer enforces the peer OID from `[mtls].peer_required_oid`;
+    # the ACL requires a *different* OID and refuses on its own.
     server = _server_with_acl(
         sap,
         x509_material,
         {"mode": "ca", "ca_file": _ca_path(x509_material), "required_oid": OTHER_OID},
-        security=server_sec,
     )
-    client = sap.build_security({"transport": "unix", "security": client_sec}, "client")
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
+    request = _mtls_request(sap)
+    der = _leaf_der(x509_material)
 
-    verified = sap.authenticate_request(request, server)
+    verified = sap.authenticate_request(request, server, peer_cert_der=der)
     with pytest.raises(sap.AuthError, match="missing required EKU OID"):
-        sap.authorize_request(request, server, verified)
+        sap.authorize_request(request, server, verified, peer_cert_der=der)
 
 
 def test_acl_ca_optional_spki_pin(sap: types.ModuleType, x509_material: Any) -> None:
-    server_sec, client_sec = _x509_security(x509_material)
-    spki = sap.spki_fingerprint(x509_material.leaf_cert.public_key())
-    client = sap.build_security({"transport": "unix", "security": client_sec}, "client")
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
+    spki = _spki(sap, x509_material.leaf_cert)
+    request = _mtls_request(sap)
+    der = _leaf_der(x509_material)
 
     # a matching pin does not change the CA-mode allow
     server_ok = _server_with_acl(
@@ -2732,10 +3009,9 @@ def test_acl_ca_optional_spki_pin(sap: types.ModuleType, x509_material: Any) -> 
             "required_oid": REQUIRED_OID,
             "trusted_fingerprints": [spki],
         },
-        security=server_sec,
     )
-    verified = sap.authenticate_request(request, server_ok)
-    assert sap.authorize_request(request, server_ok, verified) == verified
+    verified = sap.authenticate_request(request, server_ok, peer_cert_der=der)
+    assert sap.authorize_request(request, server_ok, verified, peer_cert_der=der) == verified
 
     # a mismatched pin narrows the CA trust to a deny
     server_bad = _server_with_acl(
@@ -2747,11 +3023,10 @@ def test_acl_ca_optional_spki_pin(sap: types.ModuleType, x509_material: Any) -> 
             "required_oid": REQUIRED_OID,
             "trusted_fingerprints": [_UNLISTED_FINGERPRINT],
         },
-        security=server_sec,
     )
-    mismatched = sap.authenticate_request(request, server_bad)
+    mismatched = sap.authenticate_request(request, server_bad, peer_cert_der=der)
     with pytest.raises(sap.AuthError, match="SPKI is not in the authorization list"):
-        sap.authorize_request(request, server_bad, mismatched)
+        sap.authorize_request(request, server_bad, mismatched, peer_cert_der=der)
 
 
 def test_acl_ca_denies_expired_cert(
@@ -2759,9 +3034,11 @@ def test_acl_ca_denies_expired_cert(
 ) -> None:
     import datetime
 
+    from cryptography.hazmat.primitives.serialization import Encoding
+
     ca_cert, ca_key = _make_ca()
     now = datetime.datetime.now(datetime.timezone.utc)
-    leaf, leaf_key = _issue_leaf(
+    leaf, _leaf_key = _issue_leaf(
         ca_cert,
         ca_key,
         oid=REQUIRED_OID,
@@ -2769,44 +3046,17 @@ def test_acl_ca_denies_expired_cert(
         not_after=now - datetime.timedelta(days=1),
     )
     _write_pem(tmp_path / "ca.crt", ca_cert)
-    _write_pem(tmp_path / "client.crt", leaf)
-    _write_key(tmp_path / "client.key", leaf_key)
-    server = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "x509",
-                "server_auth": "none",
-                "ca_file": str(tmp_path / "ca.crt"),
-                "client_required_oid": REQUIRED_OID,
-            },
-            "acl": {
-                "mode": "ca",
-                "ca_file": str(tmp_path / "ca.crt"),
-                "required_oid": REQUIRED_OID,
-            },
-        },
-        "server",
+    der = leaf.public_bytes(Encoding.DER)
+    server = _server_with_acl(
+        sap,
+        None,
+        {"mode": "ca", "ca_file": str(tmp_path / "ca.crt"), "required_oid": REQUIRED_OID},
     )
-    client = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "x509",
-                "server_auth": "none",
-                "client_cert": str(tmp_path / "client.crt"),
-                "client_key": str(tmp_path / "client.key"),
-            },
-        },
-        "client",
-    )
-    request = _request_obj(sap)
-    sap.attach_client_auth(request, client)
+    request = _mtls_request(sap)
 
+    verified = sap.authenticate_request(request, server, peer_cert_der=der)
     with pytest.raises(sap.AuthError, match="outside its validity window"):
-        sap.authenticate_request(request, server)
+        sap.authorize_request(request, server, verified, peer_cert_der=der)
 
 
 # -- mTLS transport credential pinning (NF6) ---------------------------------
@@ -2818,8 +3068,7 @@ def test_acl_list_pins_mtls_spki(sap: types.ModuleType, crypto: types.ModuleType
     cert = _build_cert(REQUIRED_OID)
     der = cert.public_bytes(Encoding.DER)
     spki = sap.spki_fingerprint(cert.public_key())
-    request = _request_obj(sap)
-    request["client_auth"] = {"method": "transport"}
+    request = _mtls_request(sap)
     server = _transport_server(sap, {"mode": "list", "trusted_fingerprints": [spki]})
 
     verified = sap.authenticate_request(request, server, peer_cert_der=der)
@@ -2841,8 +3090,7 @@ def test_acl_ca_authorizes_mtls_cert(
     leaf, _ = _issue_leaf(ca_cert, ca_key, oid=REQUIRED_OID)
     _write_pem(tmp_path / "ca.crt", ca_cert)
     der = leaf.public_bytes(Encoding.DER)
-    request = _request_obj(sap)
-    request["client_auth"] = {"method": "transport"}
+    request = _mtls_request(sap)
     server = _transport_server(
         sap,
         {"mode": "ca", "ca_file": str(tmp_path / "ca.crt"), "required_oid": REQUIRED_OID},
@@ -2937,7 +3185,6 @@ def test_receive_timeout_bounds_a_silent_unix_peer(
     sap: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    keymaterial: Any,
 ) -> None:
     """A listening-but-never-accepting peer must not hang the read.
 
@@ -2955,7 +3202,7 @@ def test_receive_timeout_bounds_a_silent_unix_peer(
         listener.listen(1)
         monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_path))
-        config = _client_config(keymaterial)
+        config = _client_config()
         config.update(connect_timeout=0.2, recv_timeout=0.3, decision_timeout=120)
 
         start = time.monotonic()
@@ -2981,7 +3228,6 @@ def test_unbound_unix_socket_fails_fast(
     sap: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    keymaterial: Any,
 ) -> None:
     """A bound but never-``listen()``ed socket fails fast (Linux: ECONNREFUSED).
 
@@ -2994,7 +3240,7 @@ def test_unbound_unix_socket_fails_fast(
         listener.bind(str(sock_path))
         monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_path))
-        config = _client_config(keymaterial)
+        config = _client_config()
         config.update(connect_timeout=0.2, recv_timeout=0.3, decision_timeout=120)
 
         start = time.monotonic()
@@ -3011,7 +3257,6 @@ def test_unbound_unix_socket_fails_fast(
 def test_closed_tcp_port_fails_within_connect_timeout(
     sap: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
-    keymaterial: Any,
 ) -> None:
     """A refused TCP connect returns within the bound instead of hanging.
 
@@ -3035,7 +3280,7 @@ def test_closed_tcp_port_fails_within_connect_timeout(
         "connect_timeout": 0.2,
         "recv_timeout": 0.3,
         "decision_timeout": 120,
-        "security": _client_security(keymaterial),
+        "security": _client_security(),
     }
 
     start = time.monotonic()
@@ -3072,19 +3317,13 @@ def test_numeric_host_does_not_invoke_dns(
                 "transport": "tcp",
                 "host": "127.0.0.1",
                 "port": port,
-                "security": {
-                    "transport_encryption": "none",
-                    "client_auth": "ssh",
-                    "server_auth": "none",
-                },
+                "security": _client_security(),
             },
             "tcp",
         )
         sock = transport.connect()
-        try:
-            assert sock is not None
-        finally:
-            sock.close()
+        assert sock is not None
+        sock.close()
     finally:
         listener.close()
 
@@ -3093,7 +3332,6 @@ def test_denied_is_logged_distinctly_from_unavailable(
     sap: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    keymaterial: Any,
     capsys: pytest.CaptureFixture,
 ) -> None:
     """`deny` logs ``denied``; a failure logs ``unavailable`` (doc §6.7)."""
@@ -3105,7 +3343,7 @@ def test_denied_is_logged_distinctly_from_unavailable(
         listener.listen(1)
         monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(silent_path))
-        config = _client_config(keymaterial)
+        config = _client_config()
         config.update(connect_timeout=0.2, recv_timeout=0.2, decision_timeout=120)
         with pytest.raises(SystemExit):
             sap.run_client(config)
@@ -3124,10 +3362,10 @@ def test_denied_is_logged_distinctly_from_unavailable(
     deny_path = tmp_path / "deny-log.sock"
     monkeypatch.setattr(sap, "prompt_for_confirmation", lambda _peer, _program: False)
     monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
-    with _unix_server(sap, deny_path, keymaterial):
+    with _unix_server(sap, deny_path):
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(deny_path))
         with pytest.raises(SystemExit) as exc:
-            sap.run_client(_client_config(keymaterial))
+            sap.run_client(_client_config())
     denied_err = capsys.readouterr().err
 
     assert exc.value.code == 1
@@ -3171,7 +3409,6 @@ def test_default_recv_timeout_survives_slow_human_via_pending_frame(
     sap: types.ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    keymaterial: Any,
 ) -> None:
     """The shipped 0.5 s first-frame bound must not abort a slower human.
 
@@ -3191,9 +3428,9 @@ def test_default_recv_timeout_survives_slow_human_via_pending_frame(
     monkeypatch.setattr(sap, "prompt_for_confirmation", slow_prompt)
     monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
 
-    with _unix_server(sap, sock_path, keymaterial):
+    with _unix_server(sap, sock_path):
         monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_path))
-        config = _client_config(keymaterial)
+        config = _client_config()
         config.update(recv_timeout=0.5, decision_timeout=120)
         start = time.monotonic()
         with pytest.raises(SystemExit) as exc:
@@ -3205,10 +3442,10 @@ def test_default_recv_timeout_survives_slow_human_via_pending_frame(
 
 
 def test_pending_frame_must_match_the_request_nonce(
-    sap: types.ModuleType, keymaterial: Any
+    sap: types.ModuleType
 ) -> None:
     """An ack for another nonce (or a bad/missing type) is rejected (A2)."""
-    request = _signed_request(sap, keymaterial)
+    request = _authed_request(sap)
     other = base64.b64encode(b"o" * 32).decode()
 
     # a valid ack passes
@@ -3226,7 +3463,7 @@ def test_pending_frame_must_match_the_request_nonce(
 
 
 def test_idle_preauth_connection_is_dropped(
-    sap: types.ModuleType, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, tmp_path: Path
 ) -> None:
     """A peer that connects and sends nothing is dropped within the bound (A3).
 
@@ -3245,8 +3482,8 @@ def test_idle_preauth_connection_is_dropped(
         "dialog_program": "zenity",
         "server_read_timeout": 0.3,
         "max_connections": 4,
-        "security": _server_security(keymaterial),
-        "acl": _acl_for(sap, keymaterial),
+        "security": _server_security(),
+        "acl": _acl_for(sap),
     }
     transport, server, thread = _running_unix_server(sap, sock_path, config)
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -3266,7 +3503,7 @@ def test_idle_preauth_connection_is_dropped(
 
 
 def test_connection_limit_refuses_over_cap_peer(
-    sap: types.ModuleType, tmp_path: Path, keymaterial: Any
+    sap: types.ModuleType, tmp_path: Path
 ) -> None:
     """Over-cap connections are refused before a handler thread is spawned (A3)."""
     sock_path = tmp_path / "run" / "server.sock"
@@ -3279,8 +3516,8 @@ def test_connection_limit_refuses_over_cap_peer(
         "dialog_program": "zenity",
         "server_read_timeout": 5.0,
         "max_connections": 1,
-        "security": _server_security(keymaterial),
-        "acl": _acl_for(sap, keymaterial),
+        "security": _server_security(),
+        "acl": _acl_for(sap),
     }
     transport, server, thread = _running_unix_server(sap, sock_path, config)
     first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -3354,7 +3591,7 @@ def test_stalled_tls_handshake_does_not_block_the_accept_loop(
             "cert_file": str(tmp_path / "server.crt"),
             "key_file": str(tmp_path / "server.key"),
         },
-        "acl": {"mode": "list", "trusted_keys": []},
+        "acl": {"mode": "list", "trusted_fingerprints": []},
     }
 
     state = {"active": 0, "peak": 0, "calls": 0}
@@ -3540,32 +3777,34 @@ def test_secure_equals_tolerates_non_ascii(sap: types.ModuleType) -> None:
 
 
 def test_non_ascii_key_id_raises_auth_error(
-    sap: types.ModuleType, keymaterial: Any
+    sap: types.ModuleType
 ) -> None:
-    request = _signed_request(sap, keymaterial)
-    request["client_auth"]["key_id"] = "SHA256:caf\u00e9"
+    request = _authed_request(sap)
+    # a non-ASCII method can never equal the configured ASCII one; the
+    # comparison must fail closed instead of raising a TypeError (review A9).
+    request["client_auth"]["method"] = "caf\u00e9"
     server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial), "acl": _acl_for(sap, keymaterial)},
+        {"transport": "unix", "security": _server_security(), "acl": _acl_for(sap)},
         "server",
     )
 
-    with pytest.raises(sap.AuthError, match="key_id"):
+    with pytest.raises(sap.AuthError, match="does not match the configured"):
         sap.authenticate_request(request, server)
 
 
 def test_non_ascii_response_nonce_raises_protocol_error(
-    sap: types.ModuleType, keymaterial: Any
+    sap: types.ModuleType
 ) -> None:
-    request = _signed_request(sap, keymaterial)
+    request = _authed_request(sap)
     server = sap.build_security(
-        {"transport": "unix", "security": _server_security(keymaterial), "acl": _acl_for(sap, keymaterial)},
+        {"transport": "unix", "security": _server_security(), "acl": _acl_for(sap)},
         "server",
     )
     response = sap.build_response(
         request["nonce"], "allow", request=request, security=server
     )
     response["nonce"] = "caf\u00e9"
-    client = sap.build_security(_client_config(keymaterial), "client")
+    client = sap.build_security(_client_config(), "client")
 
     with pytest.raises(sap.ProtocolError, match="nonce"):
         sap.verify_response(response, request, client)
@@ -3620,7 +3859,7 @@ def test_dialog_prompts_are_serialised(
         time.sleep(0.1)
         with counter_lock:
             active -= 1
-        return types.SimpleNamespace(returncode=0)
+        return types.SimpleNamespace(returncode=0, stdout=b"")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     confirmation = _confirmation(sap)
@@ -3742,7 +3981,7 @@ def test_client_auth_none_warns_loudly_on_tcp(
             "security": {
                 "transport_encryption": "none",
                 "client_auth": "none",
-                "server_auth": "signature",
+                "server_auth": "none",
             },
         }
     )
@@ -3756,7 +3995,7 @@ def test_client_auth_none_warns_loudly_on_tcp(
 def test_client_auth_none_rejected_under_mtls(sap: types.ModuleType) -> None:
     # mTLS already forces client_auth = "transport"; "none" must not be a way
     # to opt out of the certificate that authenticates the channel.
-    with pytest.raises(sap.SecurityConfigError, match="client_auth = 'none'"):
+    with pytest.raises(sap.SecurityConfigError, match="client_auth must be"):
         sap.validate_security_config(
             {
                 "transport": "tcp",
@@ -3775,7 +4014,6 @@ def test_client_auth_none_end_to_end(sap: types.ModuleType) -> None:
     sap.attach_client_auth(request, client)
 
     assert request["client_auth"] == {"method": "none"}
-    assert client.client_signing_key is None
 
     server = sap.build_security(_none_server_config(), "server")
     verified = sap.authenticate_request(request, server)
@@ -3788,20 +4026,20 @@ def test_client_auth_none_end_to_end(sap: types.ModuleType) -> None:
 
 def test_build_security_none_requires_none_acl(sap: types.ModuleType) -> None:
     config = _none_server_config()
-    config["acl"] = {"mode": "list", "trusted_keys": [_UNLISTED_FINGERPRINT]}
+    config["acl"] = {"mode": "list", "trusted_fingerprints": [_UNLISTED_FINGERPRINT]}
 
     with pytest.raises(sap.SecurityConfigError, match="requires acl.mode = 'none'"):
         sap.build_security(config, "server")
 
 
 def test_build_security_none_acl_requires_none_client_auth(
-    sap: types.ModuleType, keymaterial: Any
+    sap: types.ModuleType
 ) -> None:
     # The mirror image: an unauthenticated ACL may not be paired with a
     # credential the server would otherwise authenticate.
     config = {
         "transport": "unix",
-        "security": _server_security(keymaterial),
+        "security": _mtls_server_security(),
         "acl": {"mode": "none"},
     }
 
@@ -3810,9 +4048,9 @@ def test_build_security_none_acl_requires_none_client_auth(
 
 
 def test_load_acl_none_rejects_trust_material(sap: types.ModuleType) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="must not set trusted_keys"):
+    with pytest.raises(sap.SecurityConfigError, match="must not set trusted_fingerprints"):
         sap.load_acl_config(
-            {"acl": {"mode": "none", "trusted_keys": [_UNLISTED_FINGERPRINT]}}
+            {"acl": {"mode": "none", "trusted_fingerprints": [_UNLISTED_FINGERPRINT]}}
         )
 
 
@@ -3832,365 +4070,7 @@ def test_authorize_none_requires_none_acl(sap: types.ModuleType) -> None:
 
 def test_authorize_none_acl_requires_none_client_auth(sap: types.ModuleType) -> None:
     server = sap.build_security(_none_server_config(), "server")
-    server.client_auth = "ssh"
+    server.client_auth = "transport"
 
     with pytest.raises(sap.AuthError, match="requires client_auth = 'none'"):
         sap.authorize_request(_request_obj(sap), server, sap.NONE_IDENTITY)
-
-
-# --- client_auth = "ssh" signed through the SSH agent -----------------------
-#
-# A minimal in-test agent speaks the length-prefixed protocol over a temporary
-# Unix socket and signs with a real `cryptography` key. The wire constants are
-# spelled out locally (not read from the module under test) so the test checks
-# the protocol independently. `ssh_agent`/`ssh_agent_socket`/`ssh_key` are the
-# new `[security]` keys; no private key file is ever read by the client.
-
-# SSH agent protocol (draft-miller-ssh-agent)
-_AGENT_FAILURE = 5
-_AGENTC_REQUEST_IDENTITIES = 11
-_AGENT_IDENTITIES_ANSWER = 12
-_AGENTC_SIGN_REQUEST = 13
-_AGENT_SIGN_RESPONSE = 14
-_AGENT_RSA_SHA2_256 = 2
-
-
-class _FakeSshAgent:
-    """A minimal SSH agent over AF_UNIX for the client's agent-signing path.
-
-    ``identities`` maps an SSH wire key blob to its private key. ``fail`` makes
-    every request answer ``SSH_AGENT_FAILURE`` so the fail-closed path is
-    exercised; ``omit`` returns an empty identity list so the configured key
-    cannot be found. Each request is one connection, matching the client.
-    """
-
-    def __init__(
-        self,
-        socket_path: Path,
-        identities: dict,
-        *,
-        fail: bool = False,
-        omit: bool = False,
-    ) -> None:
-        self.socket_path = Path(socket_path)
-        self.identities = identities
-        self.fail = fail
-        self.omit = omit
-        self.sign_flags: Any = None
-        self._stop = threading.Event()
-        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._listener.bind(str(self.socket_path))
-        self._listener.listen(4)
-        self._listener.settimeout(0.2)
-        self._thread = threading.Thread(target=self._serve, daemon=True)
-        self._thread.start()
-
-    def __enter__(self) -> "_FakeSshAgent":
-        return self
-
-    def __exit__(self, *_exc: Any) -> None:
-        self.close()
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=5)
-        self._listener.close()
-
-    def _serve(self) -> None:
-        while not self._stop.is_set():
-            try:
-                connection, _ = self._listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            with connection:
-                try:
-                    self._handle(connection)
-                except (OSError, KeyError, ValueError):
-                    pass
-
-    @staticmethod
-    def _read_exact(connection: Any, count: int) -> bytes:
-        buffer = bytearray()
-        while len(buffer) < count:
-            chunk = connection.recv(count - len(buffer))
-            if not chunk:
-                raise ValueError("client closed early")
-            buffer += chunk
-        return bytes(buffer)
-
-    @classmethod
-    def _read_string(cls, payload: bytes, offset: int):
-        (length,) = struct.unpack(">I", payload[offset : offset + 4])
-        offset += 4
-        return payload[offset : offset + length], offset + length
-
-    @staticmethod
-    def _string(data: bytes) -> bytes:
-        return struct.pack(">I", len(data)) + data
-
-    def _send(self, connection: Any, payload: bytes) -> None:
-        connection.sendall(struct.pack(">I", len(payload)) + payload)
-
-    def _handle(self, connection: Any) -> None:
-        (length,) = struct.unpack(">I", self._read_exact(connection, 4))
-        payload = self._read_exact(connection, length)
-        if self.fail:
-            self._send(connection, bytes([_AGENT_FAILURE]))
-            return
-        kind = payload[0]
-        if kind == _AGENTC_REQUEST_IDENTITIES:
-            blobs = [] if self.omit else list(self.identities)
-            body = bytes([_AGENT_IDENTITIES_ANSWER]) + struct.pack(">I", len(blobs))
-            body += b"".join(self._string(blob) + self._string(b"test") for blob in blobs)
-            self._send(connection, body)
-        elif kind == _AGENTC_SIGN_REQUEST:
-            key_blob, offset = self._read_string(payload, 1)
-            data, offset = self._read_string(payload, offset)
-            (self.sign_flags,) = struct.unpack(">I", payload[offset : offset + 4])
-            signature_blob = self._sign(self.identities[key_blob], data, self.sign_flags)
-            self._send(
-                connection,
-                bytes([_AGENT_SIGN_RESPONSE]) + self._string(signature_blob),
-            )
-        else:
-            self._send(connection, bytes([_AGENT_FAILURE]))
-
-    @staticmethod
-    def _sign(private_key: Any, data: bytes, flags: int) -> bytes:
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
-
-        if isinstance(private_key, ed25519.Ed25519PrivateKey):
-            return _FakeSshAgent._string(b"ssh-ed25519") + _FakeSshAgent._string(
-                private_key.sign(data)
-            )
-        if isinstance(private_key, rsa.RSAPrivateKey):
-            # the client must request SHA-256 through the agent flag
-            assert flags == _AGENT_RSA_SHA2_256, flags
-            signature = private_key.sign(data, padding.PKCS1v15(), hashes.SHA256())
-            return _FakeSshAgent._string(b"rsa-sha2-256") + _FakeSshAgent._string(
-                signature
-            )
-        raise ValueError("unsupported test key")
-
-
-def _agent_client_config(socket_path: Path, ssh_key: str, **overrides: Any) -> dict:
-    """A client `[security]` block signing `ssh` through the agent at `socket_path`."""
-    security: dict[str, Any] = {
-        "transport_encryption": "none",
-        "client_auth": "ssh",
-        "server_auth": "none",
-        "ssh_agent": True,
-        "ssh_agent_socket": str(socket_path),
-        "ssh_key": ssh_key,
-    }
-    security.update(overrides)
-    return {"transport": "unix", "security": security}
-
-
-def _assert_agent_block_verifies(
-    sap: types.ModuleType, request: dict, public_key: Any, *, key_id: str
-) -> None:
-    """Verify an agent-signed block exactly like the server does."""
-    block = request["client_auth"]
-    assert block["method"] == "ssh"
-    assert block["key_id"] == key_id
-    assert block["public_key"] == base64.b64encode(
-        sap.ssh_public_blob(public_key)
-    ).decode()
-    sap.verify_bytes(
-        public_key,
-        block["alg"],
-        sap.signing_payload(request, "client_auth"),
-        base64.b64decode(block["signature"]),
-    )
-
-
-def test_ssh_agent_ed25519_signs_and_verifies(
-    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path, keymaterial: Any
-) -> None:
-    private_key = sap.load_private_key_file(keymaterial.client_private)
-    blob = sap.ssh_public_blob(private_key.public_key())
-    key_id = sap.ssh_fingerprint(private_key.public_key())
-    socket_path = tmp_path / "agent.sock"
-
-    with _FakeSshAgent(socket_path, {blob: private_key}) as agent:
-        client = sap.build_security(
-            _agent_client_config(socket_path, keymaterial.client_public), "client"
-        )
-        assert client.client_signing_key is None
-        assert client.client_signing_agent_socket == str(socket_path)
-        request = _request_obj(sap)
-        sap.attach_client_auth(request, client)
-
-    assert request["client_auth"]["alg"] == "ssh-ed25519"
-    _assert_agent_block_verifies(sap, request, private_key.public_key(), key_id=key_id)
-    assert agent.sign_flags == 0
-
-    # the server verifies and authorizes the agent-signed request unchanged
-    server = sap.build_security(
-        {
-            "transport": "unix",
-            "security": {
-                "transport_encryption": "none",
-                "client_auth": "ssh",
-                "server_auth": "none",
-                "trusted_keys": [keymaterial.client_public],
-            },
-            "acl": {"mode": "list", "trusted_keys": [key_id]},
-        },
-        "server",
-    )
-    assert sap.authenticate_request(request, server) == key_id
-    assert sap.authorize_request(request, server, key_id) == key_id
-
-
-def test_ssh_agent_rsa_requests_sha256(
-    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path
-) -> None:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_line = private_key.public_key().public_bytes(
-        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
-    ).decode()
-    blob = sap.ssh_public_blob(private_key.public_key())
-    key_id = sap.ssh_fingerprint(private_key.public_key())
-    socket_path = tmp_path / "agent.sock"
-
-    with _FakeSshAgent(socket_path, {blob: private_key}) as agent:
-        client = sap.build_security(
-            _agent_client_config(socket_path, public_line), "client"
-        )
-        request = _request_obj(sap)
-        sap.attach_client_auth(request, client)
-
-    assert request["client_auth"]["alg"] == "rsa-sha2-256"
-    assert agent.sign_flags == _AGENT_RSA_SHA2_256
-    _assert_agent_block_verifies(sap, request, private_key.public_key(), key_id=key_id)
-
-
-def test_ssh_agent_uses_ssh_auth_sock_default(
-    sap: types.ModuleType,
-    crypto: types.ModuleType,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-
-    private_key = ed25519.Ed25519PrivateKey.generate()
-    public_line = private_key.public_key().public_bytes(
-        serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH
-    ).decode()
-    socket_path = tmp_path / "agent.sock"
-    monkeypatch.setenv("SSH_AUTH_SOCK", str(socket_path))
-
-    with _FakeSshAgent(socket_path, {sap.ssh_public_blob(private_key.public_key()): private_key}):
-        client = sap.build_security(
-            _agent_client_config(socket_path, public_line, ssh_agent_socket=None),
-            "client",
-        )
-
-    # `ssh_agent = true` with no explicit socket falls back to $SSH_AUTH_SOCK.
-    assert client.client_signing_agent_socket == str(socket_path)
-
-
-def test_ssh_agent_missing_key_in_agent_fails_closed(
-    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path, keymaterial: Any
-) -> None:
-    other = sap.load_private_key_file(keymaterial.server_private)
-    socket_path = tmp_path / "agent.sock"
-
-    with _FakeSshAgent(
-        socket_path, {sap.ssh_public_blob(other.public_key()): other}
-    ):
-        client = sap.build_security(
-            _agent_client_config(socket_path, keymaterial.client_public), "client"
-        )
-        request = _request_obj(sap)
-
-        with pytest.raises(sap.AuthError, match="does not hold the configured key"):
-            sap.attach_client_auth(request, client)
-
-
-def test_ssh_agent_unset_socket_fails_closed(
-    sap: types.ModuleType,
-    crypto: types.ModuleType,
-    monkeypatch: pytest.MonkeyPatch,
-    keymaterial: Any,
-) -> None:
-    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
-    config = _agent_client_config(Path("/nonexistent/agent.sock"), keymaterial.client_public)
-    del config["security"]["ssh_agent_socket"]
-
-    with pytest.raises(sap.SecurityConfigError, match="SSH_AUTH_SOCK"):
-        sap.build_security(config, "client")
-
-
-def test_ssh_agent_unreachable_socket_fails_closed(
-    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path, keymaterial: Any
-) -> None:
-    # A configured socket that does not exist is a runtime failure at signing
-    # time (build_security only records the path), and must fail closed.
-    client = sap.build_security(
-        _agent_client_config(tmp_path / "missing.sock", keymaterial.client_public),
-        "client",
-    )
-    request = _request_obj(sap)
-
-    with pytest.raises(sap.AuthError, match="cannot talk to the SSH agent"):
-        sap.attach_client_auth(request, client)
-
-
-def test_ssh_agent_failure_response_fails_closed(
-    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path, keymaterial: Any
-) -> None:
-    private_key = sap.load_private_key_file(keymaterial.client_private)
-    socket_path = tmp_path / "agent.sock"
-
-    with _FakeSshAgent(
-        socket_path, {sap.ssh_public_blob(private_key.public_key()): private_key}, fail=True
-    ):
-        client = sap.build_security(
-            _agent_client_config(socket_path, keymaterial.client_public), "client"
-        )
-        request = _request_obj(sap)
-
-        with pytest.raises(sap.AuthError, match="refused to list"):
-            sap.attach_client_auth(request, client)
-
-
-def test_ssh_agent_requires_ssh_key(sap: types.ModuleType, tmp_path: Path) -> None:
-    config = _agent_client_config(tmp_path / "agent.sock", "")
-    del config["security"]["ssh_key"]
-
-    with pytest.raises(sap.SecurityConfigError, match="ssh_key"):
-        sap.build_security(config, "client")
-
-
-def test_load_config_resolves_ssh_agent_paths(sap: types.ModuleType, tmp_path: Path) -> None:
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[security]\nssh_key = "keys/id.pub"\nssh_agent_socket = "run/agent.sock"\n'
-    )
-
-    loaded = sap.load_config(str(config_path))
-
-    assert loaded["security"]["ssh_key"] == str(tmp_path / "keys" / "id.pub")
-    assert loaded["security"]["ssh_agent_socket"] == str(tmp_path / "run" / "agent.sock")
-
-
-def test_load_config_leaves_inline_ssh_key_untouched(
-    sap: types.ModuleType, tmp_path: Path
-) -> None:
-    inline = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexampleexampleexampleexample comment"
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(f'[security]\nssh_key = "{inline}"\n')
-
-    loaded = sap.load_config(str(config_path))
-
-    assert loaded["security"]["ssh_key"] == inline
