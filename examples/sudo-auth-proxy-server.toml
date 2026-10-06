@@ -1,0 +1,189 @@
+# sudo-auth-proxy — standalone server configuration (no Nix required)
+#
+# This is the *host* side of the service: the process that shows the
+# privilege-elevation dialog on the machine where the human sits. It is the
+# counterpart of the PAM client that runs inside the guest (see
+# `tartarus.sudo-auth-proxy` in the NixOS/home-manager modules, and the MOFOS
+# guest at `hosts/nixos/mofos/default.nix`).
+#
+# It is deliberately written as a plain TOML file so it can run on a machine
+# with no Nix at all — any Linux distribution with Python 3.11+ and the
+# `cryptography` wheel. The full design and threat model live in
+# `docs/sudo-auth-proxy.md`; §15.1 has the step-by-step setup.
+#
+# Copy it to `~/.config/sudo-auth-proxy/config.toml` and run:
+#
+#   sudo-auth-proxy --config ~/.config/sudo-auth-proxy/config.toml
+#
+# Paths inside this file are resolved relative to the file's own directory, so
+# `./ca.crt` means "next to this config".
+#
+# ---------------------------------------------------------------------------
+# Read this before editing: the file is validated against an EXACT schema
+#
+# At startup every key, at every level, is checked against the set the service
+# actually reads. A typo (`max_connection`) and a key on the wrong side of a
+# `[table]` header are both refused, with the offending key named -- nothing is
+# silently ignored. An ignored knob is worse than a missing one, because the
+# operator believes it is in force.
+#
+# The trap this schema exists for is a *placement* error. TOML assigns a key to
+# the **nearest preceding `[table]` header**, so the three authentication knobs
+# must sit *under* `[security]`: written above it they are top-level keys, the
+# service sees no `[security]` values at all, and it exits with
+#
+#   sudo-auth-proxy: 'client_auth' must be written in [security], but it is
+#   written at the top level
+#
+# ...which is exactly as fatal as leaving them out, because with
+# `transport_encryption = "none"` the service refuses to run rather than
+# disable authentication implicitly (doc §7.5). Everything above the first
+# table header must stay above it; every key below a header belongs to that
+# header's table until the next one.
+#
+# Accepted top-level keys: mode, transport, cid, host, port, socket,
+# socket_dir_mode, socket_mode, connect_timeout, decision_timeout, recv_timeout,
+# max_connections, server_read_timeout, dialog_program, resolution, debug,
+# approver, client_version, guest_hint -- plus the `[security]`, `[acl]` and
+# `[mtls]` tables. The full key list is doc §7.9; the `[security]` keys are
+# spelled out below. `tests/test_sudo_auth_proxy.py`
+# (`test_shipped_example_config_matches_the_schema`) validates this file, so it
+# cannot drift out of the schema unnoticed.
+
+# ---------------------------------------------------------------------------
+# mode = "server" | "client"
+#
+# Required, and deliberately not defaulted: a config that forgets it must not
+# silently start a listener.
+# ---------------------------------------------------------------------------
+mode = "server"
+
+# ---------------------------------------------------------------------------
+# Transport: how the guest reaches this server.
+#
+#   "vsock"  the guest dials the host over AF_VSOCK (no IP stack, no firewall
+#            port, point-to-point between the VM and its hypervisor)
+#   "tcp"    the guest dials an address:port
+#   "unix"   the host dials into the guest over SSH and forwards a Unix socket
+#            (`ssh -R`); needs no address on the guest side, but only exists
+#            while the SSH session is up
+#
+# This example is the VSOCK callback used by the MOFOS guest.
+# ---------------------------------------------------------------------------
+transport = "vsock"
+
+# The VSOCK CID to bind. `2` is VMADDR_CID_HOST — the hypervisor, from the
+# guest's point of view — and is what the tartarus host module binds. Use `-1`
+# (VMADDR_CID_ANY) to accept on every local CID instead.
+cid = 2
+
+# Both sides must agree on the port. The MOFOS guest is configured with 65012;
+# the tartarus-internal guests use 65001.
+port = 65012
+
+# ---------------------------------------------------------------------------
+# Timeouts (seconds unless noted)
+# ---------------------------------------------------------------------------
+
+# Bound on the client's connect + TLS handshake. Must be small: this process
+# backs a PAM hook that runs on *every* `sudo`, and an unreachable peer must
+# not stall the stack.
+connect_timeout = 0.2
+
+# The human window. `0` waits indefinitely; `120` is the shipped default.
+decision_timeout = 120
+
+# Bound on the first frame after the connection (the pre-dialog
+# `auth_pending` acknowledgement), so a stale/half-open peer fails fast
+# without bounding the human's time to answer.
+recv_timeout = 0.5
+
+# Pre-authentication resource bounds: at most this many handler threads run at
+# once, and an accepted connection may stall at most this long (this bounds a
+# TCP connect that never finishes its TLS handshake) before it is dropped.
+max_connections = 64
+server_read_timeout = 10.0
+
+# ---------------------------------------------------------------------------
+# The dialog backend. One of "zenity" (Linux), "osascript"/"swiftdialog" (macOS).
+#
+# It is never auto-detected: a wrong guess would either fail every prompt or,
+# worse, show a dialog on the wrong session. The prompt is a two-line summary on
+# every backend; the full detail block (identity, TTY, CWD, request id) sits
+# behind a "Details" affordance: an info button on swiftDialog, a third button on
+# osascript, and zenity's `--extra-button` -- offered only when the installed
+# zenity advertises it, which is probed once per process. "Details" is never a
+# decision on any backend; it opens a second dialog and only an explicit
+# "Authorize" there allows. `debug = true` below still logs the whole block.
+# ---------------------------------------------------------------------------
+dialog_program = "zenity"
+
+# `socket` is the single Unix socket for the `unix` transport (`%t` = the
+# per-user runtime directory). Unused for `vsock`/`tcp`, but harmless — and it
+# is where a `unix`-transport server would listen. It must be written BEFORE
+# the `[security]`/`[acl]` tables below: in TOML, every key after a table
+# header belongs to that table.
+socket = "%t/sudo-auth-proxy/server.sock"
+socket_dir_mode = "0700"
+socket_mode = "0600"
+
+# Log connection/handshake/request timing and the sanitised request fields to
+# stderr. The full detail block (the one the dialog summarises) is logged here
+# too, which is how you inspect a request on a backend with no "Details"
+# affordance.
+debug = false
+
+# ---------------------------------------------------------------------------
+# [security] — the three authentication knobs.
+#
+# mTLS is the ONLY authentication mechanism this service has. There is no
+# message signing, no SSH-key signature, and no application-layer certificate
+# signature: either the TLS channel authenticates both peers
+# (`transport_encryption = "mtls"`, which forces both auths to "transport"),
+# or authentication is explicitly switched off on all three knobs.
+#
+# Never leave a knob out: with `transport_encryption = "none"` the service
+# refuses to start unless `client_auth` and `server_auth` are both written as
+# "none". Disabling authentication is a decision, not a default.
+# ---------------------------------------------------------------------------
+[security]
+# "none" | "mtls". A VSOCK connection is point-to-point between the guest and
+# its hypervisor, with no network path for a third party, so this example
+# leaves it unencrypted. Use "mtls" for anything that crosses a network you do
+# not control, and see docs/sudo-auth-proxy.md §7 for the `[mtls]` block.
+transport_encryption = "none"
+
+# "transport" | "none". Does not authenticate the requester: any process inside
+# the guest that can reach CID 2 port 65012 can raise a prompt here.
+client_auth = "none"
+
+# "transport" | "none". Nothing authenticates the response, so a compromised
+# guest could feed itself an `allow`. Acceptable only because the guest is the
+# machine being *granted* privilege, and the guest cannot reach this server
+# except over the private VSOCK link.
+server_auth = "none"
+
+# Seconds a response stays valid (`issued_at` .. `expires_at`) and the clock
+# skew tolerated when checking it. Only meaningful with mTLS, but harmless.
+response_ttl = 30
+clock_skew = 5
+
+# ---------------------------------------------------------------------------
+# [acl] — authorization: *who* may use the mechanism, given a verified
+# credential. Evaluated before any dialog, matches only cryptographic
+# material (never usernames, TTYs, addresses or any other request metadata),
+# and defaults to deny-all.
+#
+#   "list"  only credentials whose mTLS leaf SPKI fingerprint is listed in
+#           `trusted_fingerprints`
+#   "ca"    any mTLS credential that chains to `ca_file` and carries
+#           `required_oid` (optionally additionally pinned by
+#           `trusted_fingerprints`)
+#   "none"  deliberately authorize every request, because `client_auth` above
+#           leaves no credential to authorize
+#
+# `mode = "none"` is only accepted when `client_auth` is also "none" (the
+# pair is a fail-closed XOR), and it must not carry any trust material.
+# ---------------------------------------------------------------------------
+[acl]
+mode = "none"

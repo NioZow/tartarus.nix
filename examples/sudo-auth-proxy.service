@@ -1,0 +1,56 @@
+# sudo-auth-proxy — systemd *user* unit for the server (non-NixOS host)
+#
+# Install as ~/.config/systemd/user/sudo-auth-proxy.service, then:
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sudo-auth-proxy.service
+#   journalctl --user -u sudo-auth-proxy -f
+#
+# It must be a *user* unit, not a system one: the service has to run inside the
+# approver's graphical session so the dialog (zenity/osascript) appears on that
+# user's desktop. A system unit would have no DISPLAY/WAYLAND_DISPLAY and every
+# prompt would fail to render.
+#
+# `ExecStart` points at the standalone script. If you installed it as a package
+# (or a wrapper on PATH), use that path instead — e.g. `ExecStart=%h/.local/bin/sudo-auth-proxy ...`.
+#
+# This mirrors `nix/packages/sudo-auth-proxy.nix` (the home-manager module),
+# which is the same unit built from Nix for NixOS/nix-darwin hosts.
+
+[Unit]
+Description=sudo authentication proxy server
+Documentation=https://github.com/niozow/tartarus.nix
+# The service exists to answer prompts from guests; it has no daemon
+# dependencies and should come up with the session.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# `%t` in the config expands to $XDG_RUNTIME_DIR, which systemd sets for user
+# units; `%h` is the home directory.
+ExecStart=%h/.local/bin/sudo-auth-proxy --config %h/.config/sudo-auth-proxy/config.toml
+
+# The socket lives in a per-user runtime directory (0700). systemd creates it
+# and owns it; the service also re-creates and chmods it itself, so dropping
+# this line cannot silently widen permissions.
+RuntimeDirectory=sudo-auth-proxy
+RuntimeDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=2
+
+# Modest hardening. `NoNewPrivileges` matters: this process only *reports* a
+# decision and must never be able to elevate privilege if it is compromised.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_VSOCK
+# Keep the graph session reachable so the dialog can be shown.
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+[Install]
+WantedBy=graphical-session.target
