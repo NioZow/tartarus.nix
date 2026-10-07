@@ -22,7 +22,7 @@
         [pythonEnv]
         ++ lib.optionals pkgs.stdenv.isLinux [pkgs.wl-clipboard];
       text = ''
-        exec ${pythonEnv.interpreter} -P ${./sources/clipboard-bridge.py} "$@"
+        exec ${pythonEnv.interpreter} -P ${./clipboard-bridge.py} "$@"
       '';
     };
 

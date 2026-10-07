@@ -35,7 +35,7 @@
           pkgs.zenity
         ];
       text = ''
-        exec ${pythonEnv.interpreter} -P ${./sources/sudo-auth-proxy.py} "$@"
+        exec ${pythonEnv.interpreter} -P ${./sudo-auth-proxy.py} "$@"
       '';
     };
 
@@ -269,12 +269,15 @@
       };
 
       resolution = mkOption {
-        type = types.nullOr (types.enum ["none" "certificate" "tartarus"]);
+        type = types.nullOr (types.enum ["none" "certificate" "tartarus" "mofos"]);
         default = null;
         description = ''
           How to resolve a connecting client's name shown in the elevation
-          dialog: `none`, `certificate` (verified peer cert CN), or
-          `tartarus` (local VM id/name bookkeeping). When unset it defaults to
+          dialog and offered to the `[[acl.rule]]` identity selector:
+          `none` (no resolution), `certificate` (verified peer cert CN/SAN),
+          `tartarus` (local VM id/name bookkeeping via the state directory), or
+          `mofos` (`mofos ls --json`, matching the peer's VSOCK CID or
+          `ipv4_address` to a VM name). When unset it defaults to
           `"certificate"` when `mtls` is enabled and `"tartarus"` otherwise.
         '';
       };
@@ -328,6 +331,55 @@
           default = null;
           description = ''
             `mode = "ca"`: EKU OID the requester certificate must carry.
+          '';
+        };
+        rule = mkOption {
+          type = types.listOf (types.submodule {
+            options = {
+              identity = mkOption {
+                type = types.str;
+                default = "*";
+                description = ''
+                  Glob pattern matched against the requester's resolved names:
+                  the friendly name produced by `resolution` (`mofos` VM name,
+                  certificate CN, tartarus VM name), the ACL display label and
+                  the verified credential fingerprint. `*` matches anything.
+                '';
+              };
+              targetUser = mkOption {
+                type = types.str;
+                default = "*";
+                description = "Glob pattern matched against the target (PAM) user.";
+              };
+              invokingUser = mkOption {
+                type = types.str;
+                default = "*";
+                description = "Glob pattern matched against the invoking user.";
+              };
+              service = mkOption {
+                type = types.str;
+                default = "*";
+                description = "Glob pattern matched against the PAM service name (sudo/su/login).";
+              };
+              policy = mkOption {
+                type = types.enum ["allow" "ask" "deny"];
+                default = "ask";
+                description = ''
+                  Approval policy for a matching request: `allow` replies
+                  immediately without a dialog, `deny` replies immediately
+                  without a dialog, `ask` shows the confirmation prompt. Rules
+                  are evaluated in order and the first match wins; no match
+                  means `ask`. Rules refine the decision *after* the ACL has
+                  authorized the credential, so they can never grant access the
+                  ACL denied.
+                '';
+              };
+            };
+          });
+          default = [];
+          description = ''
+            Ordered approval rules (`[[acl.rule]]`), evaluated after the ACL
+            authorizes the credential; the first matching rule wins.
           '';
         };
       };
@@ -836,6 +888,17 @@
         }
         // optionalAttrs (server.acl.mode == "ca" && server.acl.requiredOid != null) {
           required_oid = server.acl.requiredOid;
+        }
+        // optionalAttrs (server.acl.rule != []) {
+          rule =
+            map (r: {
+              identity = r.identity;
+              target_user = r.targetUser;
+              invoking_user = r.invokingUser;
+              service = r.service;
+              policy = r.policy;
+            })
+            server.acl.rule;
         };
 
       settings =
@@ -991,6 +1054,17 @@
       }
       // optionalAttrs (server.acl.mode == "ca" && server.acl.requiredOid != null) {
         required_oid = server.acl.requiredOid;
+      }
+      // optionalAttrs (server.acl.rule != []) {
+        rule =
+          map (r: {
+            identity = r.identity;
+            target_user = r.targetUser;
+            invoking_user = r.invokingUser;
+            service = r.service;
+            policy = r.policy;
+          })
+          server.acl.rule;
       };
 
     settings =

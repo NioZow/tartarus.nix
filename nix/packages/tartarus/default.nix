@@ -17,12 +17,12 @@ in
     pyproject = true;
 
     src = lib.fileset.toSource {
-      root = ../..;
+      root = ../../..;
       fileset = lib.fileset.unions [
-        ../../pyproject.toml
-        ../../uv.lock
-        ../../README.md
-        (lib.fileset.fileFilter (file: file.hasExt "py") ../../src)
+        ../../../pyproject.toml
+        ../../../uv.lock
+        ../../../README.md
+        (lib.fileset.fileFilter (file: file.hasExt "py") ../../../src)
       ];
     };
 

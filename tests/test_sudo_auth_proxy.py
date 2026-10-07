@@ -96,7 +96,7 @@ SOURCE_PATH = (
     Path(__file__).resolve().parents[1]
     / "nix"
     / "packages"
-    / "sources"
+    / "sudo-auth-proxy"
     / "sudo-auth-proxy.py"
 )
 
@@ -4074,3 +4074,310 @@ def test_authorize_none_acl_requires_none_client_auth(sap: types.ModuleType) -> 
 
     with pytest.raises(sap.AuthError, match="requires client_auth = 'none'"):
         sap.authorize_request(_request_obj(sap), server, sap.NONE_IDENTITY)
+
+
+# --- resolution: mode selection and the mofos resolver ----------------------
+
+
+def test_get_resolution_mode_defaults_follow_mtls(sap: types.ModuleType) -> None:
+    assert sap.get_resolution_mode({}) == "tartarus"
+    assert sap.get_resolution_mode({"mtls": {"enable": True}}) == "certificate"
+
+
+@pytest.mark.parametrize("mode", ["none", "certificate", "tartarus", "mofos"])
+def test_get_resolution_mode_accepts_known_modes(
+    sap: types.ModuleType, mode: str
+) -> None:
+    assert sap.get_resolution_mode({"resolution": mode}) == mode
+
+
+def test_get_resolution_mode_ignores_unknown(sap: types.ModuleType) -> None:
+    """An unknown value falls back to the mTLS-aware default, never passes through."""
+    assert sap.get_resolution_mode({"resolution": "bogus"}) == "tartarus"
+
+
+def _mofos_payload() -> str:
+    return json.dumps(
+        [
+            {
+                "id": 4,
+                "name": "template-nixos",
+                "cid": 4,
+                "ipv4_address": "192.168.90.147",
+            },
+            {"id": 5, "name": "stream", "cid": 5, "ipv4_address": "192.168.90.148"},
+        ]
+    )
+
+
+def _mofos_ok(*_args: Any, **_kwargs: Any) -> Any:
+    return types.SimpleNamespace(returncode=0, stdout=_mofos_payload(), stderr="")
+
+
+def test_resolve_mofos_name_by_cid(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sap, "_mofos_cache", None)
+    recorded: dict = {}
+
+    def fake_run(argv: Any, **_kwargs: Any) -> Any:
+        recorded["argv"] = argv
+        return _mofos_ok()
+
+    monkeypatch.setattr(sap.subprocess, "run", fake_run)
+    assert sap.resolve_mofos_name(5) == "stream"
+    assert recorded["argv"] == ["mofos", "ls", "--json"]
+
+
+def test_resolve_mofos_name_by_ip(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sap, "_mofos_cache", None)
+    monkeypatch.setattr(sap.subprocess, "run", _mofos_ok)
+    assert sap.resolve_mofos_name("192.168.90.147") == "template-nixos"
+
+
+def test_resolve_mofos_name_unknown_returns_none(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sap, "_mofos_cache", None)
+    monkeypatch.setattr(sap.subprocess, "run", _mofos_ok)
+    assert sap.resolve_mofos_name(99) is None
+    assert sap.resolve_mofos_name("10.0.0.1") is None
+
+
+def test_resolve_mofos_name_missing_binary_is_cosmetic(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sap, "_mofos_cache", None)
+
+    def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise FileNotFoundError("mofos")
+
+    monkeypatch.setattr(sap.subprocess, "run", boom)
+    assert sap.resolve_mofos_name(4) is None
+
+
+def test_resolve_mofos_name_caches_the_listing(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sap, "_mofos_cache", None)
+    calls = {"n": 0}
+
+    def counting(*_args: Any, **_kwargs: Any) -> Any:
+        calls["n"] += 1
+        return _mofos_ok()
+
+    monkeypatch.setattr(sap.subprocess, "run", counting)
+    assert sap.resolve_mofos_name(4) == "template-nixos"
+    assert sap.resolve_mofos_name(5) == "stream"
+    assert calls["n"] == 1
+
+
+def test_get_peer_name_uses_mofos_for_the_peer(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Sock:
+        def getpeername(self) -> tuple[int, int]:
+            return (5, 0)
+
+    transport = sap.CallbackTransport({"transport": "tcp"}, "tcp")
+    monkeypatch.setattr(sap, "_mofos_cache", None)
+    monkeypatch.setattr(sap.subprocess, "run", _mofos_ok)
+    assert sap.get_peer_name(_Sock(), "mofos", transport) == "stream"
+
+
+# --- acl rule engine --------------------------------------------------------
+
+
+def test_parse_rules_reads_selectors_and_preserves_order(
+    sap: types.ModuleType,
+) -> None:
+    acl = sap.load_acl_config(
+        {
+            "acl": {
+                "mode": "none",
+                "rule": [
+                    {"identity": "gram", "target_user": "root", "policy": "allow"},
+                    {"identity": "*", "policy": "deny"},
+                ],
+            }
+        }
+    )
+
+    assert [rule.policy for rule in acl.rules] == ["allow", "deny"]
+    assert acl.rules[0].identity == "gram"
+    assert acl.rules[0].target_user == "root"
+    assert acl.rules[0].service == "*"
+
+
+def test_parse_rules_defaults_to_ask_and_star(sap: types.ModuleType) -> None:
+    acl = sap.load_acl_config({"acl": {"mode": "list", "rule": [{}]}})
+
+    assert acl.rules[0].policy == "ask"
+    assert acl.rules[0].identity == "*"
+
+
+@pytest.mark.parametrize(
+    "entry", [{"policy": "maybe"}, {"identity": 3}, "nope"]
+)
+def test_parse_rules_rejects_bad_entries(
+    sap: types.ModuleType, entry: Any
+) -> None:
+    with pytest.raises(sap.SecurityConfigError):
+        sap.load_acl_config({"acl": {"mode": "list", "rule": [entry]}})
+
+
+def test_parse_rules_rejects_an_unknown_key(sap: types.ModuleType) -> None:
+    with pytest.raises(sap.SecurityConfigError, match="unknown key"):
+        sap.load_acl_config(
+            {"acl": {"mode": "list", "rule": [{"ident": "x"}]}}
+        )
+
+
+def test_evaluate_rules_first_match_wins(sap: types.ModuleType) -> None:
+    acl = sap.load_acl_config(
+        {
+            "acl": {
+                "mode": "list",
+                "rule": [
+                    {"identity": "gram", "policy": "deny"},
+                    {"identity": "gram", "policy": "allow"},
+                ],
+            }
+        }
+    )
+
+    policy = sap.evaluate_rules(
+        acl.rules,
+        identities=("gram",),
+        target_user="root",
+        invoking_user="user",
+        service="sudo",
+    )
+    assert policy == "deny"
+
+
+def test_evaluate_rules_matches_any_identity_candidate(
+    sap: types.ModuleType,
+) -> None:
+    acl = sap.load_acl_config(
+        {"acl": {"mode": "list", "rule": [{"identity": "template-*", "policy": "allow"}]}}
+    )
+    identities = sap.identity_candidates(
+        requester="SHA256:abc", label="", peer="template-nixos"
+    )
+
+    assert sap.evaluate_rules(
+        acl.rules,
+        identities=identities,
+        target_user="root",
+        invoking_user="user",
+        service="sudo",
+    ) == "allow"
+
+
+def test_evaluate_rules_matches_target_and_service(sap: types.ModuleType) -> None:
+    acl = sap.load_acl_config(
+        {
+            "acl": {
+                "mode": "list",
+                "rule": [{"identity": "*", "service": "su", "policy": "deny"}],
+            }
+        }
+    )
+
+    assert sap.evaluate_rules(
+        acl.rules,
+        identities=("vault",),
+        target_user="root",
+        invoking_user="user",
+        service="su",
+    ) == "deny"
+    assert sap.evaluate_rules(
+        acl.rules,
+        identities=("vault",),
+        target_user="root",
+        invoking_user="user",
+        service="sudo",
+    ) == "ask"
+
+
+def test_evaluate_rules_defaults_to_ask(sap: types.ModuleType) -> None:
+    assert sap.evaluate_rules(
+        (), identities=(), target_user="root", invoking_user="user", service="sudo"
+    ) == "ask"
+
+
+def test_identity_candidates_include_label_peer_and_credential(
+    sap: types.ModuleType,
+) -> None:
+    assert sap.identity_candidates(
+        requester="SHA256:abc", label="alice", peer="template"
+    ) == ("alice", "template", "SHA256:abc")
+
+
+def test_handler_rule_allow_answers_without_a_dialog(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _authed_request(sap)
+    acl = {"mode": "none", "rule": [{"identity": "*", "policy": "allow"}]}
+
+    frames, prompts = _exchange(sap, monkeypatch, [], _frame(sap, request), acl=acl)
+
+    assert prompts == []
+    assert len(frames) == 1
+    parsed = _decode(sap, frames[0])
+    assert parsed["type"] == "auth_response"
+    assert parsed["decision"] == "allow"
+
+
+def test_handler_rule_deny_answers_without_a_dialog(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _authed_request(sap)
+    acl = {"mode": "none", "rule": [{"identity": "*", "policy": "deny"}]}
+
+    frames, prompts = _exchange(sap, monkeypatch, [], _frame(sap, request), acl=acl)
+
+    assert prompts == []
+    assert _decode(sap, frames[0])["decision"] == "deny"
+
+
+def test_handler_rule_ask_still_prompts(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _authed_request(sap)
+    acl = {"mode": "none", "rule": [{"identity": "someone-else", "policy": "allow"}]}
+
+    frames, prompts = _exchange(
+        sap, monkeypatch, [True], _frame(sap, request), acl=acl
+    )
+
+    assert len(prompts) == 1
+    assert _decode(sap, frames[-1])["decision"] == "allow"
+
+
+# --- sudo target display ----------------------------------------------------
+
+
+def test_effective_target_user_defaults_sudo_to_root(sap: types.ModuleType) -> None:
+    assert sap.effective_target_user("sudo", "user", "user") == "root"
+    assert sap.effective_target_user("sudo", "", "user") == "root"
+
+
+def test_effective_target_user_keeps_explicit_targets(
+    sap: types.ModuleType,
+) -> None:
+    assert sap.effective_target_user("sudo", "www-data", "user") == "www-data"
+    assert sap.effective_target_user("su", "root", "user") == "root"
+
+
+def test_build_confirmation_shows_root_for_sudo(sap: types.ModuleType) -> None:
+    request = _request_obj(sap, target_user="user", invoking_user="user")
+    confirmation = sap.build_confirmation(
+        peer="vault", identity="none", label="", request=request, transport="vsock"
+    )
+
+    assert confirmation.target_user == "root"
+    assert "user -> root" in sap.confirmation_message(confirmation)

@@ -38,9 +38,9 @@
   # client certificate the other guest services already present.
   sapUnix = (services.sudoAuthProxyTransport or "vsock") == "unix";
 
-  sudoAuthProxy = import ../packages/sudo-auth-proxy.nix {inherit inputs;};
-  sshAgentProxyPkg = import ../packages/ssh-agent-proxy.nix {inherit inputs;};
-  clipboardBridge = import ../packages/clipboard-bridge.nix {inherit inputs;};
+  sudoAuthProxy = import ../packages/sudo-auth-proxy {inherit inputs;};
+  sshAgentProxyPkg = import ../packages/ssh-agent-proxy {inherit inputs;};
+  clipboardBridge = import ../packages/clipboard-bridge {inherit inputs;};
 
   # Common mTLS client block; the OIDs differ per service.
   clientMtls = requiredOid: peerOid: {

@@ -24,6 +24,7 @@ import tomllib
 import types
 import unicodedata
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 from socketserver import (
     BaseServer,
@@ -145,6 +146,31 @@ SERVER_AUTH_METHODS = ("transport", "none")
 # list denies all (doc §8.3). `"none"` authorizes every request because there is
 # no credential to authorize; it is rejected unless `client_auth = "none"` (XOR).
 ACL_MODES = ("list", "ca", "none")
+
+# The `[acl]` rule engine (`[[acl.rule]]`). Rules refine the *approval* decision
+# once the ACL has already authorized the credential: each rule matches the
+# requester's identity (the resolved friendly name, the ACL label, the verified
+# fingerprint or `none`), the target/invoking user and the PAM service with
+# glob patterns, and names the policy to apply. They are evaluated in file order
+# and the first match wins, exactly like `ssh-agent-proxy`'s rule list -- there
+# is no merging between rules. The policies are:
+#   `ask`   show the confirmation dialog (the default when no rule matches);
+#   `allow` reply allow without a dialog;
+#   `deny`  reply deny without a dialog.
+# `"*"` (or an absent selector) matches anything. Rules inspect only data the
+# server already trusts for display (`target_user`/`invoking_user`/`service` are
+# self-reported and never authorization inputs), so they can never *grant* a
+# credential the ACL rejected -- the ACL runs first and is the gate.
+RULE_POLICIES = ("allow", "ask", "deny")
+CONFIG_RULE_KEYS = frozenset(
+    {
+        "identity",
+        "target_user",
+        "invoking_user",
+        "service",
+        "policy",
+    }
+)
 
 # The fixed identity returned by `authenticate_request` when requester
 # authentication is deliberately disabled (`client_auth = "none"`). It is a
@@ -623,6 +649,7 @@ CONFIG_ACL_KEYS = frozenset(
         "ca_file",
         "required_oid",
         "labels",
+        "rule",
     }
 )
 
@@ -776,6 +803,58 @@ def validate_config_schema(config: dict, *, source: str | None = None) -> None:
 # --- security model: validation, keyrings, auth blocks (doc §7) -----------
 
 
+@dataclass(frozen=True)
+class Rule:
+    """One `[[acl.rule]]` approval rule (the `[acl]` rule engine).
+
+    A rule refines the *approval* decision after the ACL has authorized the
+    credential. Its selectors are glob patterns (`fnmatch`); `"*"` or an empty
+    selector matches anything. `identity` is matched against every identity
+    candidate the server has for the connection (the resolved friendly name, the
+    ACL label, the verified fingerprint, or the `none` sentinel), and
+    `target_user`/`invoking_user`/`service` against the (self-reported) request
+    metadata. Rules never *grant* anything the ACL denied: the ACL runs first
+    and is the authorization gate. Evaluated in file order, first match wins.
+    """
+
+    identity: str = "*"
+    target_user: str = "*"
+    invoking_user: str = "*"
+    service: str = "*"
+    policy: str = "ask"
+
+    def matches(
+        self,
+        *,
+        identities: "frozenset[str] | tuple[str, ...]",
+        target_user: str,
+        invoking_user: str,
+        service: str,
+    ) -> bool:
+        """True when every selector matches the supplied connection context."""
+        if not _any_pattern_matches(self.identity, identities):
+            return False
+        return (
+            _pattern_matches(self.target_user, target_user)
+            and _pattern_matches(self.invoking_user, invoking_user)
+            and _pattern_matches(self.service, service)
+        )
+
+
+def _pattern_matches(pattern: str, value: str) -> bool:
+    """Glob-match one selector; `"*"` or an empty pattern matches anything."""
+    if not pattern or pattern == "*":
+        return True
+    return bool(fnmatchcase(value, pattern))
+
+
+def _any_pattern_matches(pattern: str, values) -> bool:
+    """Glob-match a selector against any of `values` (empty matches anything)."""
+    if not pattern or pattern == "*":
+        return True
+    return any(_pattern_matches(pattern, value) for value in values)
+
+
 @dataclass
 class AclConfig:
     """The validated `[acl]` authorization policy for one server (doc §8).
@@ -784,8 +863,9 @@ class AclConfig:
     `[security]` authentication: it decides whether an already-verified
     credential may use the mechanism at all. It matches **only** cryptographic
     material (mTLS leaf SPKI fingerprints and CA chains); metadata such as
-    `PAM_USER`, `PAM_TTY`, `rhost` or `guest_hint` is never consulted (review
-    log S11).
+    `PAM_USER`, `PAM_TTY`, `rhost` or `guest_hint` is never consulted for
+    authorization (review log S11). The `rules` list is a separate *approval*
+    refinement evaluated after authorization (see `Rule`).
 
     - `mode = "list"`: a credential is eligible only when its mTLS leaf SPKI
       fingerprint is in `trusted_fingerprints`. An empty set denies everyone;
@@ -803,6 +883,7 @@ class AclConfig:
     ca_file: str | None = None
     required_oid: str | None = None
     labels: dict = field(default_factory=dict)
+    rules: tuple = field(default_factory=tuple)
 
 
 @dataclass
@@ -1001,6 +1082,47 @@ def _fingerprint_set(entries: object, kind: str) -> frozenset:
     return frozenset(_normalize_fingerprint(entry, kind) for entry in entries)
 
 
+def _parse_rules(entries: object) -> tuple:
+    """Validate the `[[acl.rule]]` list into `Rule` objects (first match wins).
+
+    Each entry is a table; only `identity`/`target_user`/`invoking_user`/
+    `service`/`policy` are read, and an unknown key is a startup error (the same
+    fail-closed policy as the rest of the schema). `policy` is exactly one of
+    `allow`/`ask`/`deny`. Order is preserved: the first matching rule wins, and
+    no rule matching means `ask` (`evaluate_rules`).
+    """
+    if entries is None:
+        return ()
+    if not isinstance(entries, list):
+        raise SecurityConfigError("[acl] rule must be an array of tables")
+    rules = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise SecurityConfigError(f"acl.rule[{index}] must be a table")
+        unknown = sorted(set(entry) - CONFIG_RULE_KEYS)
+        if unknown:
+            raise SecurityConfigError(
+                f"acl.rule[{index}] has unknown key(s): "
+                + ", ".join(repr(key) for key in unknown)
+            )
+        policy = entry.get("policy", "ask")
+        if policy not in RULE_POLICIES:
+            raise SecurityConfigError(
+                f"acl.rule[{index}] policy must be one of "
+                f"{', '.join(RULE_POLICIES)}, got {policy!r}"
+            )
+        selectors = {}
+        for key in ("identity", "target_user", "invoking_user", "service"):
+            value = entry.get(key, "*")
+            if not isinstance(value, str):
+                raise SecurityConfigError(
+                    f"acl.rule[{index}] {key} must be a string pattern"
+                )
+            selectors[key] = value or "*"
+        rules.append(Rule(policy=policy, **selectors))
+    return tuple(rules)
+
+
 def load_acl_config(config: dict) -> AclConfig:
     """Validate the server `[acl]` table into an `AclConfig` (doc §8).
 
@@ -1012,7 +1134,9 @@ def load_acl_config(config: dict) -> AclConfig:
     rejected rather than guessed. `"none"` is only reachable because
     `client_auth = "none"` needs an explicit ACL that deliberately authorizes
     unauthenticated requests (`build_security` enforces the pairing). In `"ca"`
-    mode the CA must be readable at load time.
+    mode the CA must be readable at load time. The optional `[[acl.rule]]` list
+    is the *approval* refinement (`_parse_rules`); it is accepted under every
+    mode, including `"none"`, because it never authorizes a credential.
     """
     raw = config.get("acl")
     if raw is None:
@@ -1031,6 +1155,7 @@ def load_acl_config(config: dict) -> AclConfig:
     )
     ca_file = raw.get("ca_file")
     required_oid = raw.get("required_oid")
+    rules = _parse_rules(raw.get("rule"))
 
     if mode == "none":
         # There is no credential to authorize, so any trust material is a
@@ -1051,7 +1176,7 @@ def load_acl_config(config: dict) -> AclConfig:
                 + ", ".join(forbidden)
                 + " (there is no credential to authorize)"
             )
-        return AclConfig(mode="none")
+        return AclConfig(mode="none", rules=rules)
 
     raw_labels = raw.get("labels") or {}
     if not isinstance(raw_labels, dict) or any(
@@ -1083,6 +1208,7 @@ def load_acl_config(config: dict) -> AclConfig:
         ca_file=ca_file,
         required_oid=required_oid,
         labels=labels,
+        rules=rules,
     )
 
 
@@ -1101,6 +1227,53 @@ def acl_allows_any(acl: AclConfig | None) -> bool:
     if acl.mode == "ca":
         return bool(acl.ca_file and acl.required_oid)
     return bool(acl.trusted_fingerprints)
+
+
+def identity_candidates(
+    *,
+    requester: str,
+    label: str = "",
+    peer: str = "",
+) -> tuple:
+    """The strings an `[[acl.rule]]` `identity` selector may match.
+
+    The server has several names for the same connection: the resolved friendly
+    name (`peer`, from `resolution`), the operator's ACL `label`, the verified
+    credential (`requester`, an mTLS SPKI fingerprint or the `none` sentinel).
+    A rule may target any of them, so all non-empty candidates are returned. The
+    order is display-name first so an exact name matches before a fingerprint.
+    """
+    seen: list = []
+    for value in (label, peer, requester):
+        if value and value not in seen:
+            seen.append(value)
+    return tuple(seen)
+
+
+def evaluate_rules(
+    rules,
+    *,
+    identities,
+    target_user: str,
+    invoking_user: str,
+    service: str,
+) -> str:
+    """Return the policy of the first matching `[[acl.rule]]`, else `"ask"`.
+
+    Rules are the *approval* layer: they run only after `authorize_request` has
+    accepted the credential, so they can never grant access the ACL denied. The
+    default with no rules (or no match) is `"ask"` -- the historical behaviour of
+    always prompting.
+    """
+    for rule in rules or ():
+        if rule.matches(
+            identities=identities,
+            target_user=target_user,
+            invoking_user=invoking_user,
+            service=service,
+        ):
+            return rule.policy
+    return "ask"
 
 
 def authorize_request(
@@ -1463,7 +1636,7 @@ def _require_x509():
 
     `cryptography` is the one third-party dependency and is supplied by the
     package's Python environment (`python3.withPackages`, see
-    `nix/packages/sudo-auth-proxy.nix`), so it is present at runtime; the
+    `nix/packages/sudo-auth-proxy/default.nix`), so it is present at runtime; the
     language server simply cannot see into that environment. Centralising the
     "is it importable at all" decision here keeps the call sites free of
     Optional handling.
@@ -1839,6 +2012,23 @@ def sanitize_request_fields(request: dict) -> dict:
     }
 
 
+def effective_target_user(service: str, target_user: str, invoking_user: str) -> str:
+    """Best-effort target account for display and rule matching.
+
+    `sudo` runs its PAM `auth` stack as the **invoking** user (it calls
+    ``pam_start(service, invoking_user)`` and only switches ``PAM_USER`` to the
+    runas user for the account/session phases), so ``PAM_USER`` repeats the
+    invoking user instead of naming the target. For ``sudo`` the target defaults
+    to ``root``; ``su``/``login`` set ``PAM_USER`` to the account, so they are
+    used verbatim. This is a display/rule-matching helper only: the raw
+    ``target_user`` still travels in the request and is bound into its digest,
+    and a `sudo -u <other>` target is not visible to an auth-phase module.
+    """
+    if service == "sudo" and (not target_user or target_user == invoking_user):
+        return "root"
+    return target_user
+
+
 @dataclass
 class Confirmation:
     """The sanitised, display-ready context for one confirmation dialog.
@@ -1847,6 +2037,9 @@ class Confirmation:
     (now sanitised) request metadata. No field here is raw request data: each
     value has already been through :func:`sanitize_field`, so a backend can
     render the dataclass without re-checking anything (doc §11.1-§11.2).
+    `target_user` has additionally been normalised by
+    :func:`effective_target_user` (so a `sudo` dialog shows `root`, not the
+    invoking user repeated).
     """
 
     peer: str
@@ -1885,13 +2078,21 @@ def build_confirmation(
     request_id = nonce[:8] if isinstance(nonce, str) else ""
     moment = time.time() if now is None else now
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(moment))
+    service = request.get("service")
+    service_text = service if isinstance(service, str) else ""
+    invoking = request.get("invoking_user")
+    invoking_text = invoking if isinstance(invoking, str) else ""
+    target = request.get("target_user")
+    target_text = target if isinstance(target, str) else ""
     return Confirmation(
         peer=sanitize_field(peer),
         identity=sanitize_field(identity),
         label=sanitize_field(label),
-        invoking_user=sanitize_field(request.get("invoking_user")),
-        target_user=sanitize_field(request.get("target_user")),
-        service=sanitize_field(request.get("service")),
+        invoking_user=sanitize_field(invoking_text),
+        target_user=sanitize_field(
+            effective_target_user(service_text, target_text, invoking_text)
+        ),
+        service=sanitize_field(service),
         tty=sanitize_field(request.get("tty")),
         rhost=sanitize_field(request.get("rhost")),
         cwd=sanitize_field(request.get("cwd")),
@@ -2261,9 +2462,65 @@ def resolve_tartarus_name(peer) -> str | None:
     return tartarus_name_for_id(vm_id)
 
 
+# `mofos` resolution: `mofos ls --json` prints a JSON array of VM objects
+# (`{"cid": 4, "name": "template-nixos", "ipv4_address": "192.168.90.147",
+# ...}`). The connecting peer is matched to a VM by VSOCK CID (int peer) or by
+# `ipv4_address` (TCP peer), and the VM's `name` becomes the friendly name shown
+# in the prompt. The listing is cached briefly so a burst of `sudo` prompts does
+# not fork `mofos` per request; a missing binary, a non-zero exit or malformed
+# JSON simply yields no name (resolution is cosmetic and never gates anything).
+MOFOS_CACHE_TTL = 30
+MOFOS_TIMEOUT = 10.0
+_mofos_cache: tuple | None = None
+
+
+def _mofos_vms() -> list:
+    """Return `mofos ls --json` as a list of dicts (cached for `MOFOS_CACHE_TTL`)."""
+    global _mofos_cache
+    now = time.time()
+    if _mofos_cache is not None and now - _mofos_cache[0] < MOFOS_CACHE_TTL:
+        return _mofos_cache[1]
+    vms: list = []
+    try:
+        result = subprocess.run(
+            ["mofos", "ls", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=MOFOS_TIMEOUT,
+        )
+        if result.returncode != 0:
+            _debug(f"mofos ls failed: {result.stderr.strip()}")
+        else:
+            parsed = json.loads(result.stdout)
+            if isinstance(parsed, list):
+                vms = [entry for entry in parsed if isinstance(entry, dict)]
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        _debug(f"mofos resolution failed: {error!r}")
+    _mofos_cache = (now, vms)
+    return vms
+
+
+def resolve_mofos_name(peer) -> str | None:
+    """`peer` (VSOCK CID int, or TCP peer IP str) -> the mofos VM name."""
+    if peer is None:
+        return None
+    for vm in _mofos_vms():
+        matched = (
+            vm.get("cid") == peer
+            if isinstance(peer, int)
+            else vm.get("ipv4_address") == peer
+        )
+        if matched:
+            name = vm.get("name")
+            if isinstance(name, str) and name:
+                return name
+    return None
+
+
 def get_resolution_mode(config: dict) -> str:
     mode = config.get("resolution")
-    if mode in ("none", "certificate", "tartarus"):
+    if mode in ("none", "certificate", "tartarus", "mofos"):
         return mode
     mtls = config.get("mtls")
     return "certificate" if isinstance(mtls, dict) and mtls.get("enable", False) else "tartarus"
@@ -2900,8 +3157,9 @@ def get_peer_name(sock, resolution: str, transport: Transport | None) -> str:
 
     The raw label comes from the transport (`cid N` for VSOCK, the address for
     TCP, the socket path/`local` for unix); `certificate` prefers the verified
-    peer CN/SAN and `tartarus` falls back to the local VM bookkeeping when the
-    transport can correlate a CID/IP.
+    peer CN/SAN, `tartarus` falls back to the local VM bookkeeping and `mofos`
+    to `mofos ls --json`, both correlating a CID/IP when the transport provides
+    one.
     """
     raw = transport.peer_label(sock) if transport is not None else "peer"
 
@@ -2923,6 +3181,13 @@ def get_peer_name(sock, resolution: str, transport: Transport | None) -> str:
         peer = transport.tartarus_peer(sock)
         if peer is not None:
             name = resolve_tartarus_name(peer)
+            if name:
+                return name
+
+    if resolution == "mofos" and transport is not None:
+        peer = transport.tartarus_peer(sock)
+        if peer is not None:
+            name = resolve_mofos_name(peer)
             if name:
                 return name
 
@@ -3152,11 +3417,47 @@ class Handler(StreamRequestHandler):
                 with contextlib.suppress(ProtocolError, OSError):
                     write_message(self.wfile, response)
                 break
-            # The request is authenticated AND authorized: acknowledge it
-            # immediately, *before* blocking on the human, so the client's
-            # short first-frame bound stays short and the human wait is bounded
-            # by `decision_timeout` (doc §6.2a; audit A2). The frame carries no
-            # decision and is not signed; it is validated only by nonce.
+            # Approval refinement (`[[acl.rule]]`). The ACL above authorized the
+            # credential; these rules only decide whether to auto-allow,
+            # auto-deny or prompt, matching the resolved identity plus the
+            # (self-reported) request metadata. An auto-decision answers
+            # immediately, exactly like an ACL denial, so the client's
+            # first-frame bound still applies and no dialog is raised.
+            policy = evaluate_rules(
+                security.acl.rules if security.acl else (),
+                identities=identity_candidates(
+                    requester=requester, label=label, peer=peer
+                ),
+                target_user=effective_target_user(
+                    request.get("service", ""),
+                    request.get("target_user", ""),
+                    request.get("invoking_user", ""),
+                ),
+                invoking_user=request.get("invoking_user", ""),
+                service=request.get("service", ""),
+            )
+            if policy in ("allow", "deny"):
+                print(
+                    f"sudo-auth-proxy server: rule {policy} for {peer} "
+                    f"(requester={sanitize_field(requester)!r})",
+                    file=sys.stderr,
+                )
+                response = build_response(
+                    request["nonce"],
+                    policy,
+                    request=request,
+                    security=security,
+                    approver=config.get("approver") or os.environ.get("USER", ""),
+                )
+                with contextlib.suppress(ProtocolError, OSError):
+                    write_message(self.wfile, response)
+                break
+            # The request is authenticated AND authorized, and no rule decided
+            # it: acknowledge it immediately, *before* blocking on the human, so
+            # the client's short first-frame bound stays short and the human wait
+            # is bounded by `decision_timeout` (doc §6.2a; audit A2). The frame
+            # carries no decision and is not signed; it is validated only by
+            # nonce.
             try:
                 write_message(self.wfile, build_pending(request["nonce"]))
             except (ProtocolError, OSError):

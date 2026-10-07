@@ -194,9 +194,9 @@
       else "/home/${username}"
     );
 
-  sudoHm = (import ../packages/sudo-auth-proxy.nix {inherit inputs;}).homeManagerModule;
-  sshHm = (import ../packages/ssh-agent-proxy.nix {inherit inputs;}).homeManagerModule;
-  clipHm = (import ../packages/clipboard-bridge.nix {inherit inputs;}).homeManagerModule;
+  sudoHm = (import ../packages/sudo-auth-proxy {inherit inputs;}).homeManagerModule;
+  sshHm = (import ../packages/ssh-agent-proxy {inherit inputs;}).homeManagerModule;
+  clipHm = (import ../packages/clipboard-bridge {inherit inputs;}).homeManagerModule;
 
   sshEntries = listOf sshReq;
   sshVmEntries =

@@ -14,7 +14,7 @@
 # `ExecStart` points at the standalone script. If you installed it as a package
 # (or a wrapper on PATH), use that path instead — e.g. `ExecStart=%h/.local/bin/sudo-auth-proxy ...`.
 #
-# This mirrors `nix/packages/sudo-auth-proxy.nix` (the home-manager module),
+# This mirrors `nix/packages/sudo-auth-proxy/default.nix` (the home-manager module),
 # which is the same unit built from Nix for NixOS/nix-darwin hosts.
 
 [Unit]

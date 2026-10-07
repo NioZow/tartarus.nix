@@ -31,7 +31,7 @@
         [pythonEnv]
         ++ lib.optionals (!pkgs.stdenv.isDarwin) [pkgs.zenity];
       text = ''
-        exec ${pythonEnv.interpreter} -P ${./sources/ssh-agent-proxy.py} "$@"
+        exec ${pythonEnv.interpreter} -P ${./ssh-agent-proxy.py} "$@"
       '';
     };
 

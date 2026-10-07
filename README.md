@@ -28,7 +28,7 @@ lib/version.nix        tartarus's own stateVersion constant
 nix/lib/               types, names, stable id -> IP/MAC/CID, mkGuests
 nix/guest/             the guest engine (build/base/network/shares/proxy/...)
 nix/host/              tartarus.* options, firewall, Squid proxy, CA, services
-nix/packages/          the CLI + the three standalone utilities
+nix/packages/          the CLI + the three standalone utilities (one dir each)
 src/tartarus/          the Python package (uv) behind the CLI
 tests/                 eval-level test suite (no VM boots)
 ```

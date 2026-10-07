@@ -6,9 +6,9 @@
   systems = ["x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"];
   forAllSystems = lib.genAttrs systems;
 
-  sudoAuthProxy = import ./packages/sudo-auth-proxy.nix {inherit inputs;};
-  sshAgentProxyPkg = import ./packages/ssh-agent-proxy.nix {inherit inputs;};
-  clipboardBridge = import ./packages/clipboard-bridge.nix {inherit inputs;};
+  sudoAuthProxy = import ./packages/sudo-auth-proxy {inherit inputs;};
+  sshAgentProxyPkg = import ./packages/ssh-agent-proxy {inherit inputs;};
+  clipboardBridge = import ./packages/clipboard-bridge {inherit inputs;};
 
   # Eval-level test suite (shared across systems; evaluation is platform
   # independent and the checks only wrap its results).
@@ -29,7 +29,7 @@ in {
     "sudo-auth-proxy" = sudoAuthProxy.nixosModule;
     # Explicitly-named alias for the guest-side PAM client module, so a
     # standalone consumer can request just the PAM wiring by name. Same
-    # module as `"sudo-auth-proxy"` (see nix/packages/sudo-auth-proxy.nix).
+    # module as `"sudo-auth-proxy"` (see nix/packages/sudo-auth-proxy/default.nix).
     "sudo-auth-proxy-pam" = sudoAuthProxy.pamNixosModule;
     "ssh-agent-proxy" = sshAgentProxyPkg.nixosModule;
     "clipboard-bridge" = clipboardBridge.nixosModule;

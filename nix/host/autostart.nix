@@ -35,7 +35,7 @@
   tartarus =
     if tartarusPkg != null
     then tartarusPkg
-    else import ../packages/tartarus.nix {inherit pkgs;};
+    else import ../packages/tartarus {inherit pkgs;};
 
   mkService = inputs.nix-service.lib.mkService {
     inherit lib username isDarwin;

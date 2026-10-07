@@ -820,7 +820,7 @@ for logging:
 This subsection fixes the exact conventions the shipped implementation chose and
 that §6.1–§6.7 leave implicit. A future client written against this document must
 reproduce these byte-for-byte; it exists so no one has to read the source to write
-one. Source of truth: `nix/packages/sources/sudo-auth-proxy.py`.
+one. Source of truth: `nix/packages/sudo-auth-proxy/sudo-auth-proxy.py`.
 
 **Framing**
 
@@ -1231,6 +1231,7 @@ The server reads exactly these keys; the client never sees this table.
 | `ca_file`              | `ca`         | path (PEM)                                        | Trusted CA. Required in `ca`; forbidden in `list`. Resolved against the config directory.                   |
 | `required_oid`         | `ca`         | OID string                                        | EKU the requester certificate must carry. Required in `ca`; forbidden in `list`.                            |
 | `labels`               | all but `none` | table: `SHA256:...` → string                    | Display/log label for a credential. **Not** an authorization input and never accepted from the requester.   |
+| `rule`                 | all          | array of tables (`[[acl.rule]]`)                  | Optional approval rules (§8.6); first match wins, no match means `ask`. Accepted under every mode.          |
 
 Validation rules (all fail closed, at startup):
 
@@ -1253,11 +1254,64 @@ Validation rules (all fail closed, at startup):
 
 The Nix home-manager module exposes the same table as
 `tartarus.sudo-auth-proxy.server.acl.{mode, trustedFingerprints, caFile,
-requiredOid}`; `labels` is currently only reachable through the free-form
+requiredOid, rule}`; `labels` is currently only reachable through the free-form
 `extraSettings`/`settings` escape hatch. The shipped host module defaults the
 whole table to `mode = "ca"` with the tartarus CA and the sudo client OID (audit
 A1), so a configured guest is authorized without an operator-maintained
 fingerprint list.
+
+### 8.6 Approval rules (`[[acl.rule]]`)
+
+The ACL above is the **authorization gate**: it decides whether a credential may
+use the mechanism at all. The optional `[[acl.rule]]` list is a second,
+**approval** refinement evaluated only *after* `authorize_request` accepts the
+credential. Rules can therefore never grant access the ACL denied; they only
+decide how an already-authorized request is answered:
+
+| `policy` | Effect                                                      |
+| -------- | ----------------------------------------------------------- |
+| `allow`  | reply `allow` immediately, without a dialog                 |
+| `ask`    | show the confirmation dialog (the default when nothing matches) |
+| `deny`   | reply `deny` immediately, without a dialog                  |
+
+Rules are evaluated in file order and the **first match wins** — there is no
+merging, exactly like `ssh-agent-proxy`'s rule list. Each rule has these
+`fnmatch` glob selectors; `*` (or an omitted selector) matches anything:
+
+| Key             | Matched against                                                                                                     |
+| --------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `identity`      | Any requester name the server holds: the `resolution` friendly name (`mofos` VM name, certificate CN, tartarus name), the ACL `labels` entry, and the verified credential (`SHA256:...` or `none`). |
+| `target_user`   | The effective target account (`root` for a plain `sudo`; see §11.1).                                                 |
+| `invoking_user` | The invoking user.                                                                                                  |
+| `service`       | The PAM service (`sudo`, `su`, `login`).                                                                            |
+| `policy`        | `allow` \| `ask` \| `deny` (default `ask`).                                                                          |
+
+Worked example — auto-allow a known guest, prompt for everything else:
+
+```toml
+[acl]
+mode = "ca"
+ca_file = "./ca.crt"
+required_oid = "1.3.6.1.4.1.99999.1.2"
+
+[[acl.rule]]
+identity = "template-nixos"   # the mofos name from `resolution = "mofos"`
+target_user = "root"
+service = "sudo"
+policy = "allow"
+
+[[acl.rule]]
+identity = "*"
+policy = "ask"
+```
+
+Because `identity` also matches the ACL label and the verified fingerprint, a
+rule can pin a credential directly (`identity = "SHA256:AbCdEf..."`) or target a
+friendly name. An unknown key, a non-string selector or a `policy` other than
+`allow`/`ask`/`deny` is a startup error (fail closed, like the rest of the
+schema). Rules are accepted under every ACL mode, including `none`, because they
+inspect only display/approval metadata — never the credential the ACL is
+responsible for.
 
 ---
 
@@ -1547,7 +1601,11 @@ needed to answer:
 
 - **Requester identity** — the verified credential (mTLS leaf SPKI, or its
   configured label; "Unauthenticated requester" when `client_auth = "none"`).
-- **Invoking user → target user** (e.g. `user → root`).
+- **Invoking user → target user** (e.g. `user → root`). The target is the
+  effective account: `sudo` runs its PAM `auth` stack as the *invoking* user (so
+  `PAM_USER` repeats the invoking user there), and the target is therefore
+  normalised to `root` for a plain `sudo`; `su`/`login` report `PAM_USER`
+  verbatim. `sudo -u <other>` is not distinguishable in the auth phase.
 - **Service** (`sudo` / `su` / `login`).
 - **TTY** (`/dev/pts/3`) and **rhost** if any.
 - **Working directory**.
@@ -1641,6 +1699,27 @@ characters (`gtk_label_set_max_width_chars (text, 60)`), which turns the summary
 and the field block into a narrow column that is taller than it is wide. A field
 that is longer than the width still wraps, which is the only way to show all of
 it without truncating (`--ellipsize` would hide the value being inspected).
+
+### 11.5 Peer name resolution (`resolution`)
+
+The `<peer>` shown in the summary is a display/log label derived from the
+transport. The server-side `resolution` key chooses how to make it friendlier;
+it never gates anything and is sanitised like every other field.
+
+| `resolution`  | Name shown                                                                                       |
+| ------------- | ------------------------------------------------------------------------------------------------ |
+| `none`        | The transport's raw label (`cid N` for VSOCK, the address for TCP, `local` for unix).            |
+| `certificate` | The verified mTLS peer certificate CN (or first `DNS` SAN). Needs mTLS.                         |
+| `tartarus`    | The local tartarus VM bookkeeping (`~/.local/state/tartarus/<name>/cid`), matched by CID/IP.     |
+| `mofos`       | `mofos ls --json`, matching the peer's VSOCK CID or `ipv4_address` to the VM `name`.             |
+
+`mofos` shells out to `mofos ls --json`, caches the listing for 30 seconds, and
+degrades to the raw label when the binary is missing, exits non-zero, or returns
+malformed JSON — resolution is cosmetic and must never delay or fail a prompt.
+The Nix module exposes it as
+`tartarus.sudo-auth-proxy.server.resolution`; unset defaults to `certificate`
+when `mtls` is enabled and `tartarus` otherwise. The resolved name is one of the
+candidates an `[[acl.rule]]` `identity` selector matches (§8.6).
 
 ---
 
@@ -2205,8 +2284,10 @@ ready-to-edit pair:
 - A session/pty-scoped recursion guard that survives into the elevated context
   (audit A5; today the guard covers only the helper process, §10.4).
 - TPM/HSM-backed certificate keys.
-- Two-person approval and command allow/deny policies (reuse the
-  `ssh-agent-proxy` rule engine).
+- ~~Identity-based approval rules.~~ **Implemented (§8.6):** `[[acl.rule]]`
+  auto-allows/auto-denies or prompts by resolved identity. Still future work:
+  two-person approval and command allow/deny policies (the command is not in the
+  protocol; §5.4).
 - Out-of-band approval (phone/push) for headless approvers.
 - Distinguishing `deny` from `unavailable` in the PAM return path (required for
   any non-ignorable `deny`/strict mode; not implementable with `pam_exec`).
@@ -2319,7 +2400,7 @@ is fixed inline and mapped below. Every item here is also bound to a phase in th
 | B1  | §7.4 showed `"SAP-v1"` then nonce, request_digest, decision, times — omitting `approver` and disagreeing with §6.4.                                   | §7.4 now quotes the full §6.4 transcript including `approver`; `alg` + `key_id` added (see NF1).                                                                    |
 | B2  | `SUDO_AUTH_PROXY_ACTIVE` (§10.4) is not preserved by `sudoers env_keep`, so default `env_reset` strips it and the recursion guard silently fails.     | `Defaults env_keep += "SUDO_AUTH_PROXY_ACTIVE"` mandated wherever the socket selector is (§4.3, §12.4 A6, §15.2).                                                   |
 | NF1 | Signature algorithm/key were not bound and there was no agility story.                                                                                | `alg` + `key_id` added to the signed transcript (§6.4, §6.3); the client pins the expected `key_id` and rejects unknown/absent `alg` (§7.4, §7.6).                  |
-| NF2 | Dialog fields (especially swiftDialog markdown) can be injected; the current code interpolates `{peer}` unescaped (`sources/sudo-auth-proxy.py:179`). | §11.2 defines NFC normalisation plus an allow-list `[A-Za-z0-9_.:/@-]` for every attacker-influenced field, with swiftDialog `* [ ] ( )` escaping.                  |
+| NF2 | Dialog fields (especially swiftDialog markdown) can be injected; the current code interpolates `{peer}` unescaped (`nix/packages/sudo-auth-proxy/sudo-auth-proxy.py`). | §11.2 defines NFC normalisation plus an allow-list `[A-Za-z0-9_.:/@-]` for every attacker-influenced field, with swiftDialog `* [ ] ( )` escaping.                  |
 | NF4 | A stale bound-but-unlistened Unix socket does **not** fail fast: `connect()` succeeds and the client then hangs on `read()`.                          | §4.3 wording corrected; §10.2 adds a receive/response timeout (`SO_RCVTIMEO`, ~500 ms); T19/T24 updated.                                                            |
 | NF5 | Rate-limit/backoff/circuit-breaker requirements were vague.                                                                                           | §11.3 fixed to max 3 prompts / 60 s / guest; exponential backoff from 5 s; breaker 10 denials / 60 s → open for 300 s; state in server memory with a 10-minute TTL. |
 | NF6 | `list` pins the mTLS SPKI, but `unix` has no mTLS by default, so the pin had nothing to match.                                                       | §8.2/§8.4 define `unix` pinning as the SSH host-key fingerprint or require `mtls = true`; with neither, fail closed.                                                |

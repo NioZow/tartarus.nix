@@ -133,6 +133,18 @@ socket_mode = "0600"
 # affordance.
 debug = false
 
+# How to resolve the connecting client's friendly name shown in the dialog:
+#
+#   "none"         show the transport's raw label (address/CID)
+#   "certificate"  verified peer certificate CN (mTLS only)
+#   "tartarus"     the local VM bookkeeping state directory
+#   "mofos"        `mofos ls --json`, matching the peer's VSOCK CID or
+#                  `ipv4_address` to a VM name
+#
+# The resolved name is also what an `[[acl.rule]]` `identity` selector matches.
+# For the MOFOS guest callback this example resolves the VM name via `mofos`.
+resolution = "mofos"
+
 # ---------------------------------------------------------------------------
 # [security] — the three authentication knobs.
 #
@@ -187,3 +199,22 @@ clock_skew = 5
 # ---------------------------------------------------------------------------
 [acl]
 mode = "none"
+
+# Optional approval rules (`[[acl.rule]]`). The ACL above decides *whether* the
+# credential may use the mechanism; these rules refine the *approval* decision
+# once it has been authorized. Each rule matches glob patterns against the
+# requester's identity (the `resolution` name, the ACL label and the verified
+# credential), the target/invoking user and the PAM service; the first matching
+# rule wins and no match means `ask`. `policy` is `allow` (reply without a
+# dialog), `deny` (reply without a dialog) or `ask` (show the prompt). A rule
+# can never grant access the ACL denied. Uncomment to auto-allow a known VM:
+#
+#   [[acl.rule]]
+#   identity = "template-nixos"
+#   target_user = "root"
+#   service = "sudo"
+#   policy = "allow"
+#
+#   [[acl.rule]]
+#   identity = "*"
+#   policy = "ask"
