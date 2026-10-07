@@ -75,6 +75,24 @@ in {
           guests of one host is an evaluation error.
         '';
       };
+      # Transport for the ssh-agent-proxy integration specifically. Mirrors
+      # `sudoAuthProxyTransport`: the per-guest marker the host server transport
+      # selection reads. `unix` selects the host→guest SSH-forwarded Unix socket
+      # (one server socket, no port); `vsock`/`tcp` keep the platform's callback
+      # transport. Mixing `unix` with a callback transport across the guests of
+      # one host is an evaluation error (the server exposes one socket).
+      sshAgentProxyTransport = mkOption {
+        type = types.enum ["vsock" "tcp" "unix"];
+        default = "vsock";
+        description = ''
+          Transport the ssh-agent-proxy integration uses for this guest. `unix`
+          requests the SSH-forwarded host→guest Unix socket (no network port);
+          `vsock`/`tcp` keep the platform's normal callback transport. At most
+          one transport per host user is supported: the host server exposes a
+          single socket, so mixing `unix` with a callback transport across the
+          guests of one host is an evaluation error.
+        '';
+      };
     };
   };
 

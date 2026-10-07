@@ -2000,6 +2000,51 @@ in {
       T
       (nixosDrvOk (mkStandaloneNixos self.nixosModules."ssh-agent-proxy" {tartarus.ssh-agent-proxy.enable = true;}))
       "ssh-agent-proxy NixOS module does not evaluate standalone";
+    # `unix` transport with certificate resolution must evaluate standalone.
+    "standalone/nixos-ssh-agent-proxy-unix" =
+      T
+      (nixosDrvOk (mkStandaloneNixos self.nixosModules."ssh-agent-proxy" {
+        tartarus.ssh-agent-proxy = {
+          enable = true;
+          server = {
+            enable = true;
+            transport = "unix";
+            resolution = "certificate";
+            mtls.enable = true;
+          };
+        };
+      }))
+      "ssh-agent-proxy unix transport does not evaluate standalone";
+    # mtls.enable is an alias for transport_encryption = "mtls": an explicit
+    # `none` alongside it must be refused by the module assertion.
+    "standalone/nixos-ssh-agent-proxy-mtls-conflict" =
+      T
+      (! (nixosDrvOk (mkStandaloneNixos self.nixosModules."ssh-agent-proxy" {
+          tartarus.ssh-agent-proxy = {
+            enable = true;
+            server = {
+              enable = true;
+              transport = "vsock";
+              mtls.enable = true;
+              security.transportEncryption = "none";
+            };
+          };
+        })))
+      "ssh-agent-proxy accepted mtls.enable with transport_encryption = none";
+    # `unix` cannot map a CID/IP, so tartarus/mofos resolution must be refused.
+    "standalone/nixos-ssh-agent-proxy-unix-bad-resolution" =
+      T
+      (! (nixosDrvOk (mkStandaloneNixos self.nixosModules."ssh-agent-proxy" {
+          tartarus.ssh-agent-proxy = {
+            enable = true;
+            server = {
+              enable = true;
+              transport = "unix";
+              resolution = "tartarus";
+            };
+          };
+        })))
+      "ssh-agent-proxy accepted tartarus resolution on the unix transport";
     "standalone/nixos-sudo-auth-proxy" =
       T
       (nixosDrvOk (mkStandaloneNixos self.nixosModules."sudo-auth-proxy" {tartarus.sudo-auth-proxy.enable = true;}))

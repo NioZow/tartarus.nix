@@ -1,0 +1,113 @@
+# ssh-agent-proxy — standalone host-side server configuration (no Nix required)
+#
+# This is the *host* side: it owns the host's SSH identities and brokers them to
+# guests. Run it on the machine where the keys live; the guest runs either the
+# bridge (`ssh-agent-proxy-client.toml`) or uses the forwarded socket directly.
+#
+# Two transports matter here:
+#
+#   "unix" + transport_encryption = "none"  The guest's ssh/git talks plain
+#           agent protocol to the `ssh -R` forwarded socket, which this server
+#           accepts on its single AF_UNIX socket. Identity is unset, so only
+#           wildcard rules match (a specific `vm_names` never matches).
+#
+#   "unix" + transport_encryption = "mtls"  The guest runs the bridge, which
+#           wraps the forwarded stream in TLS; this server terminates it. The
+#           verified client certificate CN becomes the identity, so per-guest
+#           `vm_names` rules work. The `[mtls]` block below is for this mode.
+#
+#   "vsock" / "tcp"  The guest dials the host callback endpoint. See the
+#           sudo-auth-proxy example for the callback shape.
+#
+# Copy to ~/.config/ssh-agent-proxy/config.toml and run:
+#
+#   ssh-agent-proxy --config ~/.config/ssh-agent-proxy/config.toml
+#
+# Paths are resolved relative to this file's directory (`./server.crt` means
+# "next to this config"), except `%t/...` which expands to the runtime dir.
+#
+# The host half of the guest setup is a plain SSH RemoteForward:
+#
+#   ssh -o StreamLocalBindUnlink=yes -o ExitOnForwardFailure=yes \
+#       -o "RemoteForward=/run/ssh-agent-proxy/%r@%h.sock %t/ssh-agent-proxy/server.sock" \
+#       -o "SetEnv=SSH_AGENT_PROXY_SOCK=/run/ssh-agent-proxy/%r@%h.sock" guest
+
+# ---------------------------------------------------------------------------
+mode = "proxy"
+
+# "vsock" | "tcp" | "unix". The single host socket below is the only endpoint.
+transport = "unix"
+
+# The AF_UNIX socket this server binds (transport = "unix"). One per host user;
+# guest identity never comes from the path. `%t` = the user runtime directory.
+socket = "%t/ssh-agent-proxy/server.sock"
+socket_dir_mode = "0700"
+socket_mode = "0600"
+
+# How a connecting peer is named. On `unix` the only valid values are:
+#   "none"         identity unset -> only wildcard rules match
+#   "certificate"  verified mTLS peer certificate CN (requires mtls below)
+# ("tartarus"/"mofos" are rejected on `unix`: there is no CID or IP to map.)
+resolution = "none"
+
+# Wall-clock bounds. `connect_timeout` bounds the dial + TLS handshake.
+connect_timeout = 10.0
+handshake_timeout = 10.0
+# Seconds to wait for a human decision (0 = wait indefinitely).
+decision_timeout = 120
+
+# The agent socket this server draws identities from when `forward_sockets`
+# is not set explicitly. Here it is set explicitly below.
+default_agent_socket_path = "%t/ssh-agent"
+
+# Upstream agent sockets whose identities are offered to clients. A directory
+# is also accepted and is scanned per connection (pick up per-session sockets).
+# One matches the ssh-agent started by the desktop session or the guest's own
+# agent.
+forward_sockets = ["%t/ssh-agent"]
+
+# Log timing/selection detail to stderr.
+debug = false
+
+# ---------------------------------------------------------------------------
+# [security] — resolved from `transport` unless written explicitly.
+#
+#   transport_encryption  "auto" | "none" | "mtls"  (auto: tcp -> mtls,
+#                          vsock/unix -> none)
+#   client_auth           "transport" | "none"
+#   server_auth           "transport" | "none"
+#
+# Under mTLS both auth knobs are forced to "transport". This example is the
+# transparent `unix + none` server, so authentication is explicitly off.
+# ---------------------------------------------------------------------------
+[security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+# ---------------------------------------------------------------------------
+# [mtls] — required when transport_encryption = "mtls" (unix + mtls). Uncomment
+# to switch this server to certificate identity; then set resolution =
+# "certificate" above and have the guest use the bridge with matching material.
+# ---------------------------------------------------------------------------
+# [mtls]
+# enable = true
+# ca_file = "./ca.crt"
+# cert_file = "./server.crt"
+# key_file = "./server.key"
+# required_oid = "1.3.6.1.4.1.99999.2.1"      # this (server) certificate
+# peer_required_oid = "1.3.6.1.4.1.99999.2.2" # the peer (client) certificate
+
+# ---------------------------------------------------------------------------
+# Explicit keys and rules. With `resolution = "none"` only wildcard `vm_names`
+# rules can match, so a `[[rule]]` with a specific selector is pointless here.
+# ---------------------------------------------------------------------------
+# [[key]]
+# id = "laptop"
+# pubkey = "ssh-ed25519 AAAA... user@laptop"
+
+[[rule]]
+key = "*"
+match.vm_names = ["*"]   # required on `unix + none`: identity is unset
+auth = "ask"
+data_signing = "deny"

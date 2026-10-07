@@ -6,9 +6,9 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from fnmatch import fnmatchcase
 from hashlib import sha256
-from json import dumps as json_dumps
+from json import dumps as json_dumps, loads as json_loads
 from logging import getLogger, basicConfig, DEBUG, INFO
-from os import environ, umask
+from os import environ, getuid, umask
 from pathlib import Path
 from re import compile as re_compile
 import socket
@@ -31,12 +31,13 @@ from socketserver import (
     ThreadingMixIn,
     UnixStreamServer,
 )
-from struct import pack, unpack
+from stat import S_ISLNK, S_ISSOCK
+from struct import calcsize, pack, unpack
 from subprocess import run
 from sys import exit, platform as sys_platform
 from tempfile import gettempdir
 from threading import Lock
-from time import monotonic
+from time import monotonic, time
 from tomllib import load
 from typing import Any, Optional
 from xml.etree import ElementTree
@@ -81,6 +82,26 @@ HOST_CID = 2
 # Default TCP listener. VSOCK is no longer the default: unless `vsock_port`
 # is set in the config the proxy listens on TCP (host:port).
 DEFAULT_TCP_BIND = "127.0.0.1:65000"
+# The single host-side AF_UNIX socket used by the `unix` transport (the host
+# dials the guest through an SSH RemoteForward); guest identity comes from the
+# certificate (mTLS) or is unset (`none`), never the socket path.
+DEFAULT_SOCKET = "%t/ssh-agent-proxy/server.sock"
+DEFAULT_SOCKET_DIR_MODE = "0700"
+DEFAULT_SOCKET_MODE = "0600"
+
+# `[security]` enums (doc §7 parity with sudo-auth-proxy). `auto` resolves from
+# the transport (tcp -> mtls, vsock/unix -> none) so it is never a runtime
+# downgrade.
+TRANSPORT_ENCRYPTIONS = ("auto", "none", "mtls")
+CLIENT_AUTH_METHODS = ("transport", "none")
+SERVER_AUTH_METHODS = ("transport", "none")
+
+# Bound the transport connect and the TLS handshake so an unreachable or
+# half-open peer fails fast instead of hanging the caller.
+DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_HANDSHAKE_TIMEOUT = 10.0
+# Seconds to wait for a human decision (0 = wait indefinitely).
+DEFAULT_DECISION_TIMEOUT = 120
 
 
 def _ms(seconds: float) -> str:
@@ -154,6 +175,13 @@ class Rule:
     and the VM selector matches (vm_names; an empty selector matches any VM).
     Rules are evaluated in file order and the first match wins -- it fully
     defines the policy, there is no merging between rules.
+
+    Matching is against the **verified identity** (`Resolution = none` -> no
+    identity at all), never against the human display label (which may be an
+    `unknown-*`/`local` placeholder). An unauthenticated peer (`identity is
+    None`) therefore matches **only** wildcard rules: an empty selector or a
+    selector made exclusively of `*` patterns. A specific `vm_names` pattern
+    can never match a peer whose identity was not established.
     """
 
     key: str  # a key id, or "*" for any key
@@ -168,10 +196,15 @@ class Rule:
             return self.key == "*" or self.key == key_id
         return fnmatchcase(key_id, self.key)
 
-    def matches_vm(self, vm_name: str) -> bool:
+    def matches_vm(self, identity: Optional[str]) -> bool:
+        if identity is None:
+            # Identity intentionally unset (resolution = "none", or the peer did
+            # not resolve): only wildcard rules apply. A specific name can never
+            # match an unauthenticated peer.
+            return not self.vm_names or all(p == "*" for p in self.vm_names)
         if not self.vm_names:
             return True  # empty selector -> any VM
-        return any(fnmatchcase(vm_name, pattern) for pattern in self.vm_names)
+        return any(fnmatchcase(identity, pattern) for pattern in self.vm_names)
 
 
 # Fallback policy for a key that isn't governed by any explicit `rule` (see
@@ -292,10 +325,27 @@ class Config:
         self.mode: Optional[str] = None
         self.merge_sockets: list[str] = []
         self.listen_socket: Optional[str] = None
+        # `transport` is the single source of truth: "vsock" | "tcp" | "unix".
+        # `host`/`port`/`cid` are the callback (client) destination; `socket`
+        # is the host-side AF_UNIX bind (server, unix transport) and
+        # `connect_socket` the AF_UNIX path the client dials.
         self.transport: str = "tcp"
         self.host: str = "127.0.0.1"
         self.port: int = DEFAULT_VSOCK_PORT
         self.cid: int = HOST_CID
+        self.socket: Optional[str] = None
+        self.connect_socket: Optional[str] = None
+        self.socket_dir_mode: str = DEFAULT_SOCKET_DIR_MODE
+        self.socket_mode: str = DEFAULT_SOCKET_MODE
+
+        # `[security]`: resolved to one of auto|none|mtls at load. `None`
+        # (unset) is resolved from the transport / legacy `mtls.enable`.
+        self.transport_encryption: Optional[str] = None
+        self.client_auth: Optional[str] = None
+        self.server_auth: Optional[str] = None
+        self.connect_timeout: float = DEFAULT_CONNECT_TIMEOUT
+        self.handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT
+        self.decision_timeout: int = DEFAULT_DECISION_TIMEOUT
 
         self.dialog_program: Optional[str] = None
 
@@ -308,11 +358,12 @@ class Config:
 
         self.vsock_port: int = DEFAULT_VSOCK_PORT
         # "host:port" to listen on over TCP, or None to use VSOCK instead.
+        # Deprecated aliases for `transport` (derived at load, with a warning).
         self.tcp_bind: Optional[str] = None
         # How to resolve a connecting VM's name: "none" | "certificate" |
-        # "tartarus". None (unset in config) means "not loaded yet"; load()
-        # resolves it to "certificate" if mtls_enable else "tartarus" unless
-        # the config sets it explicitly. Proxy-mode only.
+        # "tartarus" | "mofos". None (unset in config) means "not loaded yet";
+        # load() resolves it to "certificate" if transport_encryption is mtls
+        # else "none" unless the config sets it explicitly. Proxy-mode only.
         self.resolution: Optional[str] = None
         self.default_agent_socket_path: Optional[str] = environ.get("SSH_AUTH_SOCK")
         # Upstream agent sockets whose identities are forwarded to every VM by
@@ -391,11 +442,35 @@ class Config:
             self.mode = mode
         self.merge_sockets = data.get("merge_sockets", self.merge_sockets)
         self.listen_socket = resolve(data.get("listen_socket", self.listen_socket))
-        self.transport = data.get("transport", self.transport)
+        self.socket = resolve(data.get("socket", self.socket))
+        self.socket_dir_mode = data.get("socket_dir_mode", self.socket_dir_mode)
+        self.socket_mode = data.get("socket_mode", self.socket_mode)
+        self.connect_socket = resolve(data.get("connect_socket", self.connect_socket))
         self.host = data.get("host", self.host)
         self.port = data.get("port", self.port)
         self.cid = data.get("cid", self.cid)
         self.dialog_program = data.get("dialog_program", self.dialog_program)
+
+        # `transport` is authoritative. Legacy configs that only set
+        # `tcp_bind`/`vsock_port` derive it (with a warning); one that sets
+        # neither keeps the historic default of the callback family.
+        transport = data.get("transport")
+        if transport is None:
+            if data.get("tcp_bind") is not None:
+                transport = "tcp"
+                log.warning(
+                    "tcp_bind is deprecated; set transport = \"tcp\" and host/port"
+                )
+            elif data.get("vsock_port") is not None:
+                transport = "vsock"
+                log.warning(
+                    "vsock_port is deprecated; set transport = \"vsock\" and port"
+                )
+            else:
+                transport = "tcp"
+        if transport not in ("vsock", "tcp", "unix"):
+            raise ValueError(f"invalid transport: {transport!r}")
+        self.transport = transport
 
         mtls = data.get("mtls", {})
         if isinstance(mtls, dict):
@@ -406,21 +481,37 @@ class Config:
             self.mtls_required_oid = mtls.get("required_oid")
             self.mtls_peer_required_oid = mtls.get("peer_required_oid")
 
+        self.connect_timeout = float(data.get("connect_timeout", self.connect_timeout))
+        self.handshake_timeout = float(
+            data.get("handshake_timeout", self.handshake_timeout)
+        )
+        self.decision_timeout = int(data.get("decision_timeout", self.decision_timeout))
+        (
+            self.transport_encryption,
+            self.client_auth,
+            self.server_auth,
+        ) = validate_security_config(data, self.transport)
+
         # Client mode is a pure forwarder: it needs only the transport,
-        # destination address/port and mTLS material to reach the host's proxy.
-        # Everything below (vsock/tcp listener, SSH_AUTH_SOCK, VM/key/rule
+        # destination address/path/socket and mTLS material to reach the host's
+        # proxy. Everything below (the listener, SSH_AUTH_SOCK, VM/key/rule
         # policy) is proxy-only and must not be parsed for a client, so a
         # minimal client config cannot fail to load (e.g. on SSH_AUTH_SOCK).
         if self.mode == "client":
+            target = (
+                self.connect_socket or environ.get("SSH_AUTH_PROXY_SOCK")
+                if self.transport == "unix"
+                else f"{self.host}:{self.port}"
+            )
             log.info(
                 f"Loaded client config from {p}: "
-                f"transport={self.transport}, connect to {self.host}:{self.port}, "
-                f"cid={self.cid}, listen_socket={self.listen_socket}, "
-                f"mtls={self.mtls_enable}"
+                f"transport={self.transport}, target={target}, cid={self.cid}, "
+                f"listen_socket={self.listen_socket}, "
+                f"transport_encryption={self.transport_encryption}"
             )
             return
 
-        self.vsock_port = data.get("vsock_port", DEFAULT_VSOCK_PORT)
+        self.vsock_port = data.get("vsock_port", self.port)
         tcp_bind = data.get("tcp_bind")
         if tcp_bind is not None:
             _split_bind(str(tcp_bind))
@@ -436,15 +527,25 @@ class Config:
             )
 
         self.resolution = data.get("resolution", self.resolution)
-        if self.resolution not in (None, "none", "certificate", "tartarus"):
+        if self.resolution not in (None, "none", "certificate", "tartarus", "mofos"):
             raise ValueError(f"invalid resolution: {self.resolution!r}")
         if self.resolution is None:
-            self.resolution = "certificate" if self.mtls_enable else "tartarus"
+            self.resolution = (
+                "certificate" if self.transport_encryption == "mtls" else "none"
+            )
+        if self.transport == "unix" and self.resolution in ("tartarus", "mofos"):
+            # There is no CID/IP on the SSH-forwarded path: identity comes from
+            # the certificate or is unset (plan §1.1, locked decision 1).
+            raise ValueError(
+                f"resolution = {self.resolution!r} is not valid on the unix "
+                "transport (use 'certificate' or 'none')"
+            )
 
         log.debug(
-            f"Config: mode={self.mode}, vsock_port={self.vsock_port}, "
-            f"default_socket={self.default_agent_socket_path}, libvirt_uri={self.libvirt_uri}, "
-            f"resolution={self.resolution}"
+            f"Config: mode={self.mode}, transport={self.transport}, "
+            f"vsock_port={self.vsock_port}, default_socket={self.default_agent_socket_path}, "
+            f"libvirt_uri={self.libvirt_uri}, resolution={self.resolution}, "
+            f"transport_encryption={self.transport_encryption}"
         )
 
         if not self.default_agent_socket_path:
@@ -666,6 +767,63 @@ def resolve_default_gateway() -> str:
     raise RuntimeError("no default gateway found in /proc/net/route")
 
 
+# `mofos` resolution: `mofos ls --json` prints a JSON array of VM objects
+# (`{"cid": 4, "name": "template-nixos", "ipv4_address": "192.168.90.147",
+# ...}`). The connecting peer is matched to a VM by VSOCK CID (int peer) or by
+# `ipv4_address` (TCP peer), and the VM's `name` becomes the identity. The
+# listing is cached briefly so a burst of requests does not fork `mofos` per
+# connection; a missing binary, a non-zero exit or malformed JSON simply yields
+# no name (resolution never gates anything -- the wildcard-only rule makes an
+# unresolved peer safe).
+MOFOS_CACHE_TTL = 30
+MOFOS_TIMEOUT = 10.0
+_mofos_cache: Optional[tuple] = None
+
+
+def _mofos_vms() -> list:
+    """Return `mofos ls --json` as a list of dicts (cached for `MOFOS_CACHE_TTL`)."""
+    global _mofos_cache
+    now = time()
+    if _mofos_cache is not None and now - _mofos_cache[0] < MOFOS_CACHE_TTL:
+        return _mofos_cache[1]
+    vms: list = []
+    try:
+        result = run(
+            ["mofos", "ls", "--json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=MOFOS_TIMEOUT,
+        )
+        if result.returncode != 0:
+            log.debug(f"mofos ls failed: {result.stderr.strip()}")
+        else:
+            parsed = json_loads(result.stdout)
+            if isinstance(parsed, list):
+                vms = [entry for entry in parsed if isinstance(entry, dict)]
+    except (OSError, ValueError) as error:
+        log.debug(f"mofos resolution failed: {error!r}")
+    _mofos_cache = (now, vms)
+    return vms
+
+
+def resolve_mofos_name(peer) -> Optional[str]:
+    """`peer` (VSOCK CID int, or TCP peer IP str) -> the mofos VM name."""
+    if peer is None:
+        return None
+    for vm in _mofos_vms():
+        matched = (
+            vm.get("cid") == peer
+            if isinstance(peer, int)
+            else vm.get("ipv4_address") == peer
+        )
+        if matched:
+            name = vm.get("name")
+            if isinstance(name, str) and name:
+                return name
+    return None
+
+
 class LibvirtResolver:
     """Dynamic CID -> VM name lookup via a live libvirt connection.
 
@@ -811,6 +969,222 @@ def prompt_for_confirmation(title: str, message: str, dialog_program: str) -> bo
     raise ValueError(f"unknown dialog_program: {dialog_program!r}")
 
 
+# --- Security model (`[security]`) and AF_UNIX helpers ---
+
+
+def validate_security_config(
+    config: dict, transport: str
+) -> tuple[str, str, str]:
+    """Resolve `[security]` to `(transport_encryption, client_auth, server_auth)`.
+
+    Fail-closed and never a silent downgrade (plan §1.3): `transport_encryption`
+    defaults to `mtls` on `tcp` and `none` on `vsock`/`unix`; `mtls.enable = true`
+    is the legacy spelling of `transport_encryption = "mtls"`. Under mTLS both
+    auth knobs are forced to `transport`; `transport` auth without mTLS is
+    rejected. Unlike sudo there is no ACL pairing, so a missing `[security]`
+    table (every existing config) resolves leniently rather than erroring -- but
+    an explicit contradiction is always fatal.
+    """
+    security = config.get("security")
+    if security is None:
+        security = {}
+    if not isinstance(security, dict):
+        raise ValueError("'[security]' must be a table")
+
+    mtls = config.get("mtls")
+    mtls_enabled = isinstance(mtls, dict) and bool(mtls.get("enable", False))
+
+    transport_encryption = security.get("transport_encryption")
+    if transport_encryption in (None, "auto"):
+        if mtls_enabled:
+            transport_encryption = "mtls"
+        elif transport == "tcp" and security:
+            # An explicit `[security]` table on tcp defaults to mTLS; a legacy
+            # config with no `[security]` at all keeps running plaintext rather
+            # than breaking on load (plan §6).
+            transport_encryption = "mtls"
+        else:
+            transport_encryption = "none"
+    if transport_encryption not in TRANSPORT_ENCRYPTIONS:
+        raise ValueError(
+            f"unknown transport_encryption {transport_encryption!r} "
+            f"(expected one of {', '.join(TRANSPORT_ENCRYPTIONS)})"
+        )
+    if mtls_enabled and transport_encryption != "mtls":
+        raise ValueError(
+            "mtls.enable = true conflicts with transport_encryption = "
+            f"{transport_encryption!r}; refusing to downgrade"
+        )
+
+    client_auth = security.get("client_auth")
+    server_auth = security.get("server_auth")
+    if client_auth is not None and client_auth not in CLIENT_AUTH_METHODS:
+        raise ValueError(
+            f"unknown client_auth {client_auth!r} "
+            f"(expected one of {', '.join(CLIENT_AUTH_METHODS)})"
+        )
+    if server_auth is not None and server_auth not in SERVER_AUTH_METHODS:
+        raise ValueError(
+            f"unknown server_auth {server_auth!r} "
+            f"(expected one of {', '.join(SERVER_AUTH_METHODS)})"
+        )
+
+    if transport_encryption == "mtls":
+        if client_auth not in (None, "transport"):
+            raise ValueError(
+                "under transport_encryption = 'mtls', client_auth must be "
+                f"'transport', not {client_auth!r} (mTLS forces it)"
+            )
+        if server_auth not in (None, "transport"):
+            raise ValueError(
+                "under transport_encryption = 'mtls', server_auth must be "
+                f"'transport', not {server_auth!r} (mTLS forces it)"
+            )
+        client_auth = "transport"
+        server_auth = "transport"
+    else:
+        if client_auth == "transport":
+            raise ValueError(
+                "client_auth = 'transport' requires transport_encryption = 'mtls'"
+            )
+        if server_auth == "transport":
+            raise ValueError(
+                "server_auth = 'transport' requires transport_encryption = 'mtls'"
+            )
+        client_auth = client_auth or "none"
+        server_auth = server_auth or "none"
+
+    return transport_encryption, client_auth, server_auth
+
+
+def _parse_mode(value: Optional[str], default: str) -> int:
+    if value is None:
+        return int(default, 8)
+    try:
+        return int(str(value), 8)
+    except ValueError as e:
+        raise ValueError(f"invalid socket mode {value!r}") from e
+
+
+def _prepare_unix_socket(path: str, dir_mode: int) -> None:
+    """Create/verify the parent dir and remove a stale socket before bind.
+
+    The parent directory is forced to `dir_mode` (`0700`) and a bind target
+    that is a symlink or a non-socket owned by another uid is refused; only a
+    socket we own is unlinked. (The `lstat` checks are not atomic with `bind()`;
+    the real guard is the 0700 directory plus the peer-uid check on accept.)
+    """
+    target = Path(path)
+    parent = target.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink():
+        raise RuntimeError(f"refusing to bind {path}: parent {parent} is a symlink")
+    parent.chmod(dir_mode)
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return
+    if S_ISLNK(info.st_mode):
+        raise RuntimeError(f"refusing to bind {path}: path is a symlink")
+    if not S_ISSOCK(info.st_mode):
+        raise RuntimeError(f"refusing to bind {path}: path exists and is not a socket")
+    if info.st_uid != getuid():
+        raise RuntimeError(f"refusing to bind {path}: socket is not owned by uid {getuid()}")
+    target.unlink()
+
+
+# AF_UNIX peer credentials. Linux exposes SO_PEERCRED (pid, uid, gid); Darwin
+# only getpeereid/LOCAL_PEERCRED (uid). The uid is what we check; there is no
+# pid, so no /proc and no guest-identity inference (plan locked decision 1).
+LOCAL_PEERCRED = 0x001  # Darwin `SOL_LOCAL` socket option
+
+
+def _darwin_peer_uid(sock) -> Optional[int]:
+    """Best-effort uid of an AF_UNIX peer on Darwin, or None if unavailable."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.getpeereid.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        libc.getpeereid.restype = ctypes.c_int
+        uid = ctypes.c_uint()
+        gid = ctypes.c_uint()
+        if libc.getpeereid(sock.fileno(), ctypes.byref(uid), ctypes.byref(gid)) == 0:
+            return int(uid.value)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        _version, uid = unpack("2i", sock.getsockopt(0, LOCAL_PEERCRED, calcsize("2i")))
+        return uid
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _unix_peer_cred(sock, *, platform: Optional[str] = None):
+    """Return `(pid, uid, gid)` for an AF_UNIX peer, or None if unavailable."""
+    if platform is None:
+        platform = sys_platform
+    if platform != "darwin" and hasattr(socket, "SO_PEERCRED"):
+        try:
+            pid, uid, gid = unpack(
+                "3i",
+                sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, calcsize("3i")),
+            )
+            return pid, uid, gid
+        except (OSError, ValueError):
+            return None
+    if platform == "darwin":
+        uid = _darwin_peer_uid(sock)
+        if uid is None:
+            return None
+        return -1, uid, -1
+    return None
+
+
+def _unix_peer_uid(sock) -> Optional[int]:
+    """Best-effort uid of an AF_UNIX peer, or None when unavailable."""
+    cred = _unix_peer_cred(sock)
+    return cred[1] if cred is not None else None
+
+
+def authorize_unix_peer(
+    sock, *, expected_uid: Optional[int] = None, platform: Optional[str] = None
+) -> Optional[int]:
+    """Refuse an AF_UNIX peer that is not the server user.
+
+    Linux `SO_PEERCRED` is authoritative, so a missing credential or a different
+    uid fails closed (`RuntimeError`). Darwin can only report a uid and, when it
+    cannot, degrades to the socket mode/ownership guarantee (the 0600 socket is
+    the real guard) rather than accepting an unverifiable identity.
+    """
+    if expected_uid is None:
+        expected_uid = getuid()
+    if platform is None:
+        platform = sys_platform
+    cred = _unix_peer_cred(sock, platform=platform)
+    if cred is None:
+        if platform == "darwin" or not hasattr(socket, "SO_PEERCRED"):
+            log.debug(
+                "unix peer credential unavailable; relying on the socket "
+                "mode/ownership guarantee"
+            )
+            return None
+        raise RuntimeError(
+            "cannot read the unix peer's credentials; refusing the connection"
+        )
+    _pid, uid, _gid = cred
+    if uid != expected_uid:
+        raise RuntimeError(
+            f"unix peer uid {uid} is not the server user uid {expected_uid}"
+        )
+    return uid
+
+
 # --- mTLS / EKU Helpers ---
 
 
@@ -842,37 +1216,52 @@ def _cert_common_name(cert: dict) -> Optional[str]:
     return subject.get("commonName")
 
 
-def resolve_peer_name(
+def resolve_peer(
     resolution: str,
     ssl_ctx: Optional[ssl.SSLContext],
     request: Any,
     static_name: Optional[str],
     unknown_label: str,
-) -> str:
-    """Resolve a connecting peer's VM name per the configured `resolution` mode.
+    peer: Any,
+) -> tuple[str, Optional[str]]:
+    """Resolve a connecting peer to `(display_label, matching_identity)`.
 
-    `static_name` is whatever the caller already looked up from the static
-    vm_by_cid/vm_by_ip table (+ LibvirtResolver fallback for VSOCK) -- the
-    "tartarus" strategy's answer, precomputed since it differs by address
-    family. `unknown_label` (e.g. "unknown-cid-7") is used when nothing
-    resolves, or unconditionally when resolution is "none".
+    The two are deliberately separate: `display_label` is always a non-empty
+    human string for logs/dialogs (falling back to `unknown_label`, e.g.
+    `unknown-cid-7`), while `matching_identity` is the value `Rule.matches_vm`
+    sees and is **None** whenever no identity was established. `none`
+    resolution always yields `(unknown_label, None)`; `certificate` uses the
+    verified mTLS CN; `tartarus` the static/libvirt bookkeeping; `mofos` the
+    `mofos ls --json` name -- each gating only when it actually resolves.
     """
     if resolution == "none":
-        return unknown_label
+        return unknown_label, None
     if resolution == "certificate" and ssl_ctx and hasattr(request, "getpeercert"):
         cert = request.getpeercert()
         if cert:
             cn = _cert_common_name(cert)
             if cn:
-                return cn
-    if static_name is not None:
-        return static_name
-    log.warning(f"Connection from unresolvable peer; no rule can match it ({unknown_label})")
-    return unknown_label
+                return cn, cn
+    if resolution == "tartarus" and static_name is not None:
+        return static_name, static_name
+    if resolution == "mofos" and peer is not None:
+        name = resolve_mofos_name(peer)
+        if name:
+            return name, name
+    log.warning(
+        f"Connection from unresolvable peer; only wildcard rules apply ({unknown_label})"
+    )
+    return unknown_label, None
 
 
 def create_ssl_context(config: Config, *, server: bool) -> Optional[ssl.SSLContext]:
-    if not config.mtls_enable:
+    # Decide from the resolved `transport_encryption`, not the legacy
+    # `mtls.enable` flag alone: a transport configured for mTLS can never fall
+    # back to plaintext (plan §1.3).
+    transport_encryption = getattr(config, "transport_encryption", None)
+    if transport_encryption is None:
+        transport_encryption = "mtls" if config.mtls_enable else "none"
+    if transport_encryption != "mtls":
         return None
     ca_file = config.mtls_ca_file
     cert_file = config.mtls_cert_file
@@ -1001,9 +1390,21 @@ class Handler(AgentIO, BaseRequestHandler):
             static_name = self.config.vm_by_cid.get(cid)
             if static_name is None and self.config.libvirt_uri:
                 static_name = LibvirtResolver.resolve_cid(self.config.libvirt_uri, cid)
-            self.vm_name = resolve_peer_name(
-                resolution, ssl_ctx, self.request, static_name, f"unknown-cid-{cid}"
-            )
+            peer = cid
+            unknown_label = f"unknown-cid-{cid}"
+        elif address_family == AF_UNIX:
+            # Host-dials-guest (SSH RemoteForward) or the local bridge. There
+            # is no CID/IP; refusal of a foreign-uid local peer is
+            # defence-in-depth and the 0600 socket is the real guard.
+            try:
+                authorize_unix_peer(self.request)
+            except RuntimeError as e:
+                log.warning(f"ssh-agent-proxy: {e}")
+                self._abort = True
+                return
+            static_name = None
+            peer = None
+            unknown_label = "local"
         else:
             # TCP listener: a guest's source IP is not a reliable identity --
             # under macOS vmnet-shared it's a DHCP lease that can differ from
@@ -1012,12 +1413,17 @@ class Handler(AgentIO, BaseRequestHandler):
             # match there.
             peer_ip = self.client_address[0]
             static_name = self.config.vm_by_ip.get(peer_ip)
-            self.vm_name = resolve_peer_name(
-                resolution, ssl_ctx, self.request, static_name, f"unknown-ip-{peer_ip}"
-            )
+            peer = peer_ip
+            unknown_label = f"unknown-ip-{peer_ip}"
+        # `vm_name` is the human display label (logs/dialogs/notifications);
+        # `vm_identity` is the verified identity used for rule matching and is
+        # None whenever no identity was established (wildcard rules only).
+        self.vm_name, self.vm_identity = resolve_peer(
+            resolution, ssl_ctx, self.request, static_name, unknown_label, peer
+        )
         log.debug(
-            f"setup: resolved vm_name={self.vm_name!r} (resolution={resolution}) "
-            f"in {_ms(monotonic() - t0)}"
+            f"setup: resolved vm_name={self.vm_name!r} identity={self.vm_identity!r} "
+            f"(resolution={resolution}) in {_ms(monotonic() - t0)}"
         )
         self.allowed_keys_for_client: dict[bytes, KeyConfig] = {}
         self.allowed_sockets: list[str] = []
@@ -1050,9 +1456,10 @@ class Handler(AgentIO, BaseRequestHandler):
         )
 
     def _match_rule(self, key_id: str) -> Optional[Rule]:
-        # First rule (in file order) matching this key and VM defines the policy.
+        # First rule (in file order) matching this key and identity defines the
+        # policy. Matching uses the verified identity, never the display label.
         for rule in self.config.rules:
-            if rule.matches_key(key_id) and rule.matches_vm(self.vm_name):
+            if rule.matches_key(key_id) and rule.matches_vm(self.vm_identity):
                 return rule
         return None
 
@@ -1473,15 +1880,130 @@ class Handler(AgentIO, BaseRequestHandler):
         self._send_msg(client, bytes([AgentMsg.FAILURE]))
 
 
+def _peer_env_socket(sock, var: str = "SSH_AUTH_PROXY_SOCK") -> Optional[str]:
+    """Linux only: the per-session forwarded socket of the process that connected
+    to the merge socket, read from its environment.
+
+    The client (`ssh`, `git`, ...) inherits `SSH_AUTH_PROXY_SOCK` from the SSH
+    session (the host wrapper's `SetEnv`, accepted by the guest `sshd`), so
+    naming exactly that socket avoids unioning every session's forwarded socket.
+    The peer pid/uid come from `SO_PEERCRED` (Linux has it; Darwin's
+    `getpeereid` has no pid), and the variable is read from
+    `/proc/<pid>/environ`.
+
+    Returns the path when it exists, else `None`. Any unavailable piece -- a
+    non-Linux platform, a peer that is not the same uid, an unreadable environ,
+    or a missing variable/socket -- yields `None`, and the caller falls back to
+    scanning configured directories (the macOS path, and the Linux safety net).
+    """
+    if not sys_platform.startswith("linux") or not hasattr(socket, "SO_PEERCRED"):
+        return None
+    try:
+        pid, uid, _gid = unpack(
+            "3i",
+            sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, calcsize("3i")),
+        )
+    except (OSError, ValueError):
+        return None
+    if pid <= 0 or uid != getuid():
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    prefix = (var + "=").encode()
+    for item in raw.split(b"\0"):
+        if item.startswith(prefix):
+            value = item[len(prefix) :].decode("utf-8", "replace")
+            if value and Path(value).exists():
+                return value
+            return None
+    return None
+
+
+def _merge_upstream_paths(
+    entries: list[str], *, session_socket: Optional[str] = None
+) -> list[str]:
+    """Resolve merge upstream entries to an ordered, de-duplicated list of
+    AF_UNIX socket paths, evaluated **per client connection**.
+
+    An entry is one of:
+
+      * a **directory** -- scanned (non-recursive) for socket files *right now*,
+        so per-session forwarded sockets that appear/disappear between sessions
+        are picked up without restarting the merge;
+      * an existing socket path -- used as-is;
+      * anything absent -- skipped (a not-yet-created directory or agent is not
+        an error; it simply contributes no upstream this time).
+
+    `session_socket` is an already-resolved, authoritative per-session socket
+    (Linux `_peer_env_socket`). When it is known it is added first and directory
+    entries are **not** scanned: the exact session socket replaces the broad
+    union of every session's forwarded socket. Directory scanning remains the
+    fallback (macOS always, Linux when the peer environment cannot be read).
+
+    De-duplication is by resolved real path, so the same socket reached through
+    both a directory scan and a literal entry is connected only once. Identity
+    de-duplication (the same public key offered by two upstreams) is handled in
+    the handler, which keys on the public-key blob.
+    """
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str) -> None:
+        try:
+            real = str(Path(candidate).resolve())
+        except OSError:
+            real = candidate
+        if real in seen:
+            return
+        seen.add(real)
+        paths.append(candidate)
+
+    if session_socket is not None:
+        add(session_socket)
+
+    for entry in entries:
+        p = Path(entry)
+        try:
+            if p.is_dir():
+                if session_socket is not None:
+                    continue  # exact session socket already added
+                for child in sorted(p.iterdir()):
+                    try:
+                        if S_ISSOCK(child.stat().st_mode):
+                            add(str(child))
+                    except OSError:
+                        continue
+            elif p.exists():
+                add(entry)
+            else:
+                log.debug(f"merge: upstream {entry!r} is absent; skipping")
+        except OSError as e:
+            log.warning(f"merge: cannot inspect upstream {entry!r}: {e}")
+    return paths
+
+
 class MergeHandler(AgentIO, BaseRequestHandler):
     """Allow-all handler for --merge mode: no VM resolution, no rules, no
     confirmation prompts -- just aggregates identities from every upstream
     agent socket and blindly forwards everything else to whichever upstream
     answers first with something other than FAILURE.
+
+    Upstreams are (re)resolved per connection via `_merge_upstream_paths`. On
+    Linux the connecting process's own `SSH_AUTH_PROXY_SOCK` is used when it can
+    be read (`_peer_env_socket`); everywhere else (macOS always), directory
+    entries are scanned so the live set of forwarded sockets is merged without a
+    restart.
     """
 
     def setup(self) -> None:
-        self.upstream_sockets: list[str] = self.server.app_sockets  # type: ignore
+        session_socket = _peer_env_socket(self.request)
+        if session_socket:
+            log.debug(f"merge: using this session's forwarded socket {session_socket}")
+        self.upstream_sockets: list[str] = _merge_upstream_paths(  # type: ignore
+            self.server.app_sockets, session_socket=session_socket
+        )
 
     def handle(self) -> None:
         client = self.request
@@ -1647,6 +2169,19 @@ class ThreadedTcpServer(ThreadingMixIn, TCPServer):
 class ThreadedUnixServer(ThreadingMixIn, UnixStreamServer):
     allow_reuse_address = True
 
+    def get_request(self):
+        sock, addr = UnixStreamServer.get_request(self)
+        # unix + mtls: TLS runs over the SSH channel (plan §2.2), so the same
+        # per-connection server-side wrap as ThreadedTcpServer applies here.
+        if getattr(self, "ssl_context", None):
+            try:
+                sock = self.ssl_context.wrap_socket(sock, server_side=True)
+            except ssl.SSLError as e:
+                log.warning(f"SSL handshake failed from {addr}: {e}")
+                sock.close()
+                raise
+        return sock, addr
+
 
 class RemoteConnection(AgentIO):
     """A single persistent connection to the host's ssh-agent-proxy, shared
@@ -1676,17 +2211,26 @@ class RemoteConnection(AgentIO):
 
     @property
     def peer(self) -> str:
+        if self.transport == "unix":
+            return f"unix:{self.host}"
         return f"{self.transport}:{self.host}:{self.port}"
 
     def _connect(self) -> socket.socket:
         t0 = monotonic()
-        family = AF_VSOCK if self.transport == "vsock" else socket.AF_INET
+        connect_timeout = getattr(self.config, "connect_timeout", SOCKET_TIMEOUT)
+        if self.transport == "unix":
+            family = AF_UNIX
+            address = str(self.host)
+            server_hostname = None
+        else:
+            family = AF_VSOCK if self.transport == "vsock" else socket.AF_INET
+            address = (self.host, self.port)
+            server_hostname = self.host if self.transport == "tcp" else None
         sock = socket.socket(family, socket.SOCK_STREAM)
-        sock.settimeout(SOCKET_TIMEOUT)
-        sock.connect((self.host, self.port))
+        sock.settimeout(connect_timeout)
+        sock.connect(address)
         t1 = monotonic()
         if self.ssl_ctx:
-            server_hostname = self.host if self.transport == "tcp" else None
             sock = self.ssl_ctx.wrap_socket(sock, server_hostname=server_hostname)
 
             peer_oid = self.config.mtls_peer_required_oid
@@ -1694,6 +2238,8 @@ class RemoteConnection(AgentIO):
                 der = sock.getpeercert(binary_form=True)
                 if der:
                     verify_cert_der(der, peer_oid, "Server")
+        # The long read timeout applies to the request/response exchange.
+        sock.settimeout(SOCKET_TIMEOUT)
         t2 = monotonic()
 
         log.debug(f"client: connect={_ms(t1 - t0)} tls={_ms(t2 - t1)}")
@@ -1776,6 +2322,13 @@ class ClientHandler(AgentIO, BaseRequestHandler):
 def run_merge(sockets: list[str], listen_path: str) -> None:
     """Merge mode: no VSOCK, no VM/policy logic -- just fan multiple upstream
     agent sockets into a single unix socket that allows everything.
+
+    Each upstream entry is a socket path or a **directory**; directories are
+    (re)scanned for sockets on every client connection (see
+    `_merge_upstream_paths`), so a per-session forwarded socket is merged as
+    soon as the session exists. On Linux the connecting process's own
+    `SSH_AUTH_PROXY_SOCK` is preferred when readable (`_peer_env_socket`); macOS
+    relies on the directory scan.
     """
     # Resolve platform-specific placeholders first.
     sockets = [_expand_socket_path(s) for s in sockets]
@@ -1812,8 +2365,33 @@ def run_merge(sockets: list[str], listen_path: str) -> None:
 def run_proxy(config: Config) -> None:
     ssl_ctx = create_ssl_context(config, server=True)
     try:
-        if config.tcp_bind:
-            host, port = _split_bind(config.tcp_bind)
+        if config.transport == "unix":
+            path = _expand_socket_path(config.socket or DEFAULT_SOCKET)
+            dir_mode = _parse_mode(config.socket_dir_mode, DEFAULT_SOCKET_DIR_MODE)
+            _prepare_unix_socket(path, dir_mode)
+            old_umask = umask(0o177)
+            try:
+                server = ThreadedUnixServer(path, Handler)
+            finally:
+                umask(old_umask)
+            Path(path).chmod(_parse_mode(config.socket_mode, DEFAULT_SOCKET_MODE))
+            with server:
+                server.app_config = config  # type: ignore
+                server.ssl_context = ssl_ctx
+                server._mtls_config = {"peer_required_oid": config.mtls_peer_required_oid}
+                log.info(
+                    f"SSH Agent Proxy listening on unix:{path} "
+                    f"(tls={ssl_ctx is not None})"
+                )
+                server.serve_forever()
+        elif config.transport == "tcp":
+            # `tcp_bind` is the deprecated combined form; the new form is
+            # `host`/`port` (default 127.0.0.1:65000).
+            host, port = (
+                _split_bind(config.tcp_bind)
+                if config.tcp_bind
+                else (config.host, config.port)
+            )
             with ThreadedTcpServer((host, port), Handler) as server:
                 server.app_config = config  # type: ignore
                 server.ssl_context = ssl_ctx
@@ -1856,8 +2434,21 @@ def run_client(config: Config) -> None:
     finally:
         umask(old_umask)
 
-    if config.transport == "vsock":
-        remote_host = config.cid
+    if config.transport == "unix":
+        # Dial the per-session forwarded socket (`connect_socket`, or the
+        # SSH_AUTH_PROXY_SOCK selector) through the SSH RemoteForward. SSL, when
+        # enabled, runs over that stream (plan §2.2).
+        remote_path = config.connect_socket or environ.get("SSH_AUTH_PROXY_SOCK")
+        if not remote_path:
+            log.error(
+                "unix transport requires connect_socket or $SSH_AUTH_PROXY_SOCK"
+            )
+            exit(1)
+        remote = RemoteConnection(
+            _expand_socket_path(remote_path), 0, "unix", ssl_ctx, config
+        )
+    elif config.transport == "vsock":
+        remote = RemoteConnection(config.cid, config.port, "vsock", ssl_ctx, config)
     else:
         remote_host = config.host
         if remote_host == "_gateway":
@@ -1867,8 +2458,7 @@ def run_client(config: Config) -> None:
             except Exception as e:
                 log.error(f"Failed to resolve default gateway: {e}")
                 exit(1)
-
-    remote = RemoteConnection(remote_host, config.port, config.transport, ssl_ctx, config)
+        remote = RemoteConnection(remote_host, config.port, "tcp", ssl_ctx, config)
     # Connect (and TLS-handshake) now rather than on the first agent
     # request -- see RemoteConnection's docstring.
     remote.ensure_connected()
@@ -1903,8 +2493,8 @@ def main() -> None:
     parser.add_argument(
         "--merge",
         nargs="+",
-        metavar="SOCKET",
-        help="(Deprecated) Merge mode: upstream sockets",
+        metavar="SOCKET_OR_DIR",
+        help="(Deprecated) Merge mode: upstream sockets or directories",
     )
     parser.add_argument(
         "--listen",

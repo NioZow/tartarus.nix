@@ -165,19 +165,28 @@ in {
             PermitRootLogin = "no";
             PasswordAuthentication = false;
           }
-          // optionalAttrs ((g.services.gpgAgentProxy or false) || (g.services.sudoAuthProxy or false)) {
+          // optionalAttrs (
+            (g.services.gpgAgentProxy or false)
+            || (g.services.sudoAuthProxy or false)
+            || (g.services.sshAgentProxy or false)
+          ) {
             # Accept host-forwarded stream-local sockets. GnuPG's socketdir on
-            # a systemd guest is $XDG_RUNTIME_DIR/gnupg, and sudo-auth-proxy
-            # binds under /run/sudo-auth-proxy; sshd must be allowed to create
-            # the forward and to replace a stale socket left by a previous
-            # session or a locally auto-launched agent.
+            # a systemd guest is $XDG_RUNTIME_DIR/gnupg, sudo-auth-proxy binds
+            # under /run/sudo-auth-proxy and ssh-agent-proxy under
+            # /run/ssh-agent-proxy; sshd must be allowed to create the forward
+            # and to replace a stale socket left by a previous session or a
+            # locally auto-launched agent.
             AllowStreamLocalForwarding = "yes";
             StreamLocalBindUnlink = "yes";
           }
-          // optionalAttrs (g.services.sudoAuthProxy or false) {
-            # The per-session selector and the recursion guard, delivered by
-            # the host ssh's `SetEnv` (doc §4.3, §10.4).
-            AcceptEnv = ["SUDO_AUTH_PROXY_SOCK" "SUDO_AUTH_PROXY_ACTIVE"];
+          // optionalAttrs ((g.services.sudoAuthProxy or false) || (g.services.sshAgentProxy or false)) {
+            # Per-session selectors delivered by the host ssh's `SetEnv`: the
+            # sudo selector + recursion guard (doc §4.3, §10.4) and the
+            # ssh-agent forwarded-socket selector (plan §2.1).
+            AcceptEnv =
+              (optional (g.services.sudoAuthProxy or false) "SUDO_AUTH_PROXY_SOCK")
+              ++ (optional (g.services.sudoAuthProxy or false) "SUDO_AUTH_PROXY_ACTIVE")
+              ++ (optional (g.services.sshAgentProxy or false) "SSH_AGENT_PROXY_SOCK");
           };
         hostKeys = [
           {
@@ -197,7 +206,9 @@ in {
       # client.
       systemd.tmpfiles.rules =
         optional (g.services.sudoAuthProxy or false)
-        "d /run/sudo-auth-proxy 0700 ${g.user.name} ${g.user.name} -";
+        "d /run/sudo-auth-proxy 0700 ${g.user.name} ${g.user.name} -"
+        ++ optional (g.services.sshAgentProxy or false)
+        "d /run/ssh-agent-proxy 0700 ${g.user.name} ${g.user.name} -";
 
       # `security.sudo.extraConfig` is appended as the *tail* of the generated
       # `/etc/sudoers` (this nixpkgs emits no `@includedir`; verified in

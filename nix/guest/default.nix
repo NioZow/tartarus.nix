@@ -38,6 +38,12 @@
   # client certificate the other guest services already present.
   sapUnix = (services.sudoAuthProxyTransport or "vsock") == "unix";
 
+  # Per-guest ssh-agent-proxy transport marker. `unix` selects the
+  # host→guest SSH-forwarded Unix socket; the bridge then runs mTLS *inside*
+  # the SSH tunnel with the tartarus client certificate, so per-guest
+  # `vm_names` rules keep working (plan §1.1).
+  sshUnix = (services.sshAgentProxyTransport or "vsock") == "unix";
+
   sudoAuthProxy = import ../packages/sudo-auth-proxy {inherit inputs;};
   sshAgentProxyPkg = import ../packages/ssh-agent-proxy {inherit inputs;};
   clipboardBridge = import ../packages/clipboard-bridge {inherit inputs;};
@@ -135,17 +141,28 @@ in {
 
         (mkIf services.sshAgentProxy {
           tartarus.ssh-agent-proxy = {
-            # Guest -> host proxy bridge.
+            # Guest -> host proxy bridge. On `unix` it dials the per-session
+            # forwarded socket (`$SSH_AGENT_PROXY_SOCK`) and wraps it with mTLS;
+            # on callback transports it dials the host's vsock/tcp endpoint with
+            # no crypto (the tartarus channel is private by construction).
             bridge = {
               enable = true;
-              transport = connection.transport;
+              transport = if sshUnix then "unix" else connection.transport;
+              connectSocket = null;
               host = connection.host;
               vsockCid = connection.cid;
               vsockPort = 65000;
               port = 65000;
               listenSocket = "%t/ssh-agent-host";
               setSshAuthSock = true;
-              mtls = clientMtls "1.3.6.1.4.1.99999.2.2" "1.3.6.1.4.1.99999.2.1";
+              security = {
+                transportEncryption = if sshUnix then "mtls" else "none";
+                serverAuth = if sshUnix then "transport" else "none";
+                clientAuth = if sshUnix then "transport" else "none";
+              };
+              mtls =
+                clientMtls "1.3.6.1.4.1.99999.2.2" "1.3.6.1.4.1.99999.2.1"
+                // {enable = sshUnix;};
             };
             # Guest-local agent, merged with the host-forwarded one.
             agent.enable = true;

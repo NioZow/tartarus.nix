@@ -260,7 +260,7 @@ the options directly:
 | Package | NixOS module | home-manager module | Options |
 | --- | --- | --- | --- |
 | `sudo-auth-proxy` | `nixosModules."sudo-auth-proxy-pam"` (or the legacy `nixosModules."sudo-auth-proxy"`) | `homeManagerModules."sudo-auth-proxy"` | client: `tartarus.sudo-auth-proxy.*`; server: `tartarus.sudo-auth-proxy.server.*` |
-| `ssh-agent-proxy` | `nixosModules."ssh-agent-proxy"` (host-side server) | `homeManagerModules."ssh-agent-proxy"` (server, bridge, agent, merge) | `tartarus.ssh-agent-proxy.{server,bridge,agent,merge}.*` |
+| `ssh-agent-proxy` | `nixosModules."ssh-agent-proxy"` (host-side server) | `homeManagerModules."ssh-agent-proxy"` (server, bridge, agent, merge) | `tartarus.ssh-agent-proxy.{server,bridge,agent,merge}.*`; the server/bridge carry `transport` (`vsock`/`tcp`/`unix`), `socket`/`connectSocket`, `security` (`transportEncryption`/`clientAuth`/`serverAuth`) and `resolution` (`none`/`certificate`/`tartarus`/`mofos`) |
 | `clipboard-bridge` | `nixosModules."clipboard-bridge"` (host-side server) | `homeManagerModules."clipboard-bridge"` (server, client, adminClient) | `tartarus.clipboard-bridge.{server,client,adminClient}.*` |
 
 The NixOS `sudo-auth-proxy` client installs the PAM wiring (`pam_exec.so` into
@@ -309,6 +309,12 @@ as `nixosModules."sudo-auth-proxy"`, kept as an alias for compatibility.
 For a host that has no Nix at all, `examples/` carries a ready-to-edit server
 config plus a systemd user unit (`examples/sudo-auth-proxy-server.toml`,
 `examples/sudo-auth-proxy.service`); see `docs/sudo-auth-proxy.md` §15.1.
+
+`ssh-agent-proxy` also runs standalone with plain `ssh -R` and no tartarus:
+`examples/ssh-agent-proxy-server.toml` and `examples/ssh-agent-proxy-client.toml`
+show the single host `unix` socket and the guest-side bridge, for both
+`unix + none` (transparent, wildcard-only) and `unix + mtls` (identity from the
+client certificate). See `docs/ssh-agent-proxy.md`.
 
 Packages are also directly buildable: `nix build .#sudo-auth-proxy`,
 `.#ssh-agent-proxy`, `.#clipboard-bridge`. All units are created through

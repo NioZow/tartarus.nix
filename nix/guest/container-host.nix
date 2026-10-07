@@ -65,7 +65,12 @@
   servicePorts = unique (concatMap (
       inner:
         optional (inner.cfg.services.sudoAuthProxy or false) 65001
-        ++ optional (inner.cfg.services.sshAgentProxy or false) 65000
+        # The `unix` ssh-agent-proxy transport is an SSH RemoteForward, so a
+        # nested container on it needs no DNATed TCP port.
+        ++ optional (
+          (inner.cfg.services.sshAgentProxy or false)
+          && ((inner.cfg.services.sshAgentProxyTransport or "vsock") != "unix")
+        ) 65000
         ++ optional (inner.cfg.services.clipboardBridge or false) 27795
     )
     innerContainers);

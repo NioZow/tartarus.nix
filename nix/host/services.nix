@@ -181,6 +181,40 @@
         + "not reachable until services.sudoAuthProxyTransport is unified."
       ) "vsock";
   sudoIsUnix = sudoTransport == "unix";
+
+  # ---- ssh-agent-proxy host wiring (mirrors the sudo block above) ----------
+  # A guest asks for the SSH-forwarded `unix` transport through the per-guest
+  # `services.sshAgentProxyTransport` marker; every other value keeps the
+  # platform's callback transport (`transportOf`). One server socket per host
+  # user, so all requesting guests must share one transport.
+  sshMarker = g: (g.services or {}).sshAgentProxyTransport or "vsock";
+  sshGuestTransport = g:
+    if sshMarker g == "unix"
+    then "unix"
+    else transportOf g;
+  sshTransports = lib.unique (map (e: sshGuestTransport e.g) (listOf sshReq));
+  sshTransport =
+    if sshTransports == []
+    then "tcp" # unused (no ssh guests); keeps the binding total
+    else if builtins.length sshTransports == 1
+    then builtins.head sshTransports
+    else if builtins.elem "unix" sshTransports
+    then
+      throw (
+        "tartarus: the enabled guests requesting ssh-agent-proxy mix the "
+        + "SSH-forwarded `unix` transport with a callback transport "
+        + "(${lib.concatStringsSep ", " sshTransports}); the server exposes a "
+        + "single socket and the two call directions are incompatible. Set "
+        + "services.sshAgentProxyTransport consistently."
+      )
+    else
+      lib.warn (
+        "tartarus: the enabled guests requesting ssh-agent-proxy use mixed "
+        + "callback transports (${lib.concatStringsSep ", " sshTransports}); "
+        + "defaulting to `vsock` (the previous behaviour). The `tcp` guests are "
+        + "not reachable until services.sshAgentProxyTransport is unified."
+      ) "vsock";
+  sshIsUnix = sshTransport == "unix";
   # The sudo-auth-proxy client OID (doc §7.6). Every tartarus client cert
   # carries it today (audit A4 documents that the OIDs separate roles, not
   # services), so `acl.mode = "ca"` authorizes the guests without an operator
@@ -309,23 +343,34 @@ in {
       (mkIf needsSsh {
         tartarus.ssh-agent-proxy.server = {
           enable = mkDefault true;
-          settings = {
-            vsock_port = mkDefault (
-              if !isDarwin && any (e: transportOf e.g == "vsock") sshEntries
-              then 65000
-              else null
-            );
-            tcp_bind = mkDefault "${mkTcpHost sshReq}:65000";
-            vm = mkDefault sshVmEntries;
-            tcp_vm = mkDefault sshTcpEntries;
+          # `unix` is host-dials-guest over one AF_UNIX socket (no port, no
+          # firewall change); vsock/tcp keep the callback direction.
+          transport = mkDefault sshTransport;
+          host = mkDefault (mkTcpHost sshReq);
+          port = mkDefault 65000;
+          cid = mkDefault 2;
+          # `unix` runs mTLS inside the SSH tunnel (identity = client cert CN,
+          # so per-guest `vm_names` rules keep working); callback transports are
+          # private by construction and run with no crypto/auth (plan §1.3).
+          security = {
+            transportEncryption = mkDefault (if sshIsUnix then "mtls" else "none");
+            serverAuth = mkDefault (if sshIsUnix then "transport" else "none");
+            clientAuth = mkDefault (if sshIsUnix then "transport" else "none");
           };
+          resolution = mkDefault (if sshIsUnix then "certificate" else "tartarus");
           mtls = {
-            enable = mkDefault true;
+            enable = mkDefault sshIsUnix;
             caFile = mkDefault x509Ca;
             certFile = mkDefault x509HostCert;
             keyFile = mkDefault x509HostKey;
             requiredOid = mkDefault "1.3.6.1.4.1.99999.2.1";
             peerOid = mkDefault "1.3.6.1.4.1.99999.2.2";
+          };
+          # `vm`/`tcp_vm` feed `resolution = "tartarus"` and are omitted by the
+          # module on the `unix` transport (no CID/IP exists there).
+          settings = {
+            vm = mkDefault sshVmEntries;
+            tcp_vm = mkDefault sshTcpEntries;
           };
         };
       })

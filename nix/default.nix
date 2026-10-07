@@ -43,6 +43,18 @@ in {
 
   packages = forAllSystems (system: import ./packages {inherit inputs self system;});
 
+  # Runnable apps. `nix run .#tartarus-certs` (and `.#tartarus`) work via
+  # `packages` already; this mirrors them explicitly for callers that prefer
+  # the `apps` output.
+  apps = forAllSystems (system: let
+    pkgs = import inputs.nixpkgs {inherit system;};
+  in {
+    "tartarus-certs" = {
+      type = "app";
+      program = "${(import ./packages {inherit inputs self system;})."tartarus-certs"}/bin/tartarus-certs";
+    };
+  });
+
   devShells = forAllSystems (system: let
     pkgs = import inputs.nixpkgs {
       inherit system;

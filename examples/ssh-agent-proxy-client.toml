@@ -1,0 +1,64 @@
+# ssh-agent-proxy — standalone guest-side bridge configuration (no Nix required)
+#
+# The bridge makes the host's brokered agent available inside the guest at
+# `listen_socket`, and — on `unix + mtls` — terminates the TLS handshake the
+# server runs inside the SSH tunnel. Point `SSH_AUTH_SOCK` at `listen_socket`
+# (or at a merge proxy that includes it).
+#
+# The guest side is driven entirely by an SSH RemoteForward established by the
+# host admin/operator; this bridge dials the forwarded socket named by
+# `connect_socket` or, when that is unset, by `$SSH_AGENT_PROXY_SOCK` (the
+# selector the host `ssh` sets with `SetEnv`):
+#
+#   ssh -o StreamLocalBindUnlink=yes -o ExitOnForwardFailure=yes \
+#       -o "RemoteForward=/run/ssh-agent-proxy/%r@%h.sock %t/ssh-agent-proxy/server.sock" \
+#       -o "SetEnv=SSH_AGENT_PROXY_SOCK=/run/ssh-agent-proxy/%r@%h.sock" guest
+#
+# For the transparent `unix + none` case there is no bridge at all: set
+#   SSH_AUTH_SOCK="$SSH_AGENT_PROXY_SOCK"
+# and any request goes straight to the forwarded socket.
+#
+# Copy to ~/.config/ssh-agent-proxy/config.toml inside the guest and run:
+#
+#   ssh-agent-proxy --config ~/.config/ssh-agent-proxy/config.toml
+
+# ---------------------------------------------------------------------------
+mode = "client"
+
+# "unix" for the SSH-forwarded path (host dials the guest).
+transport = "unix"
+
+# Where in the guest clients reach this bridge.
+listen_socket = "%t/ssh-agent-host"
+
+# The forwarded socket to dial. Leave unset to use $SSH_AUTH_PROXY_SOCK, which
+# is what the host `ssh ... SetEnv=SSH_AGENT_PROXY_SOCK=<path>` exports.
+# connect_socket = "/run/ssh-agent-proxy/%r@%h.sock"
+
+# Bound on the dial + TLS handshake to the host server.
+connect_timeout = 10.0
+handshake_timeout = 10.0
+decision_timeout = 120
+
+debug = false
+
+# ---------------------------------------------------------------------------
+# [security] — `unix` defaults to `none`; set mTLS to get certificate identity
+# on the server. When mtls is on, both auth knobs must be "transport".
+# ---------------------------------------------------------------------------
+[security]
+transport_encryption = "mtls"
+client_auth = "transport"
+server_auth = "transport"
+
+# ---------------------------------------------------------------------------
+# [mtls] — this guest's client certificate, chained to the same CA the server
+# trusts. OIDs separate the two roles (see the server's `[security]` comment).
+# ---------------------------------------------------------------------------
+[mtls]
+enable = true
+ca_file = "./ca.crt"
+cert_file = "./client.crt"
+key_file = "./client.key"
+required_oid = "1.3.6.1.4.1.99999.2.2"      # this (client) certificate
+peer_required_oid = "1.3.6.1.4.1.99999.2.1" # the peer (server) certificate

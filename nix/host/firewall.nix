@@ -155,7 +155,14 @@
       # fall back to TCP and need the matching host-service ports opened.
       isTcp = g: kind == "container" || g.services.disableVsock;
       needsClip = any (g: g.services.clipboardBridge && isTcp g) (attrValues enabledInst);
-      needsSsh = any (g: g.services.sshAgentProxy && isTcp g) (attrValues enabledInst);
+      # The `unix` ssh-agent-proxy transport is an SSH RemoteForward over the
+      # single host AF_UNIX socket: no TCP port is opened (plan Phase 3 item 20).
+      needsSsh = any (
+        g:
+          g.services.sshAgentProxy
+          && isTcp g
+          && (((g.services or {}).sshAgentProxyTransport or "vsock") != "unix")
+      ) (attrValues enabledInst);
       needsSudo = any (g: g.services.sudoAuthProxy && isTcp g) (attrValues enabledInst);
 
       tcpRules = concatStringsSep "\n" (
@@ -418,7 +425,12 @@
       "ip daddr ${p.gateway} tcp dport ${toString port} counter accept comment \"${svc}\"";
     hostServiceRules = concatStringsSep "\n" [
       (hostServiceRule "sudoAuthProxy" 65001)
-      (hostServiceRule "sshAgentProxy" 65000)
+      # No port for the `unix` ssh-agent-proxy transport (SSH RemoteForward).
+      (optionalString (
+          (g.services.sshAgentProxy or false)
+          && (((g.services or {}).sshAgentProxyTransport or "vsock") != "unix")
+        )
+        "ip daddr ${p.gateway} tcp dport 65000 counter accept comment \"sshAgentProxy\"")
       (hostServiceRule "clipboardBridge" 27795)
     ];
     allowEntry = a:

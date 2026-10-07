@@ -1199,6 +1199,10 @@ Server config `[acl]`:
   never a silent decision.
 - A request that fails the ACL is answered with a `deny` (authenticated by mTLS
   when `server_auth = "transport"`), or not answered — never silently ignored.
+- `resolution = "none"` (or an unresolved peer) yields **no matching identity**
+  (§11.5): the resolved name is display-only, so only a `"*"`/empty `identity`
+  selector can match. Never authorize an unauthenticated peer by a specific
+  display-name pattern.
 
 ### 8.4 Worked examples
 
@@ -1720,6 +1724,15 @@ The Nix module exposes it as
 `tartarus.sudo-auth-proxy.server.resolution`; unset defaults to `certificate`
 when `mtls` is enabled and `tartarus` otherwise. The resolved name is one of the
 candidates an `[[acl.rule]]` `identity` selector matches (§8.6).
+
+**`resolution = "none"` is wildcard-only.** The resolved name is a *display*
+label, never a matching identity: with `none` the identity is unset, so only an
+empty `identity` selector or `"*"` can match. A specific `identity` pattern can
+never authorize an unauthenticated peer (it would be name spoofing by label).
+This is enforced in ssh-agent-proxy by a dedicated `matches_vm(None)` rule
+(see `docs/ssh-agent-proxy.md` §5.2) and is the model the `[[acl.rule]]`
+matching must follow: match cryptographic material, never a display string. The
+`mofos` resolver is available here at parity with ssh-agent-proxy.
 
 ---
 
