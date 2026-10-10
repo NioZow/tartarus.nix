@@ -119,6 +119,7 @@
     services = g.services;
     firewall = g.firewall;
     proxy = g.proxy;
+    shares = g.shares;
     relays = g.relays;
     requires = g.requires;
     host = g.host or null;

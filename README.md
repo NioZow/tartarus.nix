@@ -399,6 +399,21 @@ macOS. The guest halves are wired automatically when a guest sets the matching
 - A proxy-only guest can reach only the proxy; DNS (53), SSH (22) and plain
   HTTP (80) are dropped, and the allowlist is HTTPS/443-only.
 
+#### Native containers
+
+A `kind = "container"` guest with no `host` pointer runs directly on the host
+kernel as a systemd-nspawn container. The host module declares it as a NixOS
+`containers.<name>`, so activation writes `/etc/nixos-containers/<name>.conf`
+(the registration `nixos-container` and the `tartarus` CLI both key off — the
+CLI reports a container as "not provisioned" until this file exists). You do
+**not** declare `containers.<name>` yourself: the engine does it from the guest
+definition, reusing the same guest system as the standalone `ctn-<name>` output,
+and wires the host bridge (`trs1`), the CA bind mounts (`/etc/tartarus/{ssh,x509}`)
+and the CA-signed SSH host key automatically. Each container reaches the
+internet through the host's NAT on `trs1`; nested containers (a `host` pointer)
+are instead declared inside their container-host VM and have no host-side
+`containers.<name>`.
+
 ### macOS (nix-darwin)
 
 - vfkit guests on `vmnet-shared` NAT (`192.168.64.0/24`, gateway

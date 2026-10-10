@@ -45,12 +45,13 @@ in {
     }
   ];
 
-  # An inner container (nested inside a container-host VM) has no per-container
-  # host address -- its host side is the VM's shared inner bridge -- so it needs
-  # an explicit default route via that bridge's host IP to reach beyond its /24
-  # (DNS/proxy on the VM, and the internet through the VM's NAT). Native
-  # containers get this from nixos-container's --local-address/--host-address.
-  networking.defaultGateway = mkIf (g.inHostVm or false) {
+  # A container is attached to its host bridge (the VM-local `trs2` when nested,
+  # the host `trs1` when native) with `privateNetwork = true`, and the host end
+  # of the veth carries the bridge's host IP. nixos-container only installs a
+  # default route in the `hostAddress`/`localAddress` (point-to-point) model, so
+  # both container flavours need the route declared here to reach beyond their
+  # /24 (the resolver/proxy, and the internet through the host's NAT).
+  networking.defaultGateway = mkIf (!g.isVm) {
     address = p.gateway;
     interface = "eth0";
   };

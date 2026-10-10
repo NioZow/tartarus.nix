@@ -569,7 +569,12 @@
         });
     };
 
-  mkContainer = name: cfg: let
+  # The module set + specialArgs that define a container guest's NixOS system.
+  # Kept separate from `mkContainer` so the *host* module can declare the same
+  # container as a NixOS `containers.<name>` (which is what writes the
+  # `/etc/nixos-containers/<name>.conf` registration) without re-deriving the
+  # guest by hand -- see `nix/host/containers.nix`.
+  mkContainerAttrs = name: cfg: let
     ctrName =
       if ctnInstanceSuffix == ""
       then name
@@ -588,16 +593,23 @@
       # container-host VM; it uses the VM-local inner bridge addressing.
       inHostVm = (cfg.host or null) != null;
     };
+  in {
+    inherit ctrName ctrId;
+    modules = [
+      inputs.home-manager.nixosModules.home-manager
+      ./default.nix
+    ];
+    specialArgs = mkSpecialArgs guest;
+  };
+
+  mkContainer = name: cfg: let
+    attrs = mkContainerAttrs name cfg;
   in
     lib.nixosSystem {
       inherit system;
       pkgs = guestPkgs;
-      specialArgs = mkSpecialArgs guest;
-      modules = [
-        inputs.home-manager.nixosModules.home-manager
-        ./default.nix
-      ];
+      inherit (attrs) modules specialArgs;
     };
 in {
-  inherit mkVm mkContainer;
+  inherit mkVm mkContainer mkContainerAttrs;
 }

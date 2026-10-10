@@ -54,20 +54,18 @@
   # A guest module absorbing `tartarusGuest.dnsResolver` into an env var, so
   # the suite can read the engine-resolved resolver address per client kind.
   dnsResolverProbe = {tartarusGuest, ...}: {
-    environment.variables.TARTARUS_DNS_RESOLVER =
-      let
-        resolver = tartarusGuest.dnsResolver or null;
-      in
-        if resolver == null
-        then "none"
-        else resolver;
+    environment.variables.TARTARUS_DNS_RESOLVER = let
+      resolver = tartarusGuest.dnsResolver or null;
+    in
+      if resolver == null
+      then "none"
+      else resolver;
   };
 
   # A guest module absorbing the engine-resolved proxy host into an env var, so
   # the suite can read the per-client proxy address (nested vs host-side).
   proxyHostProbe = {tartarusGuest, ...}: {
-    environment.variables.TARTARUS_PROXY_HOST =
-      let h = tartarusGuest.proxy.host or "none"; in h;
+    environment.variables.TARTARUS_PROXY_HOST = let h = tartarusGuest.proxy.host or "none"; in h;
   };
 
   # ==== host-system evaluation ==========================================
@@ -271,7 +269,10 @@
       default = {};
     };
   };
-  mkDarwinHostWith = {guests ? {}, modules ? []}:
+  mkDarwinHostWith = {
+    guests ? {},
+    modules ? [],
+  }:
     lib.nixosSystem {
       system = "aarch64-darwin";
       pkgs = import inputs.nixpkgs {
@@ -689,11 +690,13 @@
   };
   chDnsProxyModules = [
     {tartarus.dns.location = "dns";}
-    {tartarus.proxy = {
-      enable = true;
-      location = "proxy";
-      port = 3128;
-    }; }
+    {
+      tartarus.proxy = {
+        enable = true;
+        location = "proxy";
+        port = 3128;
+      };
+    }
   ];
   hostChDnsProxy = mkHost {
     guests = chDnsProxyGuestSet {enable = true;};
@@ -757,11 +760,15 @@
         systemConfig = proxyHostProbe;
       };
     };
-    modules = [{tartarus.proxy = {
-      enable = true;
-      location = "proxy";
-      port = 3128;
-    }; }];
+    modules = [
+      {
+        tartarus.proxy = {
+          enable = true;
+          location = "proxy";
+          port = 3128;
+        };
+      }
+    ];
   };
 
   # Darwin counterpart: the container-host VM `ch` (id 5) is reached at its
@@ -794,11 +801,15 @@
         systemConfig = proxyHostProbe;
       };
     };
-    modules = [{tartarus.proxy = {
-      enable = true;
-      location = "proxy";
-      port = 3128;
-    }; }];
+    modules = [
+      {
+        tartarus.proxy = {
+          enable = true;
+          location = "proxy";
+          port = 3128;
+        };
+      }
+    ];
   };
 
   hostBadStatic101 = mkHost {
@@ -1313,6 +1324,11 @@
   nestedProxyClientDarwinGuests = mkGuestsFromHostOn "aarch64-darwin" hostNestedProxyClientDarwin;
   proxyHostOf = guests: namespace:
     guests.nixosConfigurations.${namespace}.config.environment.variables.TARTARUS_PROXY_HOST;
+
+  # Host-side native container provisioning: the host declares the container as
+  # a NixOS `containers.<name>` (what writes the /etc/nixos-containers/<name>.conf
+  # registration), and the container gets a default route on its host bridge.
+  dnsNativeCtn = dnsNativeGuests.nixosConfigurations."ctn-dns";
 
   envText = guests: name:
     guests.nixosConfigurations."vm-${name}".config.home-manager.users.user.home.file.".config/environment.d/10-tartarus.conf".text;
@@ -2157,6 +2173,47 @@ in {
         == "/var/lib/tartarus-inner/certs/x509/inner")
       "containers.inner key bind mounts are missing or wrong";
 
+    # Native (host-side) containers must be declared as NixOS `containers.<name>`
+    # so activation writes the `/etc/nixos-containers/<name>.conf` registration
+    # the CLI keys off; without it `trs list` reports "not provisioned".
+    "host-containers/native-declared" =
+      T
+      (hostDnsNative.config.containers ? dns
+        && hostDnsNative.config.containers.dns.hostBridge == "trs1"
+        && hostDnsNative.config.containers.dns.privateNetwork
+        && hostDnsNative.config.containers.dns.ephemeral == false
+        && hostDnsNative.config.containers.dns.bindMounts ? "/etc/tartarus/ssh"
+        && hostDnsNative.config.containers.dns.bindMounts ? "/etc/tartarus/x509"
+        && hostDnsNative.config.containers.dns.bindMounts."/etc/tartarus/ssh".isReadOnly)
+      "a native container guest is not declared as a host `containers.<name>`";
+
+    # A native container's CA directories are bind-mounted straight from the
+    # per-host machines dir (containers/<name>), unlike the nested path which
+    # stages the SSH key inside the container-host VM.
+    "host-containers/native-bindmounts" =
+      T
+      (hostDnsNative.config.containers.dns.bindMounts."/etc/tartarus/ssh".hostPath
+        == "${hostDnsNative.config.tartarus.ca.ssh.machinesDir}/containers/dns"
+        && hostDnsNative.config.containers.dns.bindMounts."/etc/tartarus/x509".hostPath
+        == "${hostDnsNative.config.tartarus.ca.x509.machinesDir}/containers/dns")
+      "a native container's CA bind mounts are wrong";
+
+    # Nested-only hosts must declare no host-side container (their `.conf`
+    # lives inside the container-host VM, not on the host).
+    "host-containers/nested-not-declared" =
+      T (hostDnsNested.config.containers == {})
+      "a nested container leaked into the host `containers` set";
+
+    # A native container runs on the host bridge with `privateNetwork`, so it
+    # needs its default route declared in-guest (nixos-container only installs
+    # one in the point-to-point hostAddress/localAddress model).
+    "host-containers/native-gateway" =
+      T
+      (dnsNativeCtn.config.networking.defaultGateway.address
+        == "10.201.0.1"
+        && dnsNativeCtn.config.networking.defaultGateway.interface == "eth0")
+      "a native container did not get a default route via its host bridge";
+
     # Feature parity: a nested container's services, relays and shares are wired
     # into the container-host VM (the VM DNATs services/relays out to the host /
     # inner address and holds the shares, then bind-mounts them inward).
@@ -2255,7 +2312,8 @@ in {
     # VM's trunk IP, never the nested container's `trs1` address.
     "container-host/nested-proxy-client-address" =
       T
-      (proxyHostOf nestedProxyClientGuests "ctn-litellm" == "10.202.0.1"
+      (proxyHostOf nestedProxyClientGuests "ctn-litellm"
+        == "10.202.0.1"
         && proxyHostOf nestedProxyClientGuests "vm-dev" == "10.200.0.5")
       "a nested proxy host resolves to the wrong address for one of its clients";
     "container-host/nested-proxy-client-address-darwin" =
@@ -2507,7 +2565,8 @@ in {
     # ---- DNS resolver record + per-client-kind address ------------------
     "dns/instances-resolver-record" =
       T
-      (dnsNativeRecord.name == "dns"
+      (dnsNativeRecord.name
+        == "dns"
         && dnsNativeRecord.kind == "container"
         && dnsNativeRecord.id == 3
         && dnsNativeRecord.ip == "10.201.0.3"
@@ -2601,30 +2660,30 @@ in {
     "standalone/nixos-ssh-agent-proxy-mtls-conflict" =
       T
       (! (nixosDrvOk (mkStandaloneNixos self.nixosModules."ssh-agent-proxy" {
-          tartarus.ssh-agent-proxy = {
+        tartarus.ssh-agent-proxy = {
+          enable = true;
+          server = {
             enable = true;
-            server = {
-              enable = true;
-              transport = "vsock";
-              mtls.enable = true;
-              security.transportEncryption = "none";
-            };
+            transport = "vsock";
+            mtls.enable = true;
+            security.transportEncryption = "none";
           };
-        })))
+        };
+      })))
       "ssh-agent-proxy accepted mtls.enable with transport_encryption = none";
     # `unix` cannot map a CID/IP, so tartarus/mofos resolution must be refused.
     "standalone/nixos-ssh-agent-proxy-unix-bad-resolution" =
       T
       (! (nixosDrvOk (mkStandaloneNixos self.nixosModules."ssh-agent-proxy" {
-          tartarus.ssh-agent-proxy = {
+        tartarus.ssh-agent-proxy = {
+          enable = true;
+          server = {
             enable = true;
-            server = {
-              enable = true;
-              transport = "unix";
-              resolution = "tartarus";
-            };
+            transport = "unix";
+            resolution = "tartarus";
           };
-        })))
+        };
+      })))
       "ssh-agent-proxy accepted tartarus resolution on the unix transport";
     "standalone/nixos-sudo-auth-proxy" =
       T

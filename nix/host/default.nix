@@ -206,7 +206,10 @@ in {
     # `nix.linux-builder` is a nix-darwin-only option, so this module must not
     # even be imported on NixOS (a `mkIf false` definition would still require
     # the option to exist).
-    ++ lib.optionals isDarwin [./linux-builder.nix];
+    ++ lib.optionals isDarwin [./linux-builder.nix]
+    # Native host-side containers are the NixOS `containers.<name>` model, which
+    # nix-darwin does not define; import this only where the option exists.
+    ++ lib.optionals isLinux [(import ./containers.nix {inherit inputs self;})];
 
   options.tartarus.internalAssertions = mkOption {
     type = types.listOf types.unspecified;
