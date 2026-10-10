@@ -224,8 +224,10 @@ in {
   # A host-side port forward into a guest. On Darwin vfkit's vmnet-shared mode
   # makes guests unable to reach each other and the host cannot route to a
   # guest's service at the gateway, so a userspace relay exposes the guest port
-  # on the gateway (`192.168.64.1`). On Linux direct routing already reaches the
-  # guest, so relays are a Darwin-only concept and are ignored elsewhere.
+  # on the gateway (`192.168.64.1`). On Linux the host firewall DNATs the port:
+  # a guest dials its bridge gateway (`10.200.0.1` on trs0, `10.201.0.1` on
+  # trs1) and a host-local client dials `127.0.0.1`, both rewritten to the
+  # guest's bridge IP.
   relay = types.submodule {
     options = {
       port = mkOption {
@@ -245,7 +247,7 @@ in {
       host = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Host address to bind. Defaults to the vmnet gateway on Darwin.";
+        description = "Host address to bind. Defaults to the vmnet gateway on Darwin, or the loopback plus the bridge gateways on Linux.";
       };
     };
   };

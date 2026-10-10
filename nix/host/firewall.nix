@@ -31,17 +31,20 @@
       (lib)
       any
       attrValues
+      concatLists
       concatMapStringsSep
       concatStringsSep
       filter
       filterAttrs
       listToAttrs
       map
+      mapAttrsToList
       mkIf
       mkMerge
       nameValuePair
       optional
       optionalString
+      unique
       ;
 
     # Platform from the consumer's `system` specialArg, never from `pkgs`:
@@ -134,6 +137,65 @@
             concatMapStringsSep "\n" (rule: "    ${allowEntry rule}") fw.allow
           )
       ) (hostSideNames kind);
+
+    # ---- host-side relays (Linux DNAT) -------------------------------------
+    # `tartarus.guests.<name>.relays` surface a guest port on the host. Linux
+    # uses nftables: a guest dials its bridge gateway (`10.200.0.1` on trs0,
+    # `10.201.0.1` on trs1) -- its service hostname (e.g. `litellm-proxy`)
+    # resolves there -- or the host dials `127.0.0.1`, and a DNAT rewrites the
+    # destination to the guest's bridge IP. `relay.host` overrides the bind
+    # addresses; `relay.targetPort` defaults to `relay.port`. (Darwin uses socat
+    # relays instead -- see relay.nix.)
+    gatewayAddresses = optional hasVm ids.vmHostIP ++ optional hasCtn ids.ctnHostIP;
+
+    relayEntries = concatLists (
+      mapAttrsToList (
+        name: g:
+          map (r: {
+            inherit name;
+            port = r.port;
+            targetPort =
+              if r.targetPort != null
+              then r.targetPort
+              else r.port;
+            proto = r.protocol;
+            targetIp = reachableIp g;
+            # The bridge the target sits on, so a host-local (DNAT'd) connection
+            # carrying source `127.0.0.1` can be hairpin-masqueraded.
+            targetBridge =
+              if g.kind == "vm" || (g.host or null) != null
+              then ids.vmBridge
+              else ids.ctnBridge;
+            hostOverride = r.host;
+          })
+          (g.relays or [])
+      )
+      guests
+    );
+
+    relayGatewayHosts = e:
+      if e.hostOverride != null
+      then filter (h: h != "127.0.0.1") [e.hostOverride]
+      else gatewayAddresses;
+    relayLoopbackHosts = e:
+      if e.hostOverride != null
+      then filter (h: h == "127.0.0.1") [e.hostOverride]
+      else ["127.0.0.1"];
+
+    relayDnat = e: host: "ip daddr ${host} ${e.proto} dport ${toString e.port} counter dnat ip to ${e.targetIp}:${toString e.targetPort} comment \"relay-${e.name}\"";
+    relayPreroutingRules =
+      concatMapStringsSep "\n" (
+        e: concatMapStringsSep "\n" (relayDnat e) (relayGatewayHosts e)
+      )
+      relayEntries;
+    relayOutputRules =
+      concatMapStringsSep "\n" (
+        e: concatMapStringsSep "\n" (relayDnat e) (relayLoopbackHosts e)
+      )
+      relayEntries;
+    relayHairpin =
+      concatMapStringsSep "\n" (b: "oifname \"${b}\" ip saddr 127.0.0.0/8 counter masquerade comment \"relay-hairpin\"")
+      (unique (map (e: e.targetBridge) relayEntries));
 
     mkKind = kind: let
       bridge =
@@ -261,6 +323,13 @@
 
       '';
 
+      # A relayed connection arriving on this kind's bridge was DNAT'd (nat
+      # prerouting) to the guest's bridge IP, so match the post-DNAT target.
+      # Must precede the same-bridge drop for a same-kind (VM -> VM) relay.
+      relayForwardRules =
+        concatMapStringsSep "\n" (e: "iifname \"${bridge}\" ip daddr ${e.targetIp} ${e.proto} dport ${toString e.targetPort} counter accept comment \"relay-${e.name}\"")
+        relayEntries;
+
       content = ''
         ${setSection}chain ${kind}_input {
           type filter hook input priority -10
@@ -287,6 +356,7 @@
           ct state established,related counter accept
           ${dnsForwardRules}
           ${proxyForwardRules}
+          ${relayForwardRules}
           iifname "${bridge}" oifname "${bridge}" counter drop comment "drop-${kind}-to-${kind}"
 
           ${noInternetRules}
@@ -302,14 +372,29 @@
     # Internet NAT. We do this in nftables (not systemd-networkd's
     # IPMasquerade) so the cross-kind proxy traffic can be exempted and the
     # client's source IP reaches the proxy VM intact for its per-guest `src`
-    # ACLs.
+    # ACLs. Relays are DNAT'd here too: guests reach a relayed port at their
+    # bridge gateway (nat prerouting), the host at `127.0.0.1` (nat output --
+    # locally generated traffic never traverses prerouting).
     natTable = ''
+      chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+
+        ${relayPreroutingRules}
+      }
+
+      chain output {
+        type nat hook output priority dstnat; policy accept;
+
+        ${relayOutputRules}
+      }
+
       chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
 
         ${optionalString proxyIsGuest "ip daddr ${targetIp} counter return comment \"proxy-no-masq\""}
         ${optionalString hasVm "ip saddr ${ids.vmSubnet} oifname != \"${ids.vmBridge}\" oifname != \"${ids.ctnBridge}\" counter masquerade comment \"vm-masq\""}
         ${optionalString hasCtn "ip saddr ${ids.ctnSubnet} oifname != \"${ids.vmBridge}\" oifname != \"${ids.ctnBridge}\" counter masquerade comment \"ctn-masq\""}
+        ${relayHairpin}
       }
     '';
 
@@ -397,11 +482,26 @@
           );
 
           boot.kernelModules = ["br_netfilter"];
-          boot.kernel.sysctl = {
-            "net.ipv4.ip_forward" = 1;
-            "net.bridge.bridge-nf-call-iptables" = 1;
-            "net.bridge.bridge-nf-call-ip6tables" = 1;
-          };
+          boot.kernel.sysctl =
+            {
+              "net.ipv4.ip_forward" = 1;
+              "net.bridge.bridge-nf-call-iptables" = 1;
+              "net.bridge.bridge-nf-call-ip6tables" = 1;
+            }
+            # A host-local relay client connects to `127.0.0.1`; the DNAT +
+            # hairpin-masquerade turns it into a forwarded flow whose reply is
+            # un-NAT'd back to `127.0.0.1` and arrives over a bridge. Without
+            # `route_localnet` the kernel treats that 127/8 address on a non-lo
+            # device as martian and drops it (the SYN-ACK never returns, so the
+            # host-local connection times out). Enable it on `all` (the kernel
+            # ORs `all` into each device's value) and per bridge for safety.
+            // lib.optionalAttrs (relayEntries != []) {
+              "net.ipv4.conf.all.route_localnet" = 1;
+            }
+            // listToAttrs (
+              map (b: nameValuePair "net.ipv4.conf.${b}.route_localnet" 1)
+              (unique (map (e: e.targetBridge) relayEntries))
+            );
 
           environment.etc."qemu/bridge.conf".text = concatMapStringsSep "\n" (b: "allow ${b}") (
             optional hasVm ids.vmBridge ++ optional hasCtn ids.ctnBridge

@@ -159,12 +159,16 @@ in {
           type = types.listOf shared.relay;
           default = [];
           description = ''
-            Host-side port forwards into this guest, exposed on the vmnet
-            gateway. Darwin-only: vfkit's vmnet-shared mode gives guests no
-            path to each other and the host cannot route to a guest service
-            through the gateway, so a userspace relay (socat) is needed. On
-            Linux direct routing already reaches the guest, so these are
-            ignored. Ports below 1024 are run as a root service.
+            Host-side port forwards into this guest. On Darwin a userspace
+            `socat` relay binds the vmnet gateway (guests have no path to each
+            other and the host cannot route to a guest service through the
+            gateway). On Linux the host firewall DNATs the port: a guest dials
+            its bridge gateway (`10.200.0.1` on trs0, `10.201.0.1` on trs1) --
+            its service hostname (e.g. `litellm-proxy`) resolves there -- and a
+            host-local client dials `127.0.0.1`; the destination is rewritten to
+            the guest's bridge IP. Set `host` on a relay to bind specific
+            addresses instead. Privileged ports (< 1024) run as a root service
+            on Darwin.
           '';
         };
 
