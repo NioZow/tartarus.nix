@@ -66,6 +66,7 @@ CTN_GUEST_COMMANDS = [
     ["--container", "restart", "NAME"],
     ["--container", "logs", "NAME"],
     ["--container", "ssh", "NAME"],
+    ["--container", "ip", "NAME"],
 ]
 
 
@@ -174,13 +175,29 @@ def test_all_guests_commands_are_not_guarded(monkeypatch):
     assert reached == ["list", "status"]
 
 
-def test_container_vm_only_commands_still_rejected(monkeypatch, capsys):
+@pytest.mark.parametrize("command", ["cid", "proxy", "proxy-ip"])
+def test_container_vm_only_commands_still_rejected(monkeypatch, capsys, command):
     config = make_config(VAULT)
     monkeypatch.setattr(cli, "load_config", lambda *a, **k: config)
     with pytest.raises(SystemExit) as exc:
-        cli.main(["--container", "cid", "vault"])
+        cli.main(["--container", command, "vault"])
     assert exc.value.code == 1
     assert "MicroVM-only" in capsys.readouterr().err
+
+
+def test_container_ip_is_no_longer_vm_only(monkeypatch):
+    # `ip` now has a container path, so a container name must reach
+    # ctn.dispatch instead of the MicroVM-only guard.
+    config = make_config(BOX)
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli.flake, "require_flake", lambda _config: None)
+    reached: list[str] = []
+    monkeypatch.setattr(cli.ctn, "dispatch", lambda _c, a: reached.append(a.command))
+    monkeypatch.setattr(cli.vm, "dispatch", lambda _c, a: reached.append(a.command))
+
+    cli.main(["ip", "box"])
+
+    assert reached == ["ip"]
 
 
 def test_help_still_works(monkeypatch, capsys):

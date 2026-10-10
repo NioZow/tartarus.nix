@@ -628,6 +628,37 @@ def action_ssh(config: Config, name: str, start: bool = False) -> NoReturn:
     )
 
 
+def action_ip(config: Config, name: str) -> None:
+    """Print a running guest's host-reachable IP.
+
+    Native containers live on the host's ``trs1`` bridge and have a static
+    ``LOCAL_ADDRESS`` recorded in their ``nixos-container`` registration. A
+    nested container lives on its container-host VM's inner bridge and has no
+    host-reachable address of its own, so it is refused (use
+    ``tartarus --container ssh`` instead).
+    """
+    base = base_name(config, name)
+    require_template(config, base)
+    guest = config.guest(base, "container")
+    if guest is not None and guest.host is not None:
+        raise TartarusError(
+            f"'{name}' is a nested container inside container-host VM "
+            f"'{guest.host}'; it has no host-reachable IP. Use "
+            f"`tartarus --container ssh {name}` instead."
+        )
+    if name not in list_conf_names():
+        die(
+            f"'{name}' is not provisioned on this host. Start it first: "
+            f"tartarus --container start {name}"
+        )
+    if not is_running(name):
+        die(f"'{name}' is not running. Start it first: tartarus --container start {name}")
+    addr = read_local_address(name)
+    if addr is None:
+        die(f"no recorded address for '{name}' in {CTN_CONF_DIR}/{name}.conf")
+    print(addr)
+
+
 def dispatch(config: Config, args) -> None:
     if args.command == "list":
         action_list(config, args.json)
@@ -647,3 +678,5 @@ def dispatch(config: Config, args) -> None:
         action_logs(config, args.name)
     elif args.command == "ssh":
         action_ssh(config, args.name, args.start)
+    elif args.command == "ip":
+        action_ip(config, args.name)

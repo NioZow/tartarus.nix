@@ -140,7 +140,11 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument("name", help="instance name, with or without a trailing '.trs' (ssh's %%h)")
 
-    p = sub.add_parser("ip", help="print a running MicroVM's host-reachable IP (macOS: vmnet DHCP address via ARP)")
+    p = sub.add_parser(
+        "ip",
+        help="print a running guest's host-reachable IP (MicroVM: static vmnet/trs0 address; "
+        "native container: its trs1 address; nested container: refused)",
+    )
     p.add_argument("name", help="instance name, with or without a trailing '.trs'")
 
     p = sub.add_parser(
@@ -263,9 +267,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         resolve_kind(config, args)
 
-        if args.container and args.command in ("cid", "proxy", "ip", "proxy-ip"):
+        if args.container and args.command in ("cid", "proxy", "proxy-ip"):
             raise TartarusError(
-                "'cid', 'proxy', 'ip' and 'proxy-ip' are MicroVM-only (VSOCK/vmnet) and have no container equivalent"
+                "'cid', 'proxy' and 'proxy-ip' are MicroVM-only (VSOCK/vmnet) and have no container equivalent"
             )
 
         guard_guest(config, args)

@@ -254,7 +254,7 @@ tartarus restart <name> [-u]      # stop, then start
 tartarus logs <name>              # console log / journal
 tartarus ssh <name> [-s|--start]  # start it first if it isn't running
 tartarus cid <name>               # MicroVM VSOCK CID
-tartarus ip <name>                # host-reachable IP (deterministic static)
+tartarus ip <name>                # host-reachable IP (MicroVM; native container)
 tartarus proxy <name>             # ProxyCommand helper (VSOCK)
 tartarus proxy-ip <name>          # ProxyCommand helper (vmnet IP)
 ```
