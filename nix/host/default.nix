@@ -62,9 +62,10 @@
     ])
     guests);
 
-  # A guest-hosted proxy must be a reachable egress point: an enabled VM with
-  # internet. vmnet-shared NAT on Darwin still lets guests reach each other
-  # and the host, so guest-hosted proxies are supported on both platforms.
+  # A guest-hosted proxy must be a reachable egress point: an enabled VM or
+  # container with internet. vmnet-shared NAT on Darwin still lets guests reach
+  # each other and the host, so guest-hosted proxies are supported on both
+  # platforms.
   proxyLocationAssertion = let
     location = config.tartarus.proxy.location;
     namedGuest = guests.${location} or null;
@@ -72,11 +73,24 @@
       namedGuest
       != null
       && namedGuest.enable
-      && namedGuest.kind == "vm"
+      && (namedGuest.kind == "vm" || namedGuest.kind == "container")
       && namedGuest.internet;
   in {
     assertion = location == "host" || guestOk;
-    message = "tartarus: `tartarus.proxy.location = \"${location}\"` must be \"host\" or name an enabled `kind = \"vm\"` guest with `internet = true`.";
+    message = "tartarus: `tartarus.proxy.location = \"${location}\"` must be \"host\" or name an enabled `kind = \"vm\"` or `kind = \"container\"` guest with `internet = true`.";
+  };
+
+  # The DNS resolver is a guest of any kind (`tartarus.dns.location`). When
+  # set it must name an enabled guest; `null` disables the carve-out.
+  dnsLocationAssertion = let
+    location = config.tartarus.dns.location;
+    namedGuest =
+      if location == null
+      then null
+      else guests.${location} or null;
+  in {
+    assertion = location == null || namedGuest != null;
+    message = "tartarus: `tartarus.dns.location = \"${toString location}\"` must name an enabled guest.";
   };
 
   requiresAssertions = let
@@ -169,6 +183,7 @@
   tartarusAssertions =
     guestAssertions
     ++ [proxyLocationAssertion]
+    ++ [dnsLocationAssertion]
     ++ requiresAssertions
     ++ mkIdAssertions "vm"
     ++ mkIdAssertions "container"

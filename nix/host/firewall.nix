@@ -73,25 +73,48 @@
       then instances.vm.enabledNames
       else instances.container.hostSideNames;
 
-    # The guest named by `proxy.location`, when it is a guest. Phase 1 asserts
-    # it is an enabled linux VM with internet, so its id exists here.
+    # Host-reachable address of an `instances.guests` record. A VM sits at its
+    # trunk IP; a native container at its `trs1` IP; a nested container is
+    # reached at its container-host VM's trunk IP, because the host does not
+    # route the VM-local inner subnet. `firewall.nix` host mode is Linux-only,
+    # but the formula stays platform-correct.
+    reachableIp = record: let
+      hostId =
+        if (record.host or null) == null
+        then null
+        else instances.vm.idByName.${record.host} or null;
+    in
+      if record.kind == "vm"
+      then
+        (
+          if isLinux
+          then ids.mkVmIP record.id
+          else ids.mkVmIPNat record.id
+        )
+      else if hostId != null
+      then
+        (
+          if isLinux
+          then ids.mkVmIP hostId
+          else ids.mkVmIPNat hostId
+        )
+      else ids.mkCtnIP record.id;
+
+    # The guest named by `proxy.location`, when it is a guest. The assertion
+    # guarantees it is an enabled VM or container with internet.
     targetGuest = guests.${proxyLocation} or null;
-    targetKind =
-      if targetGuest != null
-      then targetGuest.kind
-      else null;
-    targetId =
-      if targetKind == "vm"
-      then instances.vm.idByName.${proxyLocation} or null
-      else if targetKind == "container"
-      then instances.container.idByName.${proxyLocation} or null
-      else null;
     targetIp =
-      if targetId == null
+      if targetGuest == null
       then null
-      else if targetKind == "vm"
-      then ids.mkVmIP targetId
-      else ids.mkCtnIP targetId;
+      else reachableIp targetGuest;
+
+    # The guest named by `tartarus.dns.location`, if any: its host-reachable IP
+    # is where every client sends UDP/TCP 53.
+    dnsResolver = instances.dnsResolver;
+    dnsResolverIp =
+      if dnsResolver == null
+      then null
+      else reachableIp dnsResolver;
 
     # Per-guest `firewall.allow` is an *input* (host-service) allowance. It is
     # never emitted in `forward`, so it can never become an egress backdoor.
@@ -218,9 +241,14 @@
         )
         enabledNames;
 
-      networkDnsRule =
-        optionalString (kind == "vm" && enabledInst ? network)
-        "ip daddr ${mkIP "network"} udp dport 53 counter accept comment \"network-vm-dns\"\nip daddr ${mkIP "network"} tcp dport 53 counter accept comment \"network-vm-dns\"";
+      # Forward DNS to the resolver guest (`tartarus.dns.location`), per client
+      # kind: a VM client arrives on `trs0`, a native container client on
+      # `trs1`, so both directions of the cross-bridge pair are covered. The
+      # target is the resolver's host-reachable IP (a nested resolver is
+      # reached at its container-host VM). Must precede the same-bridge drop.
+      dnsForwardRules =
+        optionalString (dnsResolverIp != null)
+        "iifname \"${bridge}\" ip daddr ${dnsResolverIp} udp dport 53 counter accept comment \"dns-resolver\"\niifname \"${bridge}\" ip daddr ${dnsResolverIp} tcp dport 53 counter accept comment \"dns-resolver\"";
 
       setSection = optionalString useSet ''
         set ${srcSetName} {
@@ -257,7 +285,7 @@
           policy accept
 
           ct state established,related counter accept
-          ${networkDnsRule}
+          ${dnsForwardRules}
           ${proxyForwardRules}
           iifname "${bridge}" oifname "${bridge}" counter drop comment "drop-${kind}-to-${kind}"
 
@@ -294,6 +322,24 @@
         if kind == "vm"
         then ids.vmHostIP
         else ids.ctnHostIP;
+      subnet =
+        if kind == "vm"
+        then ids.vmSubnet
+        else ids.ctnSubnet;
+      # The engine only uses /24 bridges, so the first three octets identify
+      # the network, and a target belongs to at most one of them.
+      subnetPrefix = let
+        octets = lib.splitString "." (lib.head (lib.splitString "/" subnet));
+      in
+        lib.concatStringsSep "." (lib.take 3 octets) + ".";
+      # The explicit host route is only meaningful on the bridge that owns the
+      # target's subnet. A nested proxy target sits at its container-host VM's
+      # address (the VM bridge on Linux, off both bridges on Darwin), so it
+      # must never be routed out of the container bridge.
+      routeOnBridge =
+        proxyIsGuest
+        && targetIp != null
+        && lib.hasPrefix subnetPrefix targetIp;
     in {
       systemd.network = {
         netdevs."10-${bridge}" = {
@@ -312,9 +358,9 @@
           };
           linkConfig.RequiredForOnline = "no";
           # Explicit host route to a guest-hosted proxy. The /24 connected
-          # route already covers it, but keeping the /32 makes the cross-kind
-          # path self-documenting.
-          routes = optional (proxyIsGuest && targetKind == kind) {
+          # route already covers it on the target's own bridge, but keeping
+          # the /32 makes the cross-kind path self-documenting.
+          routes = optional routeOnBridge {
             Destination = "${targetIp}/32";
             Scope = "link";
           };

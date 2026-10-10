@@ -127,6 +127,26 @@
 
   details = lib.mapAttrs detail (vmEnabled // ctnEnabled);
 
+  # The guest named by `tartarus.dns.location`, as a plain record with its
+  # container-host VM (if nested) attached as `hostVm`. Computed here so no
+  # downstream module has to force the `tartarus.guests` submodule itself.
+  dnsLocation = config.tartarus.dns.location;
+  dnsResolverRecord =
+    if dnsLocation == null
+    then null
+    else let
+      resolver = details.${dnsLocation} or null;
+    in
+      if resolver == null
+      then null
+      else resolver
+        // {
+          hostVm =
+            if resolver.host != null
+            then details.${resolver.host} or null
+            else null;
+        };
+
   # Autostart records. A nested container's `autostart = true` becomes an
   # autostart request for its *host VM*: the VM must boot for the container to
   # start. The container itself additionally carries `autoStart =
@@ -181,6 +201,12 @@ in {
       default = [];
       description = "Enabled guests with `proxy.enable = true`, as plain records.";
     };
+    dnsResolver = mkOption {
+      type = types.nullOr types.unspecified;
+      internal = true;
+      default = null;
+      description = "The guest named by `tartarus.dns.location`, as a plain record with its container-host VM attached as `hostVm`; null when unset.";
+    };
   };
 
   config.tartarus.instances = {
@@ -203,5 +229,6 @@ in {
     guests = details;
     autostart = autostartRecords;
     proxyClients = builtins.filter (g: g.proxy.enable) (builtins.attrValues details);
+    dnsResolver = dnsResolverRecord;
   };
 }

@@ -18,9 +18,9 @@ in {
       default = "host";
       description = ''
         Where the proxy runs: `"host"` (default) or the name of an enabled
-        `kind = "vm"` guest with `internet = true`. Darwin hosts only support
-        `"host"`. This is global transport config only -- filtering is per
-        guest.
+        `kind = "vm"` or `kind = "container"` guest with `internet = true`.
+        Darwin hosts only support `"host"`. This is global transport config
+        only -- filtering is per guest.
       '';
     };
 
@@ -44,6 +44,18 @@ in {
       type = types.bool;
       default = false;
       description = "Log proxy metadata (client IP, CONNECT host) to journald.";
+    };
+  };
+
+  options.tartarus.dns = {
+    location = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Name of the enabled guest that is the resolver for all guests on this
+        host. When set, the firewall accepts DNS traffic (UDP/TCP 53) from every
+        guest kind to that resolver. `null` (default) disables the carve-out.
+      '';
     };
   };
 

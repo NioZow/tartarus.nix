@@ -158,6 +158,27 @@ in {
             description = "Subnet for nested containers.";
           };
         };
+
+        dns = {
+          enable = mkOption {
+            type = types.bool;
+            default = true;
+            description = ''
+              Run dnsmasq on the inner bridge as the nested containers'
+              resolver, forwarding upstream. Disable on a VM that does not
+              serve DNS to its containers.
+            '';
+          };
+          upstream = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = ''
+              Upstream server the inner containers' dnsmasq forwards to. `null`
+              forwards to the VM's own upstream gateway (today's behaviour);
+              set an address to send inner queries to a resolver guest instead.
+            '';
+          };
+        };
       };
       persistentHome = {
         enable = mkEnableOption "a persistent /home backed by a writable disk image (VM only)";

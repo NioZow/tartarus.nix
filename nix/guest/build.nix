@@ -76,20 +76,22 @@
   guests = config.tartarus.guests or {};
   globalProxy = config.tartarus.proxy or {};
 
+  # The host's resolver guest (`tartarus.dns.location`), as the plain record
+  # `instances.nix` derives. Absent for a hand-written sample config, which
+  # then exposes no resolver address (the guest keeps its gateway default).
+  dnsResolverRecord = (config.tartarus.instances or {}).dnsResolver or null;
+
   # Host-level ceilings backing `vm.mem = "host"` / `vm.vcpu = "host"` (plan
   # §8). Read from the consumer's evaluated host config; a hand-written sample
   # config may omit them, which is fine until a guest actually asks for "host".
   hostMemoryMiB = (config.tartarus or {}).hostMemoryMiB or null;
   hostCores = (config.tartarus or {}).hostCores or null;
 
-  # Resolve the proxy endpoint a guest should use. `location = "host"` (the
-  # default) means the guest-side host gateway. A guest name means that VM's
-  # trunk IP on Linux. On Darwin it also means the host gateway: vfkit/vmnet
-  # shared mode marks the bridge ports PRIVATE, so guests cannot reach each
-  # other, and a guest-hosted proxy is reached through the host's socat relay
-  # (see host/proxy.nix). Returns null whenever the gateway is the answer, so
-  # platform.nix supplies it.
-  proxyHostFor = let
+  # The proxy host's resolved identity, independent of the client. `nested`
+  # marks a container that runs inside a container-host VM (`target.host`),
+  # whose host-reachable address is that VM's, not its own `trs1` IP.
+  # `hostVmId` is the container-host VM's id.
+  proxyTarget = let
     location = globalProxy.location or "host";
   in
     if location == "host" || !(globalProxy.enable or false)
@@ -102,17 +104,17 @@
         else "vm";
       kindGuests = lib.filterAttrs (_: gg: gg.enable && gg.kind == targetKind) guests;
       targetId = (ids.assignIds kindGuests).${location} or null;
+      nested = target != null && (target.host or null) != null;
+      hostVmId =
+        if !nested
+        then null
+        else let
+          vmGuests = lib.filterAttrs (_: gg: gg.enable && gg.kind == "vm") guests;
+        in (ids.assignIds vmGuests).${target.host} or null;
     in
       if targetId == null
       then null
-      else if targetKind == "vm"
-      then
-        (
-          if lib.hasSuffix "-darwin" hostSystem
-          then null
-          else ids.mkVmIP targetId
-        )
-      else ids.mkCtnIP targetId;
+      else {inherit targetId targetKind nested hostVmId;};
 
   # One `mkService` factory per module system. The guest itself is always Linux
   # (`isDarwin = false`); system scope is homeManager = false, home-manager scope
@@ -147,9 +149,58 @@
     # sample configs keep working.
     innerContainers ? [],
   }: let
-    proxyHost = proxyHostFor;
+    # Resolve the proxy endpoint *for this client*. `location = "host"` (the
+    # default) means the guest-side host gateway. A nested-target client inside
+    # the target's own VM keeps its gateway, so it gets null (platform.nix then
+    # supplies the inner-bridge host IP). On Darwin a VM target is reached
+    # through the host's socat relay, so it also gets null; a nested target is
+    # reached at its container-host VM's vmnet NAT address instead.
+    proxyHost =
+      if proxyTarget == null
+      then null
+      else if proxyTarget.nested
+      then
+        (
+          if inHostVm
+          then null
+          else if lib.hasSuffix "-darwin" hostSystem
+          then ids.mkVmIPNat proxyTarget.hostVmId
+          else ids.mkVmIP proxyTarget.hostVmId
+        )
+      else if proxyTarget.targetKind == "vm"
+      then
+        (
+          if lib.hasSuffix "-darwin" hostSystem
+          then null
+          else ids.mkVmIP proxyTarget.targetId
+        )
+      else ids.mkCtnIP proxyTarget.targetId;
+
+    # The resolver a client of this kind queries. A nested client keeps its own
+    # dnsmasq gateway, so it gets null; a nested resolver is reached at its
+    # container-host VM's trunk address; otherwise the resolver's own address
+    # (a container's `trs1` IP, or a VM's trunk/vmnet IP).
+    dnsResolver = let
+      target =
+        if dnsResolverRecord == null || inHostVm
+        then null
+        else if dnsResolverRecord.hostVm != null
+        then dnsResolverRecord.hostVm
+        else dnsResolverRecord;
+    in
+      if target == null
+      then null
+      else if target.kind == "vm"
+      then
+        (
+          if lib.hasSuffix "-darwin" hostSystem
+          then ids.mkVmIPNat target.id
+          else ids.mkVmIP target.id
+        )
+      else ids.mkCtnIP target.id;
+
     platform = platformLib.mk {
-      inherit hostSystem kind id proxyHost inHostVm;
+      inherit hostSystem kind id proxyHost inHostVm dnsResolver;
       disableVsock = (cfg.services or {}).disableVsock or false;
       proxyPort = globalProxy.port or 3128;
     };
@@ -202,6 +253,10 @@
           hostIP = ids.innerHostIP;
           subnet = ids.innerSubnet;
         };
+        dns = {
+          enable = true;
+          upstream = null;
+        };
       };
     };
     vmCfg = cfg.vm or {};
@@ -219,6 +274,7 @@
           // {
             stateVolume = vmDefaults.containerHost.stateVolume // (chCfg.stateVolume or {});
             network = vmDefaults.containerHost.network // (chCfg.network or {});
+            dns = vmDefaults.containerHost.dns // (chCfg.dns or {});
           };
       };
 
@@ -234,6 +290,7 @@
       hostUid
       lowHostUid
       inHostVm
+      dnsResolver
       ;
 
     isVm = platform.isVm;
@@ -505,7 +562,11 @@
           inputs.home-manager.nixosModules.home-manager
           ./default.nix
         ]
-        ++ lib.optional guest.isContainerHost (import ./container-host.nix {innerContainers = innerRecords;});
+        ++ lib.optional guest.isContainerHost (import ./container-host.nix {
+          innerContainers = innerRecords;
+          dnsLocation = (config.tartarus.dns or {}).location or null;
+          proxyLocation = (config.tartarus.proxy or {}).location or null;
+        });
     };
 
   mkContainer = name: cfg: let

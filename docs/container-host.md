@@ -49,6 +49,8 @@ classical VMs, native Linux containers and a container host at the same time.
 | `...vm.containerHost.network.bridge` | str | `"trs2"` | VM-local inner bridge. |
 | `...vm.containerHost.network.hostIP` | str | `"10.202.0.1"` | Container host's address on the inner bridge. |
 | `...vm.containerHost.network.subnet` | str | `"10.202.0.0/24"` | Inner container subnet. |
+| `...vm.containerHost.dns.enable` | bool | `true` | Run dnsmasq on the inner bridge as the nested containers' resolver. |
+| `...vm.containerHost.dns.upstream` | null or str | `null` | Upstream the inner dnsmasq forwards to. `null` uses the VM's own gateway; an address forwards to a resolver guest. |
 
 `host` is container-only and `vm.containerHost.enable` is VM-only; the
 assertions in `nix/host/default.nix` enforce both.
@@ -115,7 +117,22 @@ network is visible to the macOS host.
   on Darwin).
 - **DNS.** `services.dnsmasq` listens on `10.202.0.1:53` and forwards to the
   VM's upstream gateway (`resolveLocalQueries = false`, so the VM's own DNS is
-  untouched). Containers use `10.202.0.1` as nameserver and default gateway.
+  untouched). Containers use `10.202.0.1` as nameserver and default gateway, so
+  the VM keeps serving the inner `.trs` names locally. `vm.containerHost.dns`
+  controls this: `enable` (default `true`) toggles dnsmasq; `upstream` (default
+  `null`) overrides the forward target — `null` uses the VM's own gateway
+  (`g.platform.gateway`), while an address forwards inner queries to a resolver
+  guest instead (athena's `ch` sets `upstream = "192.168.64.51"`, the `network`
+  VM that DNATs 53 to the nested `dns` container).
+- **Serving nested DNS/proxy.** When the host's `tartarus.dns.location` (or
+  `tartarus.proxy.location`) names a container nested in **this** VM, the VM
+  DNATs the service port on its trunk interface inward to that container:
+  `iifname "eth0" udp dport 53 … dnat ip to 10.202.0.3:53` and the TCP
+  equivalent for the resolver, and `iifname "eth0" tcp dport 3128 … dnat ip to
+  10.202.0.4:3128` for the proxy. A client dials the VM's trunk address directly
+  (the `network` VM at `192.168.64.51` on athena), so there is **no host
+  `socat` relay** on the DNS path; the proxy keeps its existing host relay
+  (`nix/host/relay.nix`), which lands on the same DNAT.
 - **Names.** The VM's `/etc/hosts` maps each inner address to `<name>` and
   `<name>.trs`, which is what the ProxyJump resolves on the jump host.
 
@@ -215,6 +232,7 @@ stands in for its inner containers in `nix/host/services.nix` and
 | User `shares` / `sharedFolder` | Declared on the container-host VM (mounted under `/var/lib/tartarus-inner/<inner>/…`) and bind-mounted into the container at its guest paths. |
 | `relays` | Two-hop: the host socat targets the VM's NAT address; the VM DNATs the relayed port to the inner container. The same port on the inner bridge is also a VM-local "service" so sibling containers can reach it via the gateway name. |
 | `proxy.enable` | VM DNATs the proxy port (`hostProxyIP` = inner host IP) to the VM gateway; a proxy-only container is fenced to that gateway by a VM `forward` drop. |
+| Resolver / proxy **service** (`tartarus.dns.location` / `tartarus.proxy.location`) | A nested container can itself be the host's resolver or proxy. The container-host VM DNATs the service port on its trunk `eth0` inward to the nested container, so the host and its VMs reach `dns`/`proxy` through the VM's address (§4, "Serving nested DNS/proxy"). |
 
 `vm.persistentHome` / `vm.nixStoreOverlay` remain VM-only; a nested container's
 rootfs lives on the VM's persistent `nixos-containers.img` volume, so its

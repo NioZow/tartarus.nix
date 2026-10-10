@@ -29,6 +29,10 @@ in {
     # guest-side proxy target falls back to the host gateway for its kind.
     proxyHost ? null,
     proxyPort ? 3128,
+    # The DNS resolver address this guest should query, resolved by the caller
+    # from `tartarus.dns.location`; null when there is none (or the guest keeps
+    # its own dnsmasq gateway).
+    dnsResolver ? null,
   }: let
     # An inner container never uses the host's Linux/Darwin split: it is always
     # Linux-inner (no vsock, the VM-local bridge, nested addressing).
@@ -163,6 +167,7 @@ in {
       proxyBind
       noProxy
       proxyPort
+      dnsResolver
       ;
 
     hypervisor =

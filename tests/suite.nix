@@ -51,6 +51,25 @@
   inStr = needle: hay: T (hasInfix needle hay) "missing substring: ${needle}";
   notInStr = needle: hay: T (!hasInfix needle hay) "unexpected substring: ${needle}";
 
+  # A guest module absorbing `tartarusGuest.dnsResolver` into an env var, so
+  # the suite can read the engine-resolved resolver address per client kind.
+  dnsResolverProbe = {tartarusGuest, ...}: {
+    environment.variables.TARTARUS_DNS_RESOLVER =
+      let
+        resolver = tartarusGuest.dnsResolver or null;
+      in
+        if resolver == null
+        then "none"
+        else resolver;
+  };
+
+  # A guest module absorbing the engine-resolved proxy host into an env var, so
+  # the suite can read the per-client proxy address (nested vs host-side).
+  proxyHostProbe = {tartarusGuest, ...}: {
+    environment.variables.TARTARUS_PROXY_HOST =
+      let h = tartarusGuest.proxy.host or "none"; in h;
+  };
+
   # ==== host-system evaluation ==========================================
   # The module's platform split is driven by the `system` specialArg, never by
   # `pkgs`; the common tests all use a Linux evaluator.
@@ -252,7 +271,7 @@
       default = {};
     };
   };
-  mkDarwinHost = guests:
+  mkDarwinHostWith = {guests ? {}, modules ? []}:
     lib.nixosSystem {
       system = "aarch64-darwin";
       pkgs = import inputs.nixpkgs {
@@ -264,18 +283,21 @@
         homeDir = "/Users/user";
         system = "aarch64-darwin";
       };
-      modules = [
-        inputs.home-manager.nixosModules.home-manager
-        self.nixosModules.tartarus
-        darwinStub
-        base
-        {
-          tartarus.ca.enable = false;
-          tartarus.ssh.enable = false;
-          tartarus.guests = guests;
-        }
-      ];
+      modules =
+        [
+          inputs.home-manager.nixosModules.home-manager
+          self.nixosModules.tartarus
+          darwinStub
+          base
+          {
+            tartarus.ca.enable = false;
+            tartarus.ssh.enable = false;
+            tartarus.guests = guests;
+          }
+        ]
+        ++ modules;
     };
+  mkDarwinHost = guests: mkDarwinHostWith {inherit guests;};
   hostBadFirewallDarwin = mkDarwinHost {
     x = {
       enable = true;
@@ -428,7 +450,7 @@
       internet = true;
     };
   };
-  hostBadLocationContainer = mkHost {
+  hostLocationContainer = mkHost {
     proxy = {
       enable = true;
       location = "box";
@@ -452,6 +474,333 @@
       internet = false;
     };
   };
+
+  # A native container proxy host (`10.201.0.4`) with a VM client: the client's
+  # cross-kind forward rule must target the container's `trs1` IP, and the NAT
+  # table must exempt it from masquerading.
+  hostProxyCtn = mkHost {
+    proxy = {
+      enable = true;
+      location = "proxy";
+      port = 3128;
+    };
+    guests = {
+      proxy = {
+        enable = true;
+        kind = "container";
+        id = 4;
+        internet = true;
+      };
+      vclient = {
+        enable = true;
+        kind = "vm";
+        id = 8;
+        internet = false;
+        proxy = {
+          enable = true;
+          allowHosts = ["c.example"];
+        };
+      };
+    };
+  };
+
+  # A proxy container nested inside a container-host VM (`ch`, id 5 -> its
+  # trunk IP `10.200.0.5`): the host reaches it at the VM's address, never at
+  # the container's `trs1` IP.
+  hostProxyInVm = mkHost {
+    proxy = {
+      enable = true;
+      location = "proxy";
+      port = 3128;
+    };
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      proxy = {
+        enable = true;
+        kind = "container";
+        id = 4;
+        internet = true;
+        host = "ch";
+      };
+      vclient = {
+        enable = true;
+        kind = "vm";
+        id = 8;
+        internet = false;
+        proxy = {
+          enable = true;
+          allowHosts = ["d.example"];
+        };
+      };
+    };
+  };
+
+  # DNS service guest (native container, id 3 -> `10.201.0.3`) with a VM client.
+  hostDnsNative = mkHost {
+    guests = {
+      dns = {
+        enable = true;
+        kind = "container";
+        id = 3;
+        internet = true;
+      };
+      dev = {
+        enable = true;
+        kind = "vm";
+        id = 7;
+        internet = true;
+        systemConfig = dnsResolverProbe;
+      };
+    };
+    modules = [{tartarus.dns.location = "dns";}];
+  };
+
+  # DNS service guest nested inside a container-host VM (`netvm`, id 9): the
+  # host resolves at the VM's trunk IP `10.200.0.9`; the nested client keeps
+  # its own dnsmasq gateway.
+  hostDnsNested = mkHost {
+    guests = {
+      netvm = {
+        enable = true;
+        kind = "vm";
+        id = 9;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      dns = {
+        enable = true;
+        kind = "container";
+        id = 3;
+        internet = true;
+        host = "netvm";
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "netvm";
+        systemConfig = dnsResolverProbe;
+      };
+      dev = {
+        enable = true;
+        kind = "vm";
+        id = 7;
+        internet = true;
+        systemConfig = dnsResolverProbe;
+      };
+    };
+    modules = [{tartarus.dns.location = "dns";}];
+  };
+
+  # A resolver that is itself a VM (id 3 -> `10.200.0.3`).
+  hostDnsVmResolver = mkHost {
+    guests = {
+      dnsvm = {
+        enable = true;
+        kind = "vm";
+        id = 3;
+        internet = true;
+      };
+      dev = {
+        enable = true;
+        kind = "vm";
+        id = 7;
+        internet = true;
+        systemConfig = dnsResolverProbe;
+      };
+    };
+    modules = [{tartarus.dns.location = "dnsvm";}];
+  };
+
+  # `tartarus.dns.location` naming a guest that is not enabled must be refused.
+  hostDnsMissing = mkHost {
+    guests.dns = {
+      enable = true;
+      kind = "container";
+      id = 3;
+      internet = true;
+    };
+    modules = [{tartarus.dns.location = "ghost";}];
+  };
+
+  # Darwin: a VM client resolves at a nested resolver's container-host VM vmnet
+  # address (`netvm`, id 9 -> `192.168.64.51`).
+  hostDnsNestedDarwin = mkDarwinHostWith {
+    guests = {
+      netvm = {
+        enable = true;
+        kind = "vm";
+        id = 9;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      dns = {
+        enable = true;
+        kind = "container";
+        id = 3;
+        internet = true;
+        host = "netvm";
+      };
+      dev = {
+        enable = true;
+        kind = "vm";
+        id = 7;
+        internet = true;
+        systemConfig = dnsResolverProbe;
+      };
+    };
+    modules = [{tartarus.dns.location = "dns";}];
+  };
+
+  # Nested `dns`/`proxy` service containers hosted by `ch` (id 5). §3(c): the
+  # container-host VM must DNAT :53/:3128 on eth0 inward to the inner
+  # container, and its dnsmasq upstream must be configurable. Built from a REAL
+  # evaluated host so `tartarus.dns.location` / `tartarus.proxy.location` reach
+  # the guest engine.
+  chDnsProxyGuestSet = containerHost: {
+    ch = {
+      enable = true;
+      kind = "vm";
+      id = 5;
+      internet = true;
+      vm.containerHost = containerHost;
+    };
+    dns = {
+      enable = true;
+      kind = "container";
+      id = 3;
+      internet = true;
+      host = "ch";
+    };
+    proxy = {
+      enable = true;
+      kind = "container";
+      id = 4;
+      internet = true;
+      host = "ch";
+    };
+  };
+  chDnsProxyModules = [
+    {tartarus.dns.location = "dns";}
+    {tartarus.proxy = {
+      enable = true;
+      location = "proxy";
+      port = 3128;
+    }; }
+  ];
+  hostChDnsProxy = mkHost {
+    guests = chDnsProxyGuestSet {enable = true;};
+    modules = chDnsProxyModules;
+  };
+  hostChDnsProxyUpstream = mkHost {
+    guests = chDnsProxyGuestSet {
+      enable = true;
+      dns.upstream = "192.168.64.51";
+    };
+    modules = chDnsProxyModules;
+  };
+  hostChDnsProxyDisabled = mkHost {
+    guests = chDnsProxyGuestSet {
+      enable = true;
+      dns.enable = false;
+    };
+    modules = chDnsProxyModules;
+  };
+
+  # §3(c) fix D: a nested proxy host reached by two client kinds. The nested
+  # client (`litellm`) stays on its own gateway; the host-side VM (`dev`) must
+  # target the container-host VM's trunk IP, not the container's `trs1` IP.
+  hostNestedProxyClient = mkHost {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      proxy = {
+        enable = true;
+        kind = "container";
+        id = 4;
+        internet = true;
+        host = "ch";
+      };
+      litellm = {
+        enable = true;
+        kind = "container";
+        id = 12;
+        internet = false;
+        host = "ch";
+        proxy = {
+          enable = true;
+          allowHosts = ["nested.example"];
+        };
+        systemConfig = proxyHostProbe;
+      };
+      dev = {
+        enable = true;
+        kind = "vm";
+        id = 7;
+        internet = false;
+        proxy = {
+          enable = true;
+          allowHosts = ["dev.example"];
+        };
+        systemConfig = proxyHostProbe;
+      };
+    };
+    modules = [{tartarus.proxy = {
+      enable = true;
+      location = "proxy";
+      port = 3128;
+    }; }];
+  };
+
+  # Darwin counterpart: the container-host VM `ch` (id 5) is reached at its
+  # deterministic vmnet-shared address (5 + 42 = 192.168.64.47).
+  hostNestedProxyClientDarwin = mkDarwinHostWith {
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      proxy = {
+        enable = true;
+        kind = "container";
+        id = 4;
+        internet = true;
+        host = "ch";
+      };
+      dev = {
+        enable = true;
+        kind = "vm";
+        id = 7;
+        internet = false;
+        proxy = {
+          enable = true;
+          allowHosts = ["dev.example"];
+        };
+        systemConfig = proxyHostProbe;
+      };
+    };
+    modules = [{tartarus.proxy = {
+      enable = true;
+      location = "proxy";
+      port = 3128;
+    }; }];
+  };
+
   hostBadStatic101 = mkHost {
     guests.big = {
       enable = true;
@@ -847,6 +1196,30 @@
   natGuest = hostGuestNft.tartarus_nat.content;
   vmInputGuest = inputPart "vm" hostGuestNft.tartarus_vm.content;
 
+  # Native container proxy host + VM client.
+  hostProxyCtnNft = nftOf hostProxyCtn;
+  vmForwardProxyCtn = forwardPart "vm" hostProxyCtnNft.tartarus_vm.content;
+  natProxyCtn = hostProxyCtnNft.tartarus_nat.content;
+
+  # Nested container proxy host inside `ch`.
+  hostProxyNestedNft = nftOf hostProxyInVm;
+  vmForwardProxyNested = forwardPart "vm" hostProxyNestedNft.tartarus_vm.content;
+  natProxyNested = hostProxyNestedNft.tartarus_nat.content;
+
+  # DNS resolver firewall rules.
+  hostDnsNativeNft = nftOf hostDnsNative;
+  vmForwardDnsNative = forwardPart "vm" hostDnsNativeNft.tartarus_vm.content;
+  ctnForwardDnsNative = forwardPart "container" hostDnsNativeNft.tartarus_container.content;
+  hostDnsNestedNft = nftOf hostDnsNested;
+  vmForwardDnsNested = forwardPart "vm" hostDnsNestedNft.tartarus_vm.content;
+
+  # Engine-resolved resolver addresses per client kind (host -> guest chain).
+  dnsNativeRecord = hostDnsNative.config.tartarus.instances.dnsResolver;
+  dnsNativeGuests = mkGuestsFromHost hostDnsNative;
+  dnsNestedGuests = mkGuestsFromHost hostDnsNested;
+  dnsVmResolverGuests = mkGuestsFromHost hostDnsVmResolver;
+  dnsNestedDarwinGuests = mkGuestsFromHostOn "aarch64-darwin" hostDnsNestedDarwin;
+
   # ==== rendered Squid config ===========================================
   squidClients = [
     {
@@ -906,6 +1279,40 @@
           // (lib.optionalAttrs (hostCores != null) {inherit hostCores;});
       };
     };
+
+  # Like `mkGuests` but fed a *real* evaluated host config, so the engine sees
+  # the derived `tartarus.instances` (notably `dnsResolver`). Used by the DNS
+  # resolver probes, which need the full host -> engine chain.
+  mkGuestsFromHostOn = hostSystem: host:
+    self.lib.mkGuests {
+      inherit inputs;
+      nixpkgs = inputs.nixpkgs;
+      system = evalSystem;
+      inherit hostSystem;
+      pkgs = pkgs;
+      hostPkgs = pkgs;
+      homeDir = "/home/user";
+      config = host.config;
+    };
+  mkGuestsFromHost = mkGuestsFromHostOn evalSystem;
+
+  dnsResolverOf = guests: namespace:
+    guests.nixosConfigurations.${namespace}.config.environment.variables.TARTARUS_DNS_RESOLVER;
+
+  # §3(c) nested dns/proxy DNAT + dnsmasq upstream, read off the evaluated VM.
+  chDnsProxyGuests = mkGuestsFromHost hostChDnsProxy;
+  chDnsProxyNft = chDnsProxyGuests.nixosConfigurations."vm-ch".config.networking.nftables.tables.tartarus_inner.content;
+  chDnsProxyDnsmasq = chDnsProxyGuests.nixosConfigurations."vm-ch".config.services.dnsmasq.settings.server;
+  chDnsProxyUpstreamGuests = mkGuestsFromHost hostChDnsProxyUpstream;
+  chDnsProxyUpstreamDnsmasq = chDnsProxyUpstreamGuests.nixosConfigurations."vm-ch".config.services.dnsmasq.settings.server;
+  chDnsProxyDisabledGuests = mkGuestsFromHost hostChDnsProxyDisabled;
+  chDnsProxyDisabledEnable = chDnsProxyDisabledGuests.nixosConfigurations."vm-ch".config.services.dnsmasq.enable;
+
+  # §3(c) fix D: a nested proxy host's client-specific address.
+  nestedProxyClientGuests = mkGuestsFromHost hostNestedProxyClient;
+  nestedProxyClientDarwinGuests = mkGuestsFromHostOn "aarch64-darwin" hostNestedProxyClientDarwin;
+  proxyHostOf = guests: namespace:
+    guests.nixosConfigurations.${namespace}.config.environment.variables.TARTARUS_PROXY_HOST;
 
   envText = guests: name:
     guests.nixosConfigurations."vm-${name}".config.home-manager.users.user.home.file.".config/environment.d/10-tartarus.conf".text;
@@ -1568,7 +1975,7 @@ in {
     "assertions/proxy-location-missing" =
       T (!assertionsPass hostBadLocationMissing) "proxy.location naming an unknown guest was accepted";
     "assertions/proxy-location-container" =
-      T (!assertionsPass hostBadLocationContainer) "proxy.location naming a container was accepted";
+      T (assertionsPass hostLocationContainer) "proxy.location naming an enabled internet container was rejected";
     "assertions/proxy-location-no-internet" =
       T (!assertionsPass hostBadLocationNoInternet) "proxy.location naming a non-internet VM was accepted";
     "assertions/proxy-location-guest-ok" =
@@ -1603,6 +2010,10 @@ in {
       T (!assertionsPass hostContainerHostOnContainer) "vm.containerHost.enable on a container was accepted";
     "assertions/host-on-vm-rejected" =
       T (!assertionsPass hostHostOnVm) "`host` on a kind = \"vm\" guest was accepted";
+    "assertions/dns-location-ok" =
+      T (assertionsPass hostDnsNative) "a valid `tartarus.dns.location` was rejected";
+    "assertions/dns-location-missing-rejected" =
+      T (!assertionsPass hostDnsMissing) "`tartarus.dns.location` naming an unknown guest was accepted";
     "types/mem-null-and-host-ok" =
       T (assertionsPass hostMemNullHost && resourceFieldsOk hostMemNullHost) "null/\"host\" mem or vcpu was rejected";
     "types/mem-bad-rejected" =
@@ -1814,6 +2225,44 @@ in {
         && hasInfix "ip saddr 10.202.0.6 ip daddr 10.200.0.1 counter accept" chProxyFilter)
       "a proxy-only nested container is not fenced to the VM gateway";
 
+    # §3(c): a resolver/proxy service container nested in this VM is reached at
+    # the VM's trunk address and DNATed inward on eth0. This fixture has no
+    # dnatPorts/relays, so it also proves the prerouting guard was widened.
+    "container-host/nested-dns-dnat" =
+      T
+      (hasInfix "iifname \"eth0\" udp dport 53 counter dnat ip to 10.202.0.3:53" chDnsProxyNft
+        && hasInfix "iifname \"eth0\" tcp dport 53 counter dnat ip to 10.202.0.3:53" chDnsProxyNft)
+      "the nested resolver's :53 is not DNATed inward from eth0";
+    "container-host/nested-proxy-service-dnat" =
+      T
+      (hasInfix "iifname \"eth0\" tcp dport 3128 counter dnat ip to 10.202.0.4:3128" chDnsProxyNft)
+      "the nested proxy service's :3128 is not DNATed inward from eth0";
+    "container-host/dnsmasq-default-upstream" =
+      T
+      (chDnsProxyDnsmasq == ["10.200.0.1"])
+      "dnsmasq upstream does not default to the VM's own gateway";
+    "container-host/dnsmasq-upstream-override" =
+      T
+      (chDnsProxyUpstreamDnsmasq == ["192.168.64.51"])
+      "vm.containerHost.dns.upstream was not used as the dnsmasq server";
+    "container-host/dnsmasq-disabled" =
+      T
+      (chDnsProxyDisabledEnable == false)
+      "vm.containerHost.dns.enable = false did not disable dnsmasq";
+
+    # §3(c) fix D: the proxy host's address depends on the *client*. A nested
+    # client keeps its own gateway; a host-side VM reaches the container-host
+    # VM's trunk IP, never the nested container's `trs1` address.
+    "container-host/nested-proxy-client-address" =
+      T
+      (proxyHostOf nestedProxyClientGuests "ctn-litellm" == "10.202.0.1"
+        && proxyHostOf nestedProxyClientGuests "vm-dev" == "10.200.0.5")
+      "a nested proxy host resolves to the wrong address for one of its clients";
+    "container-host/nested-proxy-client-address-darwin" =
+      T
+      (proxyHostOf nestedProxyClientDarwinGuests "vm-dev" == "192.168.64.47")
+      "a Darwin host-side client does not resolve the nested proxy at the host VM's vmnet address";
+
     # Force the nested container's own evaluation: its config must resolve with
     # inner-bridge addressing. `tryEval` so a heavy/fragile nested eval reports
     # rather than crashing the whole suite.
@@ -2012,8 +2461,68 @@ in {
       inStr "ip daddr 10.200.0.5 counter return comment \"proxy-no-masq\"" natGuest;
     "nft-cross/no-host-proxy-input" =
       notInStr "vclient-proxy" vmInputGuest;
+    # A container proxy target: the VM client's rule keeps the client bridge
+    # (`trs0`) and targets the container's `trs1` IP, and the NAT table exempts
+    # that target from masquerading (R2).
+    "nft-cross/vm-client-to-container-proxy" =
+      inStr "iifname \"trs0\" ip saddr 10.200.0.8 ip daddr 10.201.0.4 tcp dport 3128 counter accept comment \"vclient-to-proxy\"" vmForwardProxyCtn;
+    "nft-cross/container-proxy-no-masq" =
+      inStr "ip daddr 10.201.0.4 counter return comment \"proxy-no-masq\"" natProxyCtn;
+    # A nested container proxy is reached at its container-host VM's address,
+    # never at the container's own `trs1` IP.
+    "nft-cross/nested-target-is-host-vm" =
+      T
+      (hasInfix "ip daddr 10.200.0.5 counter return comment \"proxy-no-masq\"" natProxyNested
+        && !hasInfix "10.201.0.4" natProxyNested)
+      "a nested container proxy target did not resolve to its container-host VM";
+    "nft-cross/vm-client-to-nested-proxy" =
+      inStr "iifname \"trs0\" ip saddr 10.200.0.8 ip daddr 10.200.0.5 tcp dport 3128 counter accept comment \"vclient-to-proxy\"" vmForwardProxyNested;
+    # The explicit /32 host route follows the target's subnet: the container
+    # bridge for a native target, the vm bridge for a nested one, and never a
+    # bridge that does not own the address.
+    "nft-cross/container-proxy-route-on-ctn-bridge" =
+      T (lib.any (r: r.Destination == "10.201.0.4/32") hostProxyCtn.config.systemd.network.networks."10-trs1".routes) "the container proxy /32 route is not on the container bridge";
+    "nft-cross/container-proxy-route-not-on-vm-bridge" =
+      T (hostProxyCtn.config.systemd.network.networks."10-trs0".routes == []) "the container proxy /32 route leaked onto the vm bridge";
+    "nft-cross/nested-proxy-route-on-vm-bridge" =
+      T (lib.any (r: r.Destination == "10.200.0.5/32") hostProxyInVm.config.systemd.network.networks."10-trs0".routes) "a nested proxy's host-VM /32 route is missing from the vm bridge";
     "nft-cross/resolved-listen-guest-proxy" =
       T (lib.sort (a: b: a < b) hostGuestProxy.config.tartarus.proxy.resolvedListenAddresses == ["10.200.0.1" "10.201.0.1"]) "guest-hosted proxy listen addresses changed";
+
+    # ---- nftables snapshots: DNS service guest --------------------------
+    # A VM client reaches a native container resolver across the bridges
+    # (`trs0` -> `trs1`); a native container client reaches it same-bridge.
+    "nft-dns/native-resolver-vm-client-udp" =
+      inStr "iifname \"trs0\" ip daddr 10.201.0.3 udp dport 53 counter accept comment \"dns-resolver\"" vmForwardDnsNative;
+    "nft-dns/native-resolver-vm-client-tcp" =
+      inStr "iifname \"trs0\" ip daddr 10.201.0.3 tcp dport 53 counter accept comment \"dns-resolver\"" vmForwardDnsNative;
+    "nft-dns/native-resolver-container-client" =
+      inStr "iifname \"trs1\" ip daddr 10.201.0.3 udp dport 53 counter accept comment \"dns-resolver\"" ctnForwardDnsNative;
+    # A nested resolver is reached at its container-host VM's trunk IP.
+    "nft-dns/nested-resolver-at-host-vm" =
+      inStr "iifname \"trs0\" ip daddr 10.200.0.9 udp dport 53 counter accept comment \"dns-resolver\"" vmForwardDnsNested;
+    "nft-dns/no-legacy-network-rule" =
+      notInStr "network-vm-dns" vmForwardDnsNative;
+
+    # ---- DNS resolver record + per-client-kind address ------------------
+    "dns/instances-resolver-record" =
+      T
+      (dnsNativeRecord.name == "dns"
+        && dnsNativeRecord.kind == "container"
+        && dnsNativeRecord.id == 3
+        && dnsNativeRecord.ip == "10.201.0.3"
+        && dnsNativeRecord.hostVm == null)
+      "tartarus.instances.dnsResolver record changed";
+    "dns/native-resolver-vm-client" =
+      T (dnsResolverOf dnsNativeGuests "vm-dev" == "10.201.0.3") "a Linux VM client did not get the resolver container's trs1 IP";
+    "dns/nested-resolver-vm-client" =
+      T (dnsResolverOf dnsNestedGuests "vm-dev" == "10.200.0.9") "a Linux VM client did not get a nested resolver's container-host VM IP";
+    "dns/nested-resolver-nested-client" =
+      T (dnsResolverOf dnsNestedGuests "ctn-inner" == "none") "a nested client did not keep its own dnsmasq gateway (null resolver)";
+    "dns/vm-resolver-vm-client" =
+      T (dnsResolverOf dnsVmResolverGuests "vm-dev" == "10.200.0.3") "a VM resolver was not resolved to its trunk IP";
+    "dns/nested-resolver-darwin-vm-client" =
+      T (dnsResolverOf dnsNestedDarwinGuests "vm-dev" == "192.168.64.51") "a Darwin VM client did not get a nested resolver's container-host VM vmnet IP";
 
     # ---- generated environment.d proxy variables ------------------------
     "env/http-proxy" = inStr "HTTP_PROXY=http://10.200.0.1:3128" envLinux;
@@ -2169,5 +2678,13 @@ in {
     vmInput = inputPart "vm" vmContent;
     ctnInput = inputPart "container" ctnContent;
     resolvedListenHost = hostOk.config.tartarus.proxy.resolvedListenAddresses;
+    vmForwardProxyCtn = vmForwardProxyCtn;
+    natProxyCtn = natProxyCtn;
+    vmForwardProxyNested = vmForwardProxyNested;
+    vmForwardDnsNative = vmForwardDnsNative;
+    ctnForwardDnsNative = ctnForwardDnsNative;
+    vmForwardDnsNested = vmForwardDnsNested;
+    chDnsProxyNft = chDnsProxyNft;
+    chDnsProxyDnsmasq = chDnsProxyDnsmasq;
   };
 }

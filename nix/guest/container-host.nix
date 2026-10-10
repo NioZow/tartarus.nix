@@ -17,7 +17,7 @@
 # cgroup-v2 delegation, host-key permissions over virtiofs, persisted state
 # across a VM restart) was intentionally skipped. Everything here evaluates,
 # but the runtime behaviours are unverified until that spike is run.
-{innerContainers ? []}: {
+{innerContainers ? [], dnsLocation ? null, proxyLocation ? null}: {
   config,
   lib,
   pkgs,
@@ -31,6 +31,7 @@
     concatMapStringsSep
     dirOf
     filter
+    findFirst
     hasPrefix
     listToAttrs
     map
@@ -46,6 +47,12 @@
   sharePolicy = import ../lib/shares.nix {inherit lib;};
 
   ch = g.vm.containerHost;
+
+  # The nested resolver/proxy service containers, when they are hosted by
+  # THIS VM (named by the host's `tartarus.dns.location` /
+  # `tartarus.proxy.location`).
+  dnsInner = findFirst (inner: inner.name == dnsLocation) null innerContainers;
+  proxyInner = findFirst (inner: inner.name == proxyLocation) null innerContainers;
 
   # The inner network identity. `mkGuest` normalizes `containerHost` for
   # hand-written sample configs, so these are always present; the defaults are
@@ -83,6 +90,20 @@
   dnatPorts =
     unique (servicePorts
       ++ optional anyInnerProxy g.proxy.port);
+
+  # The host reaches a nested resolver/proxy service container at this VM's
+  # trunk address; DNAT the service ports on `eth0` inward to the container.
+  # Unlike the relay path below there is no host socat involved: the client
+  # dials the VM directly, so this is the only hop.
+  nestedServiceRules =
+    (optionalString (dnsInner != null) ''
+      iifname "eth0" udp dport 53 counter dnat ip to ${ids.mkInnerIP dnsInner.id}:53 comment "inner-dns"
+      iifname "eth0" tcp dport 53 counter dnat ip to ${ids.mkInnerIP dnsInner.id}:53 comment "inner-dns"
+    '')
+    + (optionalString (proxyInner != null) ''
+      iifname "eth0" tcp dport ${toString g.proxy.port} counter dnat ip to ${ids.mkInnerIP proxyInner.id}:${toString g.proxy.port} comment "inner-proxy"
+    '');
+  hasNestedServices = dnsInner != null || proxyInner != null;
 
   # Nested containers that must not egress directly: their traffic is dropped
   # in `forward` except for the VM gateway (proxy + host services + DNS).
@@ -246,7 +267,7 @@ in {
       tartarus_inner = {
         family = "inet";
         content = ''
-          ${optionalString (dnatPorts != [] || relayForwards != []) ''
+          ${optionalString (dnatPorts != [] || relayForwards != [] || hasNestedServices) ''
             chain prerouting {
               type nat hook prerouting priority dstnat; policy accept;
 
@@ -254,6 +275,7 @@ in {
               iifname "${bridge}" ip daddr ${hostIP} tcp dport { ${concatMapStringsSep ", " toString dnatPorts} } counter dnat ip to ${g.platform.gateway} comment "inner-host-services"
             ''}
               ${relayRules}
+              ${nestedServiceRules}
             }
           ''}
           chain postrouting {
@@ -279,9 +301,11 @@ in {
     };
 
   # A minimal resolver the inner containers can use: listen on the inner bridge
-  # and forward to the VM's own upstream gateway. `resolveLocalQueries = false`
-  # keeps the VM's own DNS unchanged (network.nix points it at the gateway).
-  services.dnsmasq = {
+  # and forward upstream. `resolveLocalQueries = false` keeps the VM's own DNS
+  # unchanged (network.nix points it at the gateway). `ch.dns.upstream = null`
+  # forwards to the VM's own upstream gateway; an address sends inner queries
+  # to a resolver guest instead.
+  services.dnsmasq = optionalAttrs ch.dns.enable {
     enable = true;
     resolveLocalQueries = false;
     settings = {
@@ -290,7 +314,7 @@ in {
       # Bind when the address appears rather than requiring the bridge to be up
       # at dnsmasq start; the bridge is created by systemd-networkd.
       bind-dynamic = true;
-      server = [g.platform.gateway];
+      server = [(if ch.dns.upstream != null then ch.dns.upstream else g.platform.gateway)];
       no-resolv = true;
     };
   };
