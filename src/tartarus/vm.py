@@ -28,6 +28,12 @@ from .process import run_quiet
 # Guards infinite recursion when a dependency cycle exists at runtime.
 _STARTING: set[str] = set()
 
+# How long to wait for microvm-shutdown's graceful ACPI path before falling
+# back to SIGKILL. The helper itself waits for QEMU to exit, so this is the
+# upper bound on the graceful attempt; a guest that ignores the powerdown must
+# not pin `tartarus stop` open indefinitely.
+GRACEFUL_SHUTDOWN_SECONDS = 10.0
+
 # ---------------------------------------------------------------------------
 # Darwin relay lifecycle (launchctl glue)
 # ---------------------------------------------------------------------------
@@ -550,7 +556,20 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
     else:
         shutdown_bin = state / "result/bin/microvm-shutdown"
         if shutdown_bin.exists():
-            run_quiet([str(shutdown_bin)], cwd=state, debug=debug)
+            # microvm-shutdown loops until QEMU's QMP socket stops accepting
+            # connections, i.e. until the guest actually exits. A guest that
+            # ignores the ACPI powerdown (common on Linux) never exits, so
+            # without a bound this call blocks forever and the SIGKILL
+            # fallback below is never reached.
+            try:
+                run_quiet(
+                    [str(shutdown_bin)],
+                    cwd=state,
+                    debug=debug,
+                    timeout=GRACEFUL_SHUTDOWN_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                warn(f"'{name}' did not shut down within {GRACEFUL_SHUTDOWN_SECONDS:.0f}s; forcing.")
 
         pid = int((state / "microvm.pid").read_text().strip())
         for _ in range(100):

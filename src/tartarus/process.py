@@ -50,6 +50,7 @@ def run_quiet(
     cwd: Path | None = None,
     debug: bool = False,
     check: bool = False,
+    timeout: float | None = None,
 ) -> None:
     """Run ``cmd`` with stdin always at ``/dev/null``.
 
@@ -58,13 +59,25 @@ def run_quiet(
     at EOF, as systemd gives ``ExecStop``. Left inherited, an interactive
     terminal never reaches EOF and this hangs forever regardless of whether
     the guest shut down cleanly.
+
+    ``timeout`` (seconds) bounds the child: on expiry the child is killed and
+    ``subprocess.TimeoutExpired`` propagates to the caller. This matters for
+    ``microvm-shutdown``, whose graceful path waits out a guest that may never
+    honour the ACPI powerdown.
     """
     if debug:
-        subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, check=check)
+        subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, check=check, timeout=timeout)
         return
 
     if check:
-        result = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
         if result.returncode != 0:
             err = result.stderr.strip() or result.stdout.strip()
             die(f"command failed ({result.returncode}): {' '.join(cmd)}\n{err}")
@@ -75,4 +88,5 @@ def run_quiet(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            timeout=timeout,
         )
