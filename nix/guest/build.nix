@@ -18,7 +18,6 @@
 #   MICROVM_ID_OVERRIDE       forced id/CID for a numbered VM instance
 #   MICROVM_EXTRA_SHARES      JSON list of ad-hoc `vm start --mount` shares
 #   TARTARUS_HOST_UID         invoking host uid (virtiofs ownership)
-#   HOME                      invoking host home (share sources, pubkey)
 #
 # Container instances use CONTAINER_INSTANCE_SUFFIX / CONTAINER_ID_OVERRIDE.
 # ---------------------------------------------------------------------------
@@ -38,11 +37,13 @@
   ids = import ../lib/ids.nix {inherit lib;};
 
   # ==== impure instance/shares interface (see header) ====
-  homeEnv = builtins.getEnv "HOME";
-  hostHome =
-    if homeEnv != ""
-    then homeEnv
-    else homeDir;
+  # The host user's home, for the client pubkey and VM share sources. Taken from
+  # the caller's `homeDir` rather than the ambient `$HOME`: a native container is
+  # built inside `nixos-rebuild`, which runs as root, so `$HOME` is `/root` and
+  # the guest would bake `/root/.ssh/containers.pub` (missing) into its
+  # authorized_keys. `mkGuests` already resolves `homeDir` from `$HOME` for the
+  # standalone/ad-hoc path, so that behaviour is unchanged.
+  hostHome = homeDir;
 
   hostUidRaw = builtins.getEnv "TARTARUS_HOST_UID";
   hostUid =
@@ -110,7 +111,8 @@
         then null
         else let
           vmGuests = lib.filterAttrs (_: gg: gg.enable && gg.kind == "vm") guests;
-        in (ids.assignIds vmGuests).${target.host} or null;
+        in
+          (ids.assignIds vmGuests).${target.host} or null;
     in
       if targetId == null
       then null
