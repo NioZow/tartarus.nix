@@ -176,6 +176,13 @@
     vmDefaults = {
       vcpu = 1;
       mem = 768;
+      # Memory ballooning is on by default (free page reporting is automatic and
+      # safe). Defaults mirror `nix/lib/types.nix`'s vmExtras submodule so a
+      # hand-written sample config (which skips the submodule) still resolves.
+      balloon = {
+        enable = true;
+        deflateOnOOM = true;
+      };
       persistentHome = {
         enable = false;
         size = 5120;
@@ -203,6 +210,7 @@
       vmDefaults
       // vmCfg
       // {
+        balloon = vmDefaults.balloon // (vmCfg.balloon or {});
         persistentHome = vmDefaults.persistentHome // (vmCfg.persistentHome or {});
         nixStoreOverlay = vmDefaults.nixStoreOverlay // (vmCfg.nixStoreOverlay or {});
         containerHost =
@@ -422,6 +430,13 @@
       // {
         vcpu = lib.mkIf (resolvedVcpu != null) resolvedVcpu;
         mem = lib.mkIf (resolvedMem != null) resolvedMem;
+      }
+      # virtio-balloon is QEMU-only; vfkit has no balloon device and throws if
+      # asked, so only wire it on Linux. Ballooning is on by default, so this
+      # guard is what makes Darwin guests a no-op rather than an error.
+      // lib.optionalAttrs guest.platform.isLinux {
+        balloon = lib.mkIf guest.vm.balloon.enable true;
+        deflateOnOOM = lib.mkIf guest.vm.balloon.enable guest.vm.balloon.deflateOnOOM;
       };
   };
 

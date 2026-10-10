@@ -108,6 +108,30 @@ in {
         default = 768;
         description = "Guest memory in MiB (VM only): a positive integer, `null` for the hypervisor default, or `\"host\"` for a host-sized cap.";
       };
+      balloon = {
+        enable = mkOption {
+          type = types.bool;
+          default = true;
+          description = ''
+            Enable the virtio-balloon and free page reporting (VM only,
+            Linux/QEMU). Defaults to `true`: free page reporting is automatic and
+            safe (the guest hands its already-free pages back to the host), so
+            idle VMs cost the host less than `vm.mem`. The balloon device itself
+            is host-driven and only changes size when you ask it to (see the
+            README's "Memory management"). Silently ignored on Darwin (vfkit has
+            no balloon device) and on containers.
+          '';
+        };
+        deflateOnOOM = mkOption {
+          type = types.bool;
+          default = true;
+          description = ''
+            Auto-deflate the balloon when the guest runs out of memory, letting
+            it reclaim memory the host took back (VM only, Linux/QEMU). Only
+            meaningful after the balloon has been inflated manually.
+          '';
+        };
+      };
       containerHost = {
         enable = mkEnableOption "hosting nested systemd-nspawn containers inside this VM";
 

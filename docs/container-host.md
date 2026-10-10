@@ -311,14 +311,16 @@ guest uses the `"host"` sentinel.
 
 ### Ballooning verdict
 
-Memory ballooning is a **documented non-goal**. The pinned microvm.nix does
-expose `microvm.balloon` and a virtio-mem hotplug pair, and QEMU implements
-ballooning — but vfkit/VZ (the macOS hypervisor the container host runs on)
-throws `"vfkit does not support memory ballooning"`. Since the feature is
-macOS-first and Linux already has native nspawn, ballooning cannot be enabled
-on the target hypervisor. The practical mitigation is the `mem = "host"` cap,
-which is host-backed and faulted on demand. Revisit if microvm.nix gains
-vfkit/VZ `VZMemoryBalloonDevice` support.
+Memory ballooning is **on by default on Linux/QEMU VMs** (including a Linux
+container-host VM): `vm.balloon.enable` defaults to `true` and wires
+`virtio-balloon` with `free-page-reporting=on`, so an idle VM hands its unused
+pages back to the host automatically. It remains **unavailable on the macOS
+container host**: vfkit/VZ (the hypervisor it runs on there) throws
+`"vfkit does not support memory ballooning"`, so the engine gates the device to
+Linux (`platform.isLinux`) and silently ignores the option on Darwin. The
+practical mitigation on macOS is still the `mem = "host"` cap, which is
+host-backed and faulted on demand. Revisit if microvm.nix gains vfkit/VZ
+`VZMemoryBalloonDevice` support.
 
 ## 12. Consumer: nixcfg `ssh.nix`
 

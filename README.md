@@ -132,7 +132,9 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `services.sshAgentProxy` | bool | `false` | Forward the host ssh-agent into the guest. |
 | `services.sudoAuthProxy` | bool | `false` | PAM sudo authentication proxy. |
 | `services.disableVsock` | bool | `false` | Force TCP instead of VSOCK (no-op where VSOCK is unavailable). |
-| `vm.vcpu` / `vm.mem` | int / null / `"host"` | `1` / `768` | VM only. A positive integer, `null` to omit the flag (microvm.nix default: 1 vCPU / 512 MiB), or `"host"` to cap at `tartarus.hostCores` / `tartarus.hostMemoryMiB`. |
+| `vm.vcpu` / `vm.mem` | int / null / `"host"` | `1` / `768` | VM only. A positive integer, `null` to omit the flag (microvm.nix default: 1 vCPU / 512 MiB), or `"host"` to cap at `tartarus.hostCores` / `tartarus.hostMemoryMiB`. See [Memory management](#memory-management). |
+| `vm.balloon.enable` | bool | `true` | VM only, Linux/QEMU. virtio-balloon + free page reporting. Free page reporting is automatic (the guest returns unused RAM to the host); the balloon itself is for manual resizing via `microvm-balloon`. Silently ignored on Darwin (vfkit has no balloon device) and on containers. Set `false` to opt out. |
+| `vm.balloon.deflateOnOOM` | bool | `true` | VM only. Auto-deflate the balloon on guest out-of-memory. Only meaningful after manually inflating it with `microvm-balloon`. |
 | `vm.persistentHome.enable` / `.size` | bool / int | `false` / `5120` | VM only, writable home disk image (MiB). |
 | `vm.nixStoreOverlay.size` | int | `2048` | VM only, writable `/nix/store` overlay (MiB). |
 | `vm.containerHost.enable` | bool | `false` | VM only. Host nested `systemd-nspawn` containers inside this VM (macOS-first container-host model). |
@@ -160,6 +162,65 @@ trust (`tartarus.ssh.*`), the generated CLI config
 (`tartarus.flakePath`, `tartarus.stateRoot`, `tartarus.sshDir`,
 `tartarus.system`, `tartarus.log`), and the host resource ceilings that resolve
 `vm.mem` / `vm.vcpu = "host"` (`tartarus.hostMemoryMiB`, `tartarus.hostCores`).
+
+### Memory management
+
+A guest's RAM is fixed at boot (`vm.mem`, default 768 MiB), and the guest's
+*usable* memory stays at that size for its whole lifetime — there is no memory
+hotplug on QEMU's `microvm` machine type. What is dynamic is only how much of
+that allocation the **host** actually keeps resident. Three related mechanisms
+return memory to the host; only some are automatic, and they are easy to
+confuse:
+
+**Free page reporting — automatic, always safe, on by default.** Every Linux VM
+gets `vm.balloon.enable = true` unless you opt out (Darwin/vfkit and containers
+ignore it: vfkit has no balloon device). It makes QEMU advertise
+`free-page-reporting=on`. When the guest kernel frees a batch of pages it
+notifies the host, which discards them and drops the VM's host RSS. There is no
+controller and no scanning, it only ever touches pages the guest has **already
+freed**, and the guest can always re-touch them (they are re-faulted on demand).
+So an idle 768 MiB VM might really cost the host far less, with no risk to the
+guest. It does nothing for a VM pinned at 100% memory.
+
+**The virtio-balloon — manual, host-driven.** The balloon is a fake device whose
+size the **host** sets, never the guest. "Inflating" it asks the guest driver to
+allocate N MiB *inside the guest* and hand those pages to the host, which can
+then reuse them while the guest sees N MiB less usable RAM; "deflating" gives
+them back. To satisfy the target the guest kernel has to reclaim its own memory
+(drop caches, swap, ...) — i.e. it must be **under pressure to release** pages
+it was actively using. That is why the balloon can reclaim *in-use* memory, and
+also why over-inflating can hurt the guest. **Nothing does this for you:**
+neither tartarus nor QEMU watches host memory pressure, so the balloon stays at
+0 until you set it yourself over **QMP** (QEMU Machine Protocol, QEMU's JSON
+control socket) using the runner's helper:
+
+```bash
+# Run while the VM is up, from its state dir (where the QMP socket lives).
+# <MiB> is the balloon size; 0 deflates it fully.
+cd ~/.local/state/tartarus/<vm>
+./result/bin/microvm-balloon 512
+```
+
+**deflate-on-OOM — automatic safety valve for the balloon.** With
+`vm.balloon.deflateOnOOM = true` (default), if the guest is about to run out of
+memory QEMU automatically shrinks the balloon and gives memory back to the guest
+so it is not OOM-killed. It has no effect until the balloon has been inflated.
+
+| Mechanism | Triggered by | Pages affected | Automatic? | Returns RAM to host |
+| --- | --- | --- | --- | --- |
+| Free page reporting | the guest kernel | pages already free | **yes** | yes (idle memory) |
+| Balloon inflation | the host, via QMP / `microvm-balloon` | in-use pages forced out of the guest | **no** | yes (in-use memory) |
+| deflate-on-OOM | QEMU, when the guest nears OOM | returns ballooned pages to the guest | yes | no (the opposite) |
+
+**Shared memory is already active on Linux.** Because every VM has host shares
+(`ro-store`, `tartarus-ssh`, `tartarus-x509`), microvm.nix backs guest RAM with a
+shared memfd (`memory-backend-memfd ...,share=on` plus `-numa node,memdev=mem`),
+which is what enables zero-copy host access to guest memory. There is no separate
+option and nothing to turn on.
+
+**KSM and hugepages are not available.** KSM only merges *anonymous* pages, and
+the shares-forced memfd backend is shmem (not KSM-eligible); microvm.nix honours
+`hugepageMem` only on cloud-hypervisor, which tartarus does not use.
 
 ### Assertions (evaluation errors)
 

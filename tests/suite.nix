@@ -1255,6 +1255,62 @@
     })
     .nixosConfigurations."vm-v";
 
+  # ==== P6: memory ballooning ===========================================
+  # Ballooning is on by default (Linux/QEMU VMs). These fixtures cover the
+  # default, the opt-out, the `deflateOnOOM` override, and the Darwin gate.
+  memBalloonDefaultVm =
+    (mkGuests {
+      globalProxy.enable = false;
+      guests.v = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+      };
+    })
+    .nixosConfigurations."vm-v";
+
+  memBalloonOffVm =
+    (mkGuests {
+      globalProxy.enable = false;
+      guests.v = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.balloon.enable = false;
+      };
+    })
+    .nixosConfigurations."vm-v";
+
+  memBalloonNoDeflateVm =
+    (mkGuests {
+      globalProxy.enable = false;
+      guests.v = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.balloon.deflateOnOOM = false;
+      };
+    })
+    .nixosConfigurations."vm-v";
+
+  # vfkit has no balloon device and throws if asked, so the engine must not wire
+  # `microvm.balloon` on Darwin even though the option defaults to true.
+  memBalloonDarwinVm =
+    (mkGuests {
+      hostSystem = "aarch64-darwin";
+      globalProxy.enable = false;
+      guests.v = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+      };
+    })
+    .nixosConfigurations."vm-v";
+
   # ==== standalone service modules ======================================
   # The three service packages must be usable from *any* NixOS/home-manager
   # config with no tartarus host/guest module anywhere in the closure. Each
@@ -1573,6 +1629,22 @@ in {
       in
         !r.success)
       "\"host\" with an unset host option did not fail evaluation";
+
+    # ---- P6: memory ballooning ------------------------------------------
+    "types/balloon-default-on" =
+      T
+      (memBalloonDefaultVm.config.microvm.balloon && memBalloonDefaultVm.config.microvm.deflateOnOOM)
+      "memory ballooning is not enabled by default on a Linux VM";
+    "types/balloon-opt-out" =
+      T (!memBalloonOffVm.config.microvm.balloon) "vm.balloon.enable = false did not disable ballooning";
+    "types/balloon-deflate-override" =
+      T
+      (memBalloonNoDeflateVm.config.microvm.balloon && !memBalloonNoDeflateVm.config.microvm.deflateOnOOM)
+      "vm.balloon.deflateOnOOM override did not reach microvm.deflateOnOOM";
+    "types/balloon-darwin-gated-off" =
+      T
+      (!memBalloonDarwinVm.config.microvm.balloon)
+      "ballooning was wired on Darwin (vfkit has no balloon device)";
 
     # ---- inner containers on a container-host VM (P2 build engine) ------
     # A nested container is Linux-inner regardless of the host platform: the

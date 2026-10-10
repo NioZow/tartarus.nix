@@ -165,7 +165,7 @@ in {
         vm = mkOption {
           type = shared.vmExtras;
           default = {};
-          description = "VM-only extras (vcpu, mem, persistent home, nix store overlay); ignored for containers.";
+          description = "VM-only extras (vcpu, mem, ballooning, persistent home, nix store overlay); ignored for containers.";
         };
 
         firewall = mkOption {
