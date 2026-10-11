@@ -4381,3 +4381,481 @@ def test_build_confirmation_shows_root_for_sudo(sap: types.ModuleType) -> None:
 
     assert confirmation.target_user == "root"
     assert "user -> root" in sap.confirmation_message(confirmation)
+
+
+# --- multi-listener server (doc §4) ----------------------------------------
+#
+# One server process may bind several listeners, each with its own transport,
+# bind target, security model and ACL. The document carries a
+# `[transport_defaults]` table deep-merged into every `[[transports]]` entry;
+# `listener_views` expands that list into the flat per-listener shape the
+# existing transport/security code already accepts, and `run_server` binds all
+# listeners before serving any.
+
+# The shipped multi-listener example (owned by the examples task). It is the
+# exact file an operator copies for a multi-transport host, so the parse test
+# loads it from the repo instead of a private inline copy -- a drift between the
+# documented example and what the server accepts would then fail here.
+_MULTI_LISTENER_EXAMPLE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "examples"
+    / "sudo-auth-proxy-listeners.toml"
+)
+
+
+@contextlib.contextmanager
+def _running_server(
+    sap: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    config: dict,
+) -> Iterator[tuple[list[tuple[Any, Any]], list[BaseException]]]:
+    """Run ``run_server`` in a daemon thread, recording each bound listener.
+
+    The real ``Transport.listen`` still binds real sockets; it is only wrapped to
+    capture the ``(server, transport)`` pairs so the test can stop the otherwise
+    unbounded serve loop. ``run_server`` performs its own cleanup when it
+    returns, so no socket is closed behind its back.
+    """
+    captured: list[tuple[Any, Any]] = []
+    errors: list[BaseException] = []
+    original_listen = sap.Transport.listen
+
+    def capturing_listen(self, handler_cls):
+        server = original_listen(self, handler_cls)
+        captured.append((server, self))
+        return server
+
+    monkeypatch.setattr(sap.Transport, "listen", capturing_listen)
+
+    def runner() -> None:
+        try:
+            sap.run_server(config)
+        except BaseException as error:  # noqa: BLE001 -- surfaced to the caller
+            errors.append(error)
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+
+    expected = len(config["transports"])
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if errors:
+            break
+        if len(captured) >= expected and all(
+            getattr(server, "_sap_serving", False) for server, _ in captured
+        ):
+            break
+        time.sleep(0.01)
+
+    try:
+        yield captured, errors
+    finally:
+        for server, _transport in captured:
+            with contextlib.suppress(Exception):
+                server.shutdown()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "run_server did not stop"
+
+
+def test_listener_expansion_deep_merges_defaults(sap: types.ModuleType) -> None:
+    """Entry fields win; nested tables merge field-by-field, lists replace."""
+    config = {
+        "mode": "server",
+        "transport_defaults": {
+            "port": 65001,
+            "security": {
+                "transport_encryption": "auto",
+                "client_auth": "transport",
+                "server_auth": "transport",
+                "response_ttl": 30,
+            },
+            "mtls": {
+                "enable": False,
+                "ca_file": "./ca.crt",
+                "cert_file": "./server.crt",
+            },
+            "acl": {"mode": "list", "trusted_fingerprints": ["SHA256:aaa"]},
+        },
+        "transports": [
+            {
+                "type": "tcp",
+                "port": 65002,
+                "security": {"transport_encryption": "none"},
+                "acl": {"trusted_fingerprints": ["SHA256:bbb"]},
+            },
+            {"type": "unix", "socket": "/run/x.sock"},
+        ],
+    }
+
+    views = sap.listener_views(config)
+
+    assert len(views) == 2
+    first, second = views
+
+    # an entry wins on a scalar field; the defaults supply the rest
+    assert first["port"] == 65002
+    assert second["port"] == 65001
+
+    # nested tables merge field-by-field: only transport_encryption is overridden
+    assert first["security"] == {
+        "transport_encryption": "none",
+        "client_auth": "transport",
+        "server_auth": "transport",
+        "response_ttl": 30,
+    }
+    assert second["security"]["transport_encryption"] == "auto"
+
+    # a list is replaced wholesale, never concatenated onto the defaults'
+    assert first["acl"]["mode"] == "list"
+    assert first["acl"]["trusted_fingerprints"] == ["SHA256:bbb"]
+    assert second["acl"]["trusted_fingerprints"] == ["SHA256:aaa"]
+
+    # the entry's own bind target overrides the defaults, which survive otherwise
+    assert second["socket"] == "/run/x.sock"
+    assert first["mtls"]["ca_file"] == "./ca.crt"
+
+
+def test_listener_views_map_type_to_transport(sap: types.ModuleType) -> None:
+    """`type` is renamed to `transport`; the globals are carried onto the view."""
+    config = {
+        "mode": "server",
+        "dialog_program": "zenity",
+        "debug": True,
+        "transports": [{"type": "vsock", "cid": 2}],
+    }
+
+    views = sap.listener_views(config)
+
+    assert len(views) == 1
+    view = views[0]
+    assert view["transport"] == "vsock"
+    assert "type" not in view
+    assert view["cid"] == 2
+    assert view["dialog_program"] == "zenity"
+    assert view["debug"] is True
+    assert view["mode"] == "server"
+    assert view["_listener_index"] == 0
+
+
+def test_legacy_flat_config_is_single_listener(sap: types.ModuleType) -> None:
+    """A flat config is one implicit listener, returned unchanged."""
+    flat = {
+        "mode": "server",
+        "transport": "unix",
+        "socket": "/run/x.sock",
+        "security": _server_security(),
+        "acl": _acl_for(sap),
+    }
+
+    views = sap.listener_views(flat)
+
+    assert views == [flat]
+    assert views[0] is flat
+    assert "_listener_index" not in views[0]
+
+
+def test_schema_rejects_flat_key_alongside_transports(sap: types.ModuleType) -> None:
+    """A flat transport/security key next to `transports` is ambiguous."""
+    config = {
+        "mode": "server",
+        "transport": "vsock",
+        "transports": [{"type": "tcp"}],
+    }
+
+    with pytest.raises(sap.SecurityConfigError) as exc:
+        sap.validate_document_schema(config)
+
+    assert "transport" in str(exc.value)
+    assert "top level" in str(exc.value)
+
+
+def test_schema_rejects_unknown_listener_key(sap: types.ModuleType) -> None:
+    """A typo inside a listener entry names the key and offers the real one."""
+    config = {
+        "mode": "server",
+        "transports": [{"type": "tcp", "max_connection": 64}],
+    }
+
+    with pytest.raises(sap.SecurityConfigError) as exc:
+        sap.validate_document_schema(config)
+
+    message = str(exc.value)
+    assert "max_connection" in message
+    assert "max_connections" in message  # the did-you-mean hint
+
+
+def test_load_config_resolves_transport_default_paths(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    """Relative `[mtls]`/`[acl]` paths resolve in defaults and in each entry."""
+    path = tmp_path / "c.toml"
+    path.write_text(
+        "mode = \"server\"\n"
+        "[transport_defaults.mtls]\n"
+        "ca_file = \"./ca.crt\"\n"
+        "[[transports]]\n"
+        "type = \"unix\"\n"
+        "socket = \"/run/x.sock\"\n"
+        "[transports.acl]\n"
+        "mode = \"ca\"\n"
+        "ca_file = \"./acl-ca.crt\"\n"
+        "required_oid = \"1.2.3\"\n"
+    )
+
+    config = sap.load_config(str(path))
+
+    assert config["transport_defaults"]["mtls"]["ca_file"] == str(tmp_path / "ca.crt")
+    assert config["transports"][0]["acl"]["ca_file"] == str(tmp_path / "acl-ca.crt")
+
+
+def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
+    """The shipped multi-listener example loads and expands to three listeners.
+
+    `examples/sudo-auth-proxy-listeners.toml` is the file the multi-transport
+    setup tells an operator to install, so it must load, pass the document
+    schema, and expand to one view per `[[transports]]` entry. Loading it here
+    (rather than an inline copy) keeps the shipped file and the Python in sync.
+    """
+    config = sap.load_config(str(_MULTI_LISTENER_EXAMPLE_PATH))
+
+    sap.validate_document_schema(config, source=str(_MULTI_LISTENER_EXAMPLE_PATH))
+    views = sap.listener_views(config)
+
+    assert len(views) == 3
+    assert [view["transport"] for view in views] == ["vsock", "tcp", "unix"]
+    # a relative path inside a listener resolves next to the config file
+    assert views[2]["mtls"]["ca_file"] == str(_MULTI_LISTENER_EXAMPLE_PATH.parent / "ca.crt")
+
+
+def test_run_server_binds_two_unix_listeners_with_distinct_acls(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One process, two unix listeners, different ACL rules.
+
+    Listener A carries no rule (an authorized request prompts and is approved);
+    listener B carries a deny-all rule, so the same request is answered deny
+    without a dialog. Both listeners are independently reachable.
+    """
+    sock_a = tmp_path / "a" / "server.sock"
+    sock_b = tmp_path / "b" / "server.sock"
+    config = {
+        "mode": "server",
+        "dialog_program": "zenity",
+        "transport_defaults": {
+            "resolution": "none",
+            "socket_dir_mode": "0700",
+            "socket_mode": "0600",
+            "security": _server_security(),
+        },
+        "transports": [
+            {"type": "unix", "socket": str(sock_a), "acl": {"mode": "none"}},
+            {
+                "type": "unix",
+                "socket": str(sock_b),
+                "acl": {"mode": "none", "rule": [{"identity": "*", "policy": "deny"}]},
+            },
+        ],
+    }
+
+    monkeypatch.setattr(sap, "prompt_for_confirmation", lambda _peer, _program: True)
+    monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
+    monkeypatch.setattr(sap, "recursion_guard_active", lambda: False)
+
+    with _running_server(sap, monkeypatch, config) as (captured, errors):
+        assert errors == []
+        assert len(captured) == 2
+
+        monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_a))
+        with pytest.raises(SystemExit) as allowed:
+            sap.run_client(_client_config())
+
+        monkeypatch.setenv("SUDO_AUTH_PROXY_SOCK", str(sock_b))
+        with pytest.raises(SystemExit) as denied:
+            sap.run_client(_client_config())
+
+    assert allowed.value.code == 0
+    assert denied.value.code == 1
+    # run_server's cleanup unlinked each socket it bound
+    assert not sock_a.exists()
+    assert not sock_b.exists()
+
+
+def test_run_server_binds_tcp_and_unix_together(
+    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tcp and a unix listener coexist in one process; both accept."""
+    sock_path = tmp_path / "run" / "server.sock"
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+
+    config = {
+        "mode": "server",
+        "dialog_program": "zenity",
+        "transport_defaults": {
+            "resolution": "none",
+            "socket_dir_mode": "0700",
+            "socket_mode": "0600",
+            "security": _server_security(),
+        },
+        "transports": [
+            {"type": "unix", "socket": str(sock_path), "acl": {"mode": "none"}},
+            {
+                "type": "tcp",
+                "host": "127.0.0.1",
+                "port": port,
+                "acl": {"mode": "none"},
+            },
+        ],
+    }
+
+    monkeypatch.setattr(sap, "verify_unix_peer_is_sshd", lambda *_a, **_k: None)
+
+    with _running_server(sap, monkeypatch, config) as (captured, errors):
+        assert errors == []
+        assert len(captured) == 2
+
+        tcp_client = socket.create_connection(("127.0.0.1", port), timeout=2)
+        unix_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        unix_client.settimeout(2)
+        unix_client.connect(str(sock_path))
+        try:
+            assert tcp_client.fileno() != -1
+            assert unix_client.fileno() != -1
+        finally:
+            tcp_client.close()
+            unix_client.close()
+
+    # the unix listener's socket is unlinked on shutdown
+    assert not sock_path.exists()
+
+
+def test_any_listener_bind_failure_is_fatal(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    """A later bind failure closes the earlier listeners and re-raises."""
+    sock_path = tmp_path / "run" / "server.sock"
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+
+    config = {
+        "mode": "server",
+        "transport_defaults": {
+            "resolution": "none",
+            "socket_dir_mode": "0700",
+            "socket_mode": "0600",
+            "security": _server_security(),
+        },
+        "transports": [
+            {"type": "unix", "socket": str(sock_path), "acl": {"mode": "none"}},
+            {
+                "type": "tcp",
+                "host": "127.0.0.1",
+                "port": port,
+                "acl": {"mode": "none"},
+            },
+        ],
+    }
+
+    try:
+        with pytest.raises(OSError):
+            sap.run_server(config)
+    finally:
+        blocker.close()
+
+    # the first listener was cleaned up, not left half-bound
+    assert not sock_path.exists()
+
+
+def test_listener_views_resolve_security_per_listener(
+    sap: types.ModuleType,
+) -> None:
+    """Each expanded view builds its own `SecurityConfig` (no certs needed).
+
+    `build_security` resolves the three knobs from the view alone, so two
+    listeners with different `[security]` tables resolve different
+    `transport_encryption` without a TLS context being created.
+    """
+    config = {
+        "mode": "server",
+        "transports": [
+            {
+                "type": "unix",
+                "socket": "/run/a.sock",
+                "security": _server_security(),
+                "acl": {"mode": "none"},
+            },
+            {
+                "type": "unix",
+                "socket": "/run/b.sock",
+                "security": _mtls_server_security(),
+                "mtls": {
+                    "enable": True,
+                    "ca_file": "/x/ca.crt",
+                    "cert_file": "/x/s.crt",
+                    "key_file": "/x/s.key",
+                },
+                "acl": {"mode": "list", "trusted_fingerprints": []},
+            },
+        ],
+    }
+
+    views = sap.listener_views(config)
+    resolved = [
+        sap.build_security(view, "server").transport_encryption for view in views
+    ]
+
+    assert resolved == ["none", "mtls"]
+
+
+def test_per_listener_security_isolation(
+    sap: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    x509_material: Any,
+) -> None:
+    """Two listeners resolve different `transport_encryption` in one process."""
+    sock_none = tmp_path / "none" / "server.sock"
+    sock_mtls = tmp_path / "mtls" / "server.sock"
+    config = {
+        "mode": "server",
+        "transport_defaults": {
+            "resolution": "none",
+            "socket_dir_mode": "0700",
+            "socket_mode": "0600",
+        },
+        "transports": [
+            {
+                "type": "unix",
+                "socket": str(sock_none),
+                "security": _server_security(),
+                "acl": {"mode": "none"},
+            },
+            {
+                "type": "unix",
+                "socket": str(sock_mtls),
+                "security": _mtls_server_security(),
+                "mtls": {
+                    "enable": True,
+                    "ca_file": str(x509_material.tmp_path / "ca.crt"),
+                    "cert_file": str(x509_material.tmp_path / "client.crt"),
+                    "key_file": str(x509_material.tmp_path / "client.key"),
+                },
+                "acl": {"mode": "list", "trusted_fingerprints": []},
+            },
+        ],
+    }
+
+    with _running_server(sap, monkeypatch, config) as (captured, errors):
+        assert errors == []
+        assert len(captured) == 2
+        # captured in bind order, i.e. the order of `transports`
+        none_server = captured[0][0]
+        mtls_server = captured[1][0]
+        assert none_server._security.transport_encryption == "none"
+        assert mtls_server._security.transport_encryption == "mtls"
+        assert getattr(none_server, "ssl_context", None) is None
+        assert getattr(mtls_server, "ssl_context", None) is not None

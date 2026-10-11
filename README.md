@@ -329,8 +329,8 @@ the options directly:
 
 | Package | NixOS module | home-manager module | Options |
 | --- | --- | --- | --- |
-| `sudo-auth-proxy` | `nixosModules."sudo-auth-proxy-pam"` (or the legacy `nixosModules."sudo-auth-proxy"`) | `homeManagerModules."sudo-auth-proxy"` | client: `tartarus.sudo-auth-proxy.*`; server: `tartarus.sudo-auth-proxy.server.*` |
-| `ssh-agent-proxy` | `nixosModules."ssh-agent-proxy"` (host-side server) | `homeManagerModules."ssh-agent-proxy"` (server, bridge, agent, merge) | `tartarus.ssh-agent-proxy.{server,bridge,agent,merge}.*`; the server/bridge carry `transport` (`vsock`/`tcp`/`unix`), `socket`/`connectSocket`, `security` (`transportEncryption`/`clientAuth`/`serverAuth`) and `resolution` (`none`/`certificate`/`tartarus`/`mofos`) |
+| `sudo-auth-proxy` | `nixosModules."sudo-auth-proxy-pam"` (or the legacy `nixosModules."sudo-auth-proxy"`) | `homeManagerModules."sudo-auth-proxy"` | client: `tartarus.sudo-auth-proxy.*`; server: `tartarus.sudo-auth-proxy.server.transportDefaults` + `.transports` (a list of `{type,...}` listeners) |
+| `ssh-agent-proxy` | `nixosModules."ssh-agent-proxy"` (host-side server) | `homeManagerModules."ssh-agent-proxy"` (server, bridge, agent, merge) | `tartarus.ssh-agent-proxy.{server,bridge,agent,merge}.*`; the **server** takes `server.transportDefaults` + `server.transports` (a list of `{type,...}` listeners, each with `socket`/`security`/`resolution`), while the **bridge** keeps a single `transport` (`vsock`/`tcp`/`unix`) + `connectSocket` |
 | `clipboard-bridge` | `nixosModules."clipboard-bridge"` (host-side server) | `homeManagerModules."clipboard-bridge"` (server, client, adminClient) | `tartarus.clipboard-bridge.{server,client,adminClient}.*` |
 
 The NixOS `sudo-auth-proxy` client installs the PAM wiring (`pam_exec.so` into
@@ -376,15 +376,53 @@ as `nixosModules."sudo-auth-proxy"`, kept as an alias for compatibility.
 > sets `transportEncryption = "none"` must write `clientAuth = "none"` and
 > `serverAuth = "none"` explicitly. See `docs/sudo-auth-proxy.md` §7 and §14.
 
+The **server** side (home-manager) declares a list of listeners instead of a
+single `transport`. Two listeners in one process, each with its own security:
+
+```nix
+{ inputs, ... }: {
+  imports = [ inputs.tartarus.homeManagerModules."sudo-auth-proxy" ];
+  tartarus.sudo-auth-proxy.server = {
+    enable = true;
+    transportDefaults = {port = 65001; recvTimeout = 0.5; decisionTimeout = 120;};
+    transports = [
+      # unauthenticated MicroVM callback
+      {type = "vsock"; cid = 2;
+       security = {transportEncryption = "none";
+                   clientAuth = "none"; serverAuth = "none";};
+       acl = {mode = "none";};}
+      # authenticated SSH-forwarded remote guest
+      {type = "unix"; socket = "%t/sudo-auth-proxy/server.sock";
+       security = {transportEncryption = "mtls";
+                   clientAuth = "transport"; serverAuth = "transport";};
+       mtls = {enable = true; caFile = "/etc/tartarus/x509/ca.crt";
+               certFile = "/etc/tartarus/x509/host.crt";
+               keyFile = "/etc/tartarus/x509/host.key";};
+       acl = {mode = "ca"; caFile = "/etc/tartarus/x509/ca.crt";
+              requiredOid = "1.3.6.1.4.1.99999.1.2";};}
+    ];
+  };
+}
+```
+
+> **No more mixed-transport warning.** A server binds one listener per
+> `transports` entry, so a `vsock`/`tcp` callback and a `unix` tunnel (or two
+> `unix` listeners with different ACLs) coexist in one process. The old
+> mixed-`vsock`/`tcp` evaluation warning and the `unix`+callback `throw` in
+> `nix/host/services.nix` are gone. The flat server options
+> (`server.transport`/`.host`/`.port`/`.security`/…) were removed with no
+> aliases; the **client/PAM** options are unchanged.
+
 For a host that has no Nix at all, `examples/` carries a ready-to-edit server
 config plus a systemd user unit (`examples/sudo-auth-proxy-server.toml`,
 `examples/sudo-auth-proxy.service`); see `docs/sudo-auth-proxy.md` §15.1.
 
 `ssh-agent-proxy` also runs standalone with plain `ssh -R` and no tartarus:
 `examples/ssh-agent-proxy-server.toml` and `examples/ssh-agent-proxy-client.toml`
-show the single host `unix` socket and the guest-side bridge, for both
-`unix + none` (transparent, wildcard-only) and `unix + mtls` (identity from the
-client certificate). See `docs/ssh-agent-proxy.md`.
+show the host `unix` listener socket (flat form, one implicit listener) and the
+guest-side bridge, for both `unix + none` (transparent, wildcard-only) and
+`unix + mtls` (identity from the client certificate). The server can also carry a
+`server.transports` list; see `docs/ssh-agent-proxy.md` §3.1.
 
 Packages are also directly buildable: `nix build .#sudo-auth-proxy`,
 `.#ssh-agent-proxy`, `.#clipboard-bridge`. All units are created through

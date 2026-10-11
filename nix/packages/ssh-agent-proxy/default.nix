@@ -69,55 +69,192 @@
       ;
     tomlFormat = pkgs.formats.toml {};
 
-    # Reusable `[security]` option set (plan §1.3), shared by the server and
-    # the bridge. `mtls.enable` remains the legacy alias for
-    # `transportEncryption = "mtls"`; the Python layer resolves `auto` from the
-    # transport (tcp → mtls, vsock/unix → none) and never downgrades.
-    mkSecurityOptions = {
-      transportEncryption = mkOption {
-        type = types.enum ["auto" "none" "mtls"];
-        default = "auto";
-        description = ''
-          Whether the byte stream is encrypted and integrity-protected.
-          `auto` (default) follows the transport: `tcp` → `mtls`,
-          `vsock`/`unix` → `none`. `mtls` is an explicit choice and never a
-          runtime fallback.
-        '';
-      };
-      clientAuth = mkOption {
-        type = types.enum ["transport" "none"];
-        default = "transport";
-        description = ''
-          How the server authenticates the requester. `transport` means the
-          identity comes from the mTLS handshake; `none` disables requester
-          authentication entirely (an explicit, warned choice only appropriate
-          on a private-by-construction transport).
-        '';
-      };
-      serverAuth = mkOption {
-        type = types.enum ["transport" "none"];
-        default = "transport";
-        description = ''
-          How the client authenticates the server's messages. `transport`
-          requires `transportEncryption = "mtls"` (and is then forced).
-        '';
-      };
-      connectTimeout = mkOption {
-        type = types.float;
-        default = 10.0;
-        description = "Seconds to wait for the transport connect before failing fast.";
-      };
-      handshakeTimeout = mkOption {
-        type = types.float;
-        default = 10.0;
-        description = "Seconds to wait for the TLS handshake before failing fast.";
-      };
-      decisionTimeout = mkOption {
-        type = types.int;
-        default = 120;
-        description = "Seconds to wait for the human decision (0 = wait indefinitely).";
-      };
+    # A field that is `null` by default in the sparse (entry) variant of a
+    # listener and carries its real default in the `transportDefaults`
+    # variant. `pkgs.formats.toml` cannot serialize `null`, so sparse entries
+    # are pruned before generation (see `pruneNulls`).
+    nullableOpt = {
+      lib,
+      nullable,
+    }: type: default: {
+      type =
+        if nullable
+        then lib.types.nullOr type
+        else type;
+      default =
+        if nullable
+        then null
+        else default;
     };
+
+    # Reusable `[security]` option set, shared by the server listeners and the
+    # client bridge. `mtls.enable` remains the legacy alias for
+    # `transportEncryption = "mtls"`; the Python layer resolves `auto` from the
+    # listener type (tcp → mtls, vsock/unix → none) and never downgrades.
+    # `nullable = true` yields the sparse entry variant used inside
+    # `transports`; `nullable = false` the defaults variant.
+    mkSecurityOptions = {
+      lib,
+      nullable ? false,
+      # The client/bridge reads the connect/handshake/decision timeouts off its
+      # `[security]` table; server listeners carry them at the listener level
+      # instead (see `mkListenerOptions`), so they are opt-in here.
+      withTimeouts ? false,
+    }: let
+      inherit (lib) mkOption types;
+      o = nullableOpt {inherit lib nullable;};
+    in
+      {
+        transportEncryption = mkOption ((o (types.enum ["auto" "none" "mtls"]) "auto")
+          // {
+            description = ''
+              Whether the byte stream is encrypted and integrity-protected.
+              `auto` (default) follows the listener's `type`: `tcp` → `mtls`,
+              `vsock`/`unix` → `none`. `mtls` is an explicit choice and never a
+              runtime fallback.
+            '';
+          });
+        clientAuth = mkOption ((o (types.enum ["transport" "none"]) "transport")
+          // {
+            description = ''
+              How the server authenticates the requester. `transport` means the
+              identity comes from the mTLS handshake and is forced whenever the
+              listener is mTLS; `none` disables requester authentication entirely
+              (an explicit, warned choice only appropriate on a private-by-
+              construction transport).
+            '';
+          });
+        serverAuth = mkOption ((o (types.enum ["transport" "none"]) "transport")
+          // {
+            description = ''
+              How the client authenticates the server's messages. `transport`
+              requires `transportEncryption = "mtls"` (and is then forced).
+            '';
+          });
+      }
+      // lib.optionalAttrs withTimeouts {
+        connectTimeout =
+          mkOption ((o types.float 10.0)
+            // {description = "Seconds to wait for the transport connect before failing fast.";});
+        handshakeTimeout =
+          mkOption ((o types.float 10.0)
+            // {description = "Seconds to wait for the TLS handshake before failing fast.";});
+        decisionTimeout =
+          mkOption ((o types.int 120)
+            // {description = "Seconds to wait for the human decision (0 = wait indefinitely).";});
+      };
+
+    # Reusable `[mtls]` option set for one listener. Extracted so it can be
+    # instantiated in both `transportDefaults` and every `transports` entry.
+    mkMtlsOptions = {
+      lib,
+      nullable ? false,
+      requiredOid,
+      peerOid,
+    }: let
+      inherit (lib) mkOption types;
+      o = nullableOpt {inherit lib nullable;};
+    in {
+      enable = mkOption ((o types.bool false)
+        // {
+          description = "Enable mutual TLS for this listener.";
+        });
+      caFile = mkOption ((o types.str "./ca.crt")
+        // {
+          description = "Path to the CA certificate. Relative to the config file directory.";
+        });
+      certFile = mkOption ((o types.str "./server.crt")
+        // {
+          description = "Path to the server certificate. Relative to the config file directory.";
+        });
+      keyFile = mkOption ((o types.str "./server.key")
+        // {
+          description = "Path to the server private key. Relative to the config file directory.";
+        });
+      requiredOid = mkOption ((o types.str requiredOid)
+        // {
+          description = "EKU OID the local server certificate must contain.";
+        });
+      peerOid = mkOption ((o types.str peerOid)
+        // {
+          description = "EKU OID the peer (client) certificate must contain.";
+        });
+    };
+
+    # One listener's option set, instantiated twice: `withType = false` for
+    # the `transportDefaults` block (real defaults, no `type`) and
+    # `withType = true` for a `transports` entry (requires `type`; every other
+    # field is a sparse `nullOr` override). All address fields are accepted on
+    # every listener; each is only meaningful for its own `type`.
+    sshListenerOptions = {
+      lib,
+      nullable,
+      withType,
+      requiredOid,
+      peerOid,
+    }: let
+      inherit (lib) mkOption types;
+      o = nullableOpt {inherit lib nullable;};
+    in
+      {
+        port = mkOption ((o types.port 65000)
+          // {
+            description = "Port the listener binds (tcp and vsock).";
+          });
+        cid = mkOption ((o types.int 2)
+          // {
+            description = "VSOCK context ID to bind to (2 = host). Only used with type = \"vsock\".";
+          });
+        host = mkOption ((o types.str "127.0.0.1")
+          // {
+            description = "TCP address to bind to. Only used with type = \"tcp\".";
+          });
+        socket = mkOption ((o types.str "%t/ssh-agent-proxy/server.sock")
+          // {
+            description = ''
+              Unix socket the listener binds (type = "unix"). Identity comes from
+              the mTLS certificate or is unset, never the socket path.
+            '';
+          });
+        socketDirMode = mkOption ((o types.str "0700")
+          // {
+            description = "Mode of the unix socket's parent directory.";
+          });
+        socketMode = mkOption ((o types.str "0600")
+          // {
+            description = "Mode of the unix server socket.";
+          });
+        connectTimeout = mkOption ((o types.float 10.0)
+          // {
+            description = "Seconds to wait for the transport connect before failing fast.";
+          });
+        handshakeTimeout = mkOption ((o types.float 10.0)
+          // {
+            description = "Seconds to wait for the TLS handshake before failing fast.";
+          });
+        decisionTimeout = mkOption ((o types.int 120)
+          // {
+            description = "Seconds to wait for the human decision (0 = wait indefinitely).";
+          });
+        resolution = mkOption ((o (types.nullOr (types.enum ["none" "certificate" "tartarus" "mofos"])) null)
+          // {
+            description = ''
+              How to resolve a connecting VM's name: `none`, `certificate`
+              (verified peer cert CN), `tartarus` (local VM bookkeeping), or
+              `mofos` (`mofos ls --json`). When unset it resolves to `certificate`
+              when the listener is mTLS and `none` otherwise. `tartarus`/`mofos`
+              are rejected on the `unix` type (no CID/IP exists there).
+            '';
+          });
+        security = mkSecurityOptions {inherit lib nullable;};
+        mtls = mkMtlsOptions {inherit lib nullable requiredOid peerOid;};
+      }
+      // lib.optionalAttrs withType {
+        type = mkOption {
+          type = types.enum ["vsock" "tcp" "unix"];
+          description = "Transport this listener binds (required for every entry).";
+        };
+      };
 
     tcpVmType = types.listOf (types.submodule {
       options = {
@@ -211,72 +348,13 @@
           description = "Path to the generated proxy config. Defaults to `~/.config/ssh-agent-proxy/config.toml`.";
         };
 
-        transport = mkOption {
-          type = types.nullOr (types.enum ["vsock" "tcp" "unix"]);
-          default = null;
-          description = ''
-            Transport the server listens on. Null derives it from the legacy
-            `settings.tcp_bind`/`settings.vsock_port` (tcp if `tcp_bind` is set,
-            else vsock). `unix` binds the single host socket `socket`.
-          '';
-        };
-
-        host = mkOption {
-          type = types.str;
-          default = "127.0.0.1";
-          description = "TCP address to bind to. Only used with transport tcp.";
-        };
-
-        port = mkOption {
-          type = types.port;
-          default = 65000;
-          description = "Port the server listens on (TCP and VSOCK).";
-        };
-
-        cid = mkOption {
-          type = types.int;
-          default = 2;
-          description = "VSOCK context ID to bind to (2 = host). Only used with transport vsock.";
-        };
-
-        socket = mkOption {
-          type = types.str;
-          default = "%t/ssh-agent-proxy/server.sock";
-          description = ''
-            Unix socket the server binds (transport unix). There is exactly one
-            server socket per host user; guest identity comes from the mTLS
-            certificate or is unset, never the socket path.
-          '';
-        };
-
-        socketDirMode = mkOption {
-          type = types.str;
-          default = "0700";
-          description = "Mode of the unix socket's parent directory.";
-        };
-
-        socketMode = mkOption {
-          type = types.str;
-          default = "0600";
-          description = "Mode of the unix server socket.";
-        };
-
-        security = mkSecurityOptions;
-
+        # Genuinely global (non-transport) policy. The `settings` freeform is
+        # the shared VM/key/rule policy the Python parses once; it is never
+        # per listener.
         settings = mkOption {
           type = types.submodule {
             freeformType = tomlFormat.type;
             options = {
-              vsock_port = mkOption {
-                type = types.nullOr types.int;
-                default = null;
-                description = "Deprecated: use `server.port` with `server.transport = \"vsock\"`.";
-              };
-              tcp_bind = mkOption {
-                type = types.nullOr types.str;
-                default = null;
-                description = "Deprecated: use `server.host`/`server.port` with `server.transport = \"tcp\"`.";
-              };
               vm = mkOption {
                 type = vmType;
                 default = [];
@@ -291,7 +369,7 @@
               tcp_vm = mkOption {
                 type = tcpVmType;
                 default = [];
-                description = "Static peer IP -> VM name mapping for the TCP listener.";
+                description = "Static peer IP -> VM name mapping for TCP listeners.";
               };
               default_agent_socket_path = mkOption {
                 type = types.nullOr types.str;
@@ -321,7 +399,43 @@
             };
           };
           default = {};
-          description = "Contents of the ssh-agent-proxy TOML config file.";
+          description = "Global (non-transport) contents of the ssh-agent-proxy TOML config file.";
+        };
+
+        # Defaults deep-merged into every `transports` entry by the Python.
+        transportDefaults = mkOption {
+          type = types.submodule {
+            options = sshListenerOptions {
+              inherit lib;
+              nullable = false;
+              withType = false;
+              requiredOid = serverRequiredOid;
+              peerOid = serverPeerOid;
+            };
+          };
+          default = {};
+          description = "Default values for every field of every entry in `transports`.";
+        };
+
+        # The listeners, all bound by the single server process.
+        transports = mkOption {
+          type = types.listOf (types.submodule {
+            options = sshListenerOptions {
+              inherit lib;
+              nullable = true;
+              withType = true;
+              requiredOid = serverRequiredOid;
+              peerOid = serverPeerOid;
+            };
+          });
+          default = [];
+          description = ''
+            One entry per transport this server binds, all in the single server
+            process. Multiple entries of the same `type` are allowed (e.g. two
+            `unix` listeners with different sockets). Empty means the server
+            binds nothing and the module rejects the configuration when
+            `enable = true`.
+          '';
         };
 
         dialogProgram = mkOption {
@@ -331,47 +445,6 @@
             then "swiftdialog"
             else "zenity";
           description = "Program used to show the key-use confirmation prompt.";
-        };
-
-        mtls = {
-          enable = mkEnableOption "mutual TLS authentication for incoming connections";
-          caFile = mkOption {
-            type = types.str;
-            default = "./ca.crt";
-            description = "Path to the CA certificate. Relative to the config file directory.";
-          };
-          certFile = mkOption {
-            type = types.str;
-            default = "./server.crt";
-            description = "Path to the server certificate. Relative to the config file directory.";
-          };
-          keyFile = mkOption {
-            type = types.str;
-            default = "./server.key";
-            description = "Path to the server private key. Relative to the config file directory.";
-          };
-          requiredOid = mkOption {
-            type = types.str;
-            default = "1.3.6.1.4.1.99999.2.1";
-            description = "EKU OID the local server certificate must contain.";
-          };
-          peerOid = mkOption {
-            type = types.str;
-            default = "1.3.6.1.4.1.99999.2.2";
-            description = "EKU OID the peer (client) certificate must contain.";
-          };
-        };
-
-        resolution = mkOption {
-          type = types.nullOr (types.enum ["none" "certificate" "tartarus" "mofos"]);
-          default = null;
-          description = ''
-            How to resolve a connecting VM's name: `none`, `certificate`
-            (verified peer cert CN), `tartarus` (local VM bookkeeping), or
-            `mofos` (`mofos ls --json`). When unset it resolves to `certificate`
-            when the transport is mTLS and `none` otherwise. `tartarus`/`mofos`
-            are rejected on the `unix` transport (no CID/IP exists there).
-          '';
         };
 
         debug = mkOption {
@@ -441,7 +514,10 @@
           description = "Port the host's proxy listens on. Used when transport is tcp or vsock.";
         };
 
-        security = mkSecurityOptions;
+        security = mkSecurityOptions {
+          inherit lib;
+          withTimeouts = true;
+        };
 
         mtls = {
           enable = mkEnableOption "mutual TLS authentication for the client connection";
@@ -536,92 +612,186 @@
     };
   };
 
-  # Shared settings assembly for the server (mode = "proxy"). The three
-  # `[security]` knobs are resolved from the transport and the legacy
-  # `mtls.enable` alias here, exactly as the Python layer re-validates them.
-  mkServerSettings = {lib}: cfg: let
+  # pkgs.formats.toml cannot serialize `null` anywhere in the tree, and both
+  # sparse `transports` entries and submodule defaults carry nulls once
+  # realized, so strip them recursively through attrsets and lists.
+  lib0 = inputs.nixpkgs.lib;
+  pruneNulls = v:
+    if builtins.isAttrs v
+    then lib0.mapAttrs (_: pruneNulls) (lib0.filterAttrs (_: x: x != null) v)
+    else if builtins.isList v
+    then map pruneNulls v
+    else v;
+
+  # The effective value of one listener: `transportDefaults` with the entry's
+  # explicitly-set (non-null) fields merged on top, exactly like the Python's
+  # `_deep_merge(defaults, entry)`.
+  effectiveListener = {
+    lib,
+    defaults,
+    entry,
+  }:
+    lib.recursiveUpdate (pruneNulls defaults) (pruneNulls entry);
+
+  # `auto` follows the listener type exactly as `validate_security_config`:
+  # `mtls.enable` wins, an explicit `transport_encryption` is honoured,
+  # otherwise `tcp` is mTLS and `vsock`/`unix` are plaintext.
+  resolveTransportEncryption = {
+    type,
+    mtlsEnabled,
+    requested,
+  }:
+    if mtlsEnabled
+    then "mtls"
+    else if requested != "auto"
+    then requested
+    else if type == "tcp"
+    then "mtls"
+    else "none";
+
+  # The generated server TOML (`mode = "proxy"`): global scalars plus the
+  # global `settings`, the `[transport_defaults]` block and one `[[transports]]`
+  # table per listener. `connect_timeout`/`handshake_timeout`/
+  # `decision_timeout` live at the listener level, where `Config.load` reads
+  # them (the previous [`security`] placement was dead config).
+  mkServerToml = {lib}: server: let
     inherit (lib) optionalAttrs;
-    effectiveTransport =
-      if cfg.transport != null
-      then cfg.transport
-      else if cfg.settings.tcp_bind != null
-      then "tcp"
-      else if cfg.settings.vsock_port != null
-      then "vsock"
-      else "tcp";
-    effectiveTransportEncryption =
-      if cfg.mtls.enable
-      then "mtls"
-      else if cfg.security.transportEncryption != "auto"
-      then cfg.security.transportEncryption
-      else if effectiveTransport == "tcp"
-      then "mtls"
-      else "none";
-    forceTransportAuth = effectiveTransportEncryption == "mtls";
-    effectiveResolution =
-      if cfg.resolution != null
-      then cfg.resolution
-      else if forceTransportAuth
-      then "certificate"
-      else "none";
-    security = {
-      transport_encryption = effectiveTransportEncryption;
-      # Under `none` the only valid auth value is `none` (`transport` requires
-      # mTLS); under mTLS both are forced to `transport`.
-      client_auth = if forceTransportAuth then "transport" else "none";
-      server_auth = if forceTransportAuth then "transport" else "none";
-      connect_timeout = cfg.security.connectTimeout;
-      handshake_timeout = cfg.security.handshakeTimeout;
-      decision_timeout = cfg.security.decisionTimeout;
+
+    renderSecurity = transportEncryption: {
+      transport_encryption = transportEncryption;
+      # mTLS forces both auths to `transport`; plaintext requires both `none`.
+      client_auth =
+        if transportEncryption == "mtls"
+        then "transport"
+        else "none";
+      server_auth =
+        if transportEncryption == "mtls"
+        then "transport"
+        else "none";
     };
-    connection =
+
+    renderMtls = mtls: {
+      enable = mtls.enable;
+      ca_file = mtls.caFile;
+      cert_file = mtls.certFile;
+      key_file = mtls.keyFile;
+      required_oid = mtls.requiredOid;
+      peer_required_oid = mtls.peerOid;
+    };
+
+    # `transportDefaults` is instantiated with `nullable = false`, so its
+    # fields carry real defaults and render in full.
+    renderDefaults = defaults:
       {
-        transport = effectiveTransport;
-        port = cfg.port;
-      }
-      // optionalAttrs (effectiveTransport == "vsock") {cid = cfg.cid;}
-      // optionalAttrs (effectiveTransport == "tcp") {host = cfg.host;}
-      // optionalAttrs (effectiveTransport == "unix") {
-        socket = cfg.socket;
-        socket_dir_mode = cfg.socketDirMode;
-        socket_mode = cfg.socketMode;
-      }
-      // optionalAttrs forceTransportAuth {
-        mtls = {
-          enable = true;
-          ca_file = cfg.mtls.caFile;
-          cert_file = cfg.mtls.certFile;
-          key_file = cfg.mtls.keyFile;
-          required_oid = cfg.mtls.requiredOid;
-          peer_required_oid = cfg.mtls.peerOid;
+        port = defaults.port;
+        cid = defaults.cid;
+        host = defaults.host;
+        socket = defaults.socket;
+        socket_dir_mode = defaults.socketDirMode;
+        socket_mode = defaults.socketMode;
+        connect_timeout = defaults.connectTimeout;
+        handshake_timeout = defaults.handshakeTimeout;
+        decision_timeout = defaults.decisionTimeout;
+        security = {
+          transport_encryption = defaults.security.transportEncryption;
+          client_auth = defaults.security.clientAuth;
+          server_auth = defaults.security.serverAuth;
         };
+        mtls = renderMtls defaults.mtls;
+      }
+      // optionalAttrs (defaults.resolution != null) {resolution = defaults.resolution;};
+
+    # A `transports` entry is a sparse override: only the fields it actually
+    # set render. `security` is always resolved (and emitted) so no entry has
+    # to rely on the defaults' `client_auth`/`server_auth` under plaintext,
+    # which the Python rejects; `mtls` is emitted only for an mTLS listener.
+    renderEntry = entry: let
+      merged = effectiveListener {
+        inherit lib;
+        defaults = server.transportDefaults;
+        inherit entry;
       };
-    extraSettings =
-      lib.removeAttrs cfg.settings (
-        if effectiveTransport == "unix"
-        then ["vm" "tcp_vm"]
-        else []
+      transportEncryption = resolveTransportEncryption {
+        type = entry.type;
+        mtlsEnabled = merged.mtls.enable;
+        requested = merged.security.transportEncryption;
+      };
+      fields = {
+        type = entry.type;
+        port = entry.port;
+        cid = entry.cid;
+        host = entry.host;
+        socket = entry.socket;
+        socket_dir_mode = entry.socketDirMode;
+        socket_mode = entry.socketMode;
+        connect_timeout = entry.connectTimeout;
+        handshake_timeout = entry.handshakeTimeout;
+        decision_timeout = entry.decisionTimeout;
+        resolution = entry.resolution;
+      };
+    in
+      pruneNulls (
+        fields
+        // {security = renderSecurity transportEncryption;}
+        // optionalAttrs (transportEncryption == "mtls") {mtls = renderMtls merged.mtls;}
       );
   in
     {
       mode = "proxy";
-      dialog_program = cfg.dialogProgram;
-      resolution = effectiveResolution;
-      security = security;
+      dialog_program = server.dialogProgram;
     }
-    // connection
-    // extraSettings;
+    // optionalAttrs server.debug {debug = true;}
+    // pruneNulls server.settings
+    // {
+      transport_defaults = renderDefaults server.transportDefaults;
+      transports = map renderEntry server.transports;
+    };
 
-  # pkgs.formats.toml cannot serialize `null` anywhere in the tree, and
-  # submodule list items carry their null defaults once realized, so strip
-  # nulls recursively through attrsets and lists.
-  lib0 = inputs.nixpkgs.lib;
-  cleanNulls = v:
-    if builtins.isAttrs v
-    then lib0.mapAttrs (_: cleanNulls) (lib0.filterAttrs (_: x: x != null) v)
-    else if builtins.isList v
-    then map cleanNulls v
-    else v;
+  # Eval-time guards, evaluated per listener (each sees the same effective
+  # values the Python will after its own deep-merge).
+  serverAssertions = {lib}: server: let
+    inherit (lib) optional;
+    perEntry = entry: let
+      merged = effectiveListener {
+        inherit lib;
+        defaults = server.transportDefaults;
+        inherit entry;
+      };
+      requested = merged.security.transportEncryption;
+      transportEncryption = resolveTransportEncryption {
+        type = entry.type;
+        mtlsEnabled = merged.mtls.enable;
+        requested = requested;
+      };
+      resolution =
+        if (merged.resolution or null) != null
+        then merged.resolution
+        else if transportEncryption == "mtls"
+        then "certificate"
+        else "none";
+    in [
+      {
+        assertion =
+          !(merged.mtls.enable
+            && requested != "auto"
+            && requested != "mtls");
+        message = "tartarus.ssh-agent-proxy.server.transports: mtls.enable = true conflicts with security.transportEncryption = \"${requested}\" (entry type = \"${entry.type}\"); refusing to downgrade.";
+      }
+      {
+        assertion =
+          !(entry.type == "unix" && (resolution == "tartarus" || resolution == "mofos"));
+        message = "tartarus.ssh-agent-proxy.server.transports: the unix listener only supports resolution = \"none\" or \"certificate\" (entry type = \"unix\").";
+      }
+    ];
+  in
+    lib.concatMap perEntry server.transports
+    ++ optional (server.enable && server.transports == []) {
+      assertion = false;
+      message = "tartarus.ssh-agent-proxy.server.enable = true requires at least one entry in server.transports.";
+    };
+
+  serverRequiredOid = "1.3.6.1.4.1.99999.2.1";
+  serverPeerOid = "1.3.6.1.4.1.99999.2.2";
 in {
   package = mkPackage;
   inherit optionsModule;
@@ -647,15 +817,14 @@ in {
       if server.configPath != null
       then server.configPath
       else "/etc/ssh-agent-proxy/config.toml";
-    settings = mkServerSettings {inherit lib;} server;
-    configFile = tomlFormat.generate "ssh-agent-proxy.toml" (cleanNulls settings);
+    configFile = tomlFormat.generate "ssh-agent-proxy.toml" (pruneNulls (mkServerToml {inherit lib;} server));
   in {
     imports = [optionsModule];
 
     config = mkIf (cfg.enable || server.enable) (lib.mkMerge [
       (mkService {
         name = "ssh-agent-proxy";
-        description = "SSH agent proxy via VSOCK, TCP or unix socket";
+        description = "SSH agent proxy via its configured listeners";
         command = "${package}/bin/ssh-agent-proxy --config ${configPath}${lib.optionalString server.debug " --debug"}";
         scope = "system";
         environment = lib.optionalAttrs (server.settings.default_agent_socket_path == null) {
@@ -667,23 +836,7 @@ in {
         environment.systemPackages = [package];
       }
       {
-        assertions = [
-          {
-            assertion =
-              !(server.mtls.enable
-                && server.security.transportEncryption != "auto"
-                && server.security.transportEncryption != "mtls");
-            message = "tartarus.ssh-agent-proxy.server: mtls.enable = true conflicts with security.transportEncryption (refusing to downgrade).";
-          }
-          {
-            assertion =
-              server.transport != "unix"
-              || server.resolution == null
-              || server.resolution == "none"
-              || server.resolution == "certificate";
-            message = "tartarus.ssh-agent-proxy.server: the unix transport only supports resolution = \"none\" or \"certificate\" (there is no CID/IP).";
-          }
-        ];
+        assertions = serverAssertions {inherit lib;} server;
       }
     ]);
   };
@@ -728,7 +881,7 @@ in {
       then bridge.configPath
       else "${home}/.config/ssh-agent-proxy/config.toml";
 
-    serverConfigFile = tomlFormat.generate "ssh-agent-proxy.toml" (cleanNulls (mkServerSettings {inherit lib;} server));
+    serverConfigFile = tomlFormat.generate "ssh-agent-proxy.toml" (pruneNulls (mkServerToml {inherit lib;} server));
 
     bridgeTransportEncryption =
       if bridge.mtls.enable
@@ -741,8 +894,14 @@ in {
     bridgeForceTransportAuth = bridgeTransportEncryption == "mtls";
     bridgeSecurity = {
       transport_encryption = bridgeTransportEncryption;
-      client_auth = if bridgeForceTransportAuth then "transport" else "none";
-      server_auth = if bridgeForceTransportAuth then "transport" else "none";
+      client_auth =
+        if bridgeForceTransportAuth
+        then "transport"
+        else "none";
+      server_auth =
+        if bridgeForceTransportAuth
+        then "transport"
+        else "none";
       connect_timeout = bridge.security.connectTimeout;
       handshake_timeout = bridge.security.handshakeTimeout;
       decision_timeout = bridge.security.decisionTimeout;
@@ -751,7 +910,10 @@ in {
       {
         transport = bridge.transport;
         listen_socket = bridge.listenSocket;
-        port = if bridge.transport == "vsock" then bridge.vsockPort else bridge.port;
+        port =
+          if bridge.transport == "vsock"
+          then bridge.vsockPort
+          else bridge.port;
         security = bridgeSecurity;
       }
       // optionalAttrs (bridge.transport == "vsock") {cid = bridge.vsockCid;}
@@ -768,7 +930,7 @@ in {
         };
       };
     bridgeConfigFile = tomlFormat.generate "ssh-agent-host.toml" (
-      cleanNulls (lib.recursiveUpdate ({mode = "client";} // bridgeConnection) bridge.extraSettings)
+      pruneNulls (lib.recursiveUpdate ({mode = "client";} // bridgeConnection) bridge.extraSettings)
     );
 
     # ---- agent ----
@@ -827,7 +989,7 @@ in {
       (mkIf (cfg.enable || server.enable) (mkMerge [
         (mkService {
           name = "ssh-agent-proxy";
-          description = "SSH agent proxy via VSOCK or TCP";
+          description = "SSH agent proxy via its configured listeners";
           command = "${package}/bin/ssh-agent-proxy --config ${serverConfigPath}${optionalString server.debug " --debug"}";
           environment = optionalAttrs (server.settings.default_agent_socket_path == null) {
             SSH_AUTH_SOCK = "%t/ssh-agent";
@@ -836,6 +998,9 @@ in {
         {
           home.packages = [package];
           home.file.${serverConfigPath}.source = serverConfigFile;
+        }
+        {
+          assertions = serverAssertions {inherit lib;} server;
         }
       ]))
 

@@ -23,6 +23,14 @@
 #
 #   ssh-agent-proxy --config ~/.config/ssh-agent-proxy/config.toml
 #
+# This is the **flat** (single-transport) form: a top-level `transport`. The
+# server still accepts it and treats the whole document as **one implicit
+# listener**, so existing hand-written configs keep working. To bind several
+# transports in one process (a `vsock` VM *and* an `ssh -R` forwarded `unix`
+# socket, with a per-listener `resolution`/`[security]`), use the
+# multi-listener form instead: `examples/ssh-agent-proxy-listeners.toml` — a
+# `[transport_defaults]` table plus one `[[transports]]` entry per listener.
+#
 # Paths are resolved relative to this file's directory (`./server.crt` means
 # "next to this config"), except `%t/...` which expands to the runtime dir.
 #

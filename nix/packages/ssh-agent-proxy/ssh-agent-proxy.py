@@ -2,6 +2,7 @@
 
 from argparse import ArgumentParser
 from base64 import b64decode, b64encode
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import IntEnum
 from fnmatch import fnmatchcase
@@ -36,10 +37,10 @@ from struct import calcsize, pack, unpack
 from subprocess import run
 from sys import exit, platform as sys_platform
 from tempfile import gettempdir
-from threading import Lock
+from threading import Lock, Thread
 from time import monotonic, time
 from tomllib import load
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from xml.etree import ElementTree
 
 # Cryptography is always required for signature verification in
@@ -115,6 +116,22 @@ def _split_bind(bind: str) -> tuple[str, int]:
         return host, int(port)
     except ValueError as e:
         raise ValueError(f"invalid tcp_bind {bind!r}, expected 'host:port'") from e
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge `override` onto `base`.
+
+    Nested tables merge field-by-field, so a sparse listener entry overrides
+    only the `[security]`/`[mtls]` fields it actually sets. Lists and scalars
+    are replaced wholesale (a listener's `acl.rule` list is never concatenated).
+    """
+    out = dict(base)
+    for key, value in override.items():
+        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
 
 
 DEFAULT_CONFIG_PATH = "~/.config/ssh-agent-proxy/config.toml"
@@ -320,6 +337,38 @@ class KnownHosts:
         return blobs
 
 
+@dataclass
+class ListenerConfig:
+    """One server listener: bind target + resolved security + per-listener identity.
+
+    A proxy-mode `Config` owns a list of these (one per emitted `transports`
+    entry, or a single implicit one for a legacy flat config). Each listener
+    resolves its own `[security]`/`[mtls]` and `resolution`, so a single server
+    process can bind many transports with independent security and identity.
+    """
+
+    transport: str
+    host: str
+    port: int
+    cid: int
+    socket: Optional[str]
+    socket_dir_mode: str
+    socket_mode: str
+    connect_timeout: float
+    handshake_timeout: float
+    decision_timeout: int
+    resolution: Optional[str]
+    transport_encryption: Optional[str]
+    client_auth: Optional[str]
+    server_auth: Optional[str]
+    mtls_enable: bool
+    mtls_ca_file: Optional[str]
+    mtls_cert_file: Optional[str]
+    mtls_key_file: Optional[str]
+    mtls_required_oid: Optional[str]
+    mtls_peer_required_oid: Optional[str]
+
+
 class Config:
     def __init__(self) -> None:
         self.mode: Optional[str] = None
@@ -355,6 +404,10 @@ class Config:
         self.mtls_key_file: Optional[str] = None
         self.mtls_required_oid: Optional[str] = None
         self.mtls_peer_required_oid: Optional[str] = None
+
+        # One entry per server listener. Empty until `load()` runs proxy mode;
+        # a legacy flat config yields exactly one implicit listener.
+        self.listeners: list[ListenerConfig] = []
 
         self.vsock_port: int = DEFAULT_VSOCK_PORT
         # "host:port" to listen on over TCP, or None to use VSOCK instead.
@@ -627,6 +680,31 @@ class Config:
                 )
             )
 
+        # Global policy above is shared by every listener. Now expand the
+        # listener list: the `transports` array (defaults deep-merged into each
+        # entry), or a single implicit listener for a legacy flat config.
+        raw_transports = data.get("transports")
+        if isinstance(raw_transports, list) and raw_transports:
+            for flat_key in ("transport", "tcp_bind", "vsock_port", "security", "mtls"):
+                if flat_key in data:
+                    raise ValueError(
+                        f"transports cannot be combined with the flat "
+                        f"{flat_key!r} key (the configuration is ambiguous)"
+                    )
+            defaults = data.get("transport_defaults") or {}
+            for index, entry in enumerate(raw_transports):
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"transports[{index}] must be a table, "
+                        f"got {type(entry).__name__}"
+                    )
+            self.listeners = [
+                self._parse_listener(_deep_merge(defaults, entry), resolve)
+                for entry in raw_transports
+            ]
+        else:
+            self.listeners = [self._parse_listener_from_flat(data)]
+
         log.info(
             f"Loaded {len(self.keys)} key(s) and {len(self.rules)} rule(s) from {p}"
         )
@@ -656,6 +734,104 @@ class Config:
             raise ValueError(f"Failed to decode base64 for key: {line}") from e
 
         return key_type, public_blob, _fingerprint(public_blob)
+
+    def _parse_listener(
+        self, data: dict, resolve: Callable[[Any], Any]
+    ) -> ListenerConfig:
+        """Build one `ListenerConfig` from a defaults-merged `transports` entry.
+
+        Security and identity are resolved **per listener**: each entry resolves
+        its own `[security]`/`[mtls]` through `validate_security_config` and its
+        own `resolution`. Relative mTLS paths are resolved against the config
+        directory by the `resolve` closure.
+        """
+        transport = data.get("type") or data.get("transport")
+        if transport not in ("vsock", "tcp", "unix"):
+            raise ValueError(f"invalid transport: {transport!r}")
+
+        transport_encryption, client_auth, server_auth = validate_security_config(
+            data, transport
+        )
+
+        mtls = data.get("mtls", {})
+        if not isinstance(mtls, dict):
+            raise ValueError("'[mtls]' must be a table")
+
+        resolution = data.get("resolution")
+        if resolution not in (None, "none", "certificate", "tartarus", "mofos"):
+            raise ValueError(f"invalid resolution: {resolution!r}")
+        if resolution is None:
+            resolution = "certificate" if transport_encryption == "mtls" else "none"
+        if transport == "unix" and resolution in ("tartarus", "mofos"):
+            raise ValueError(
+                f"resolution = {resolution!r} is not valid on the unix transport "
+                "(use 'certificate' or 'none')"
+            )
+
+        return ListenerConfig(
+            transport=transport,
+            host=data.get("host", "127.0.0.1"),
+            port=int(data.get("port", DEFAULT_VSOCK_PORT)),
+            cid=int(data.get("cid", HOST_CID)),
+            socket=resolve(data.get("socket")),
+            socket_dir_mode=data.get("socket_dir_mode", DEFAULT_SOCKET_DIR_MODE),
+            socket_mode=data.get("socket_mode", DEFAULT_SOCKET_MODE),
+            connect_timeout=float(
+                data.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT)
+            ),
+            handshake_timeout=float(
+                data.get("handshake_timeout", DEFAULT_HANDSHAKE_TIMEOUT)
+            ),
+            decision_timeout=int(
+                data.get("decision_timeout", DEFAULT_DECISION_TIMEOUT)
+            ),
+            resolution=resolution,
+            transport_encryption=transport_encryption,
+            client_auth=client_auth,
+            server_auth=server_auth,
+            mtls_enable=bool(mtls.get("enable", False)),
+            mtls_ca_file=resolve(mtls.get("ca_file")),
+            mtls_cert_file=resolve(mtls.get("cert_file")),
+            mtls_key_file=resolve(mtls.get("key_file")),
+            mtls_required_oid=mtls.get("required_oid"),
+            mtls_peer_required_oid=mtls.get("peer_required_oid"),
+        )
+
+    def _parse_listener_from_flat(self, data: dict) -> ListenerConfig:
+        """Build the single implicit listener of a legacy flat proxy config.
+
+        Uses the flat fields already parsed into `self.*` (including the
+        `vsock_port`/`tcp_bind` aliases) so every existing hand-written config
+        keeps binding exactly the same target as before. `data` is accepted to
+        mirror `_parse_listener`'s signature.
+        """
+        host, port = self.host, self.port
+        if self.transport == "vsock":
+            port = self.vsock_port
+        elif self.tcp_bind:
+            host, port = _split_bind(self.tcp_bind)
+        return ListenerConfig(
+            transport=self.transport,
+            host=host,
+            port=port,
+            cid=self.cid,
+            socket=self.socket,
+            socket_dir_mode=self.socket_dir_mode,
+            socket_mode=self.socket_mode,
+            connect_timeout=self.connect_timeout,
+            handshake_timeout=self.handshake_timeout,
+            decision_timeout=self.decision_timeout,
+            resolution=self.resolution,
+            transport_encryption=self.transport_encryption,
+            client_auth=self.client_auth,
+            server_auth=self.server_auth,
+            mtls_enable=self.mtls_enable,
+            mtls_ca_file=self.mtls_ca_file,
+            mtls_cert_file=self.mtls_cert_file,
+            mtls_key_file=self.mtls_key_file,
+            mtls_required_oid=self.mtls_required_oid,
+            mtls_peer_required_oid=self.mtls_peer_required_oid,
+        )
 
 
 # --- Protocol Helpers ---
@@ -1254,7 +1430,9 @@ def resolve_peer(
     return unknown_label, None
 
 
-def create_ssl_context(config: Config, *, server: bool) -> Optional[ssl.SSLContext]:
+def create_ssl_context(
+    config: "Config | ListenerConfig", *, server: bool
+) -> Optional[ssl.SSLContext]:
     # Decide from the resolved `transport_encryption`, not the legacy
     # `mtls.enable` flag alone: a transport configured for mTLS can never fall
     # back to plaintext (plan §1.3).
@@ -1384,7 +1562,7 @@ class Handler(AgentIO, BaseRequestHandler):
                         return
 
         address_family = getattr(self.server, "address_family", AF_UNIX)
-        resolution = self.config.resolution
+        resolution = self.server.listener_config.resolution
         if address_family == AF_VSOCK:
             cid, _ = self.client_address
             static_name = self.config.vm_by_cid.get(cid)
@@ -2362,60 +2540,101 @@ def run_merge(sockets: list[str], listen_path: str) -> None:
         listen.unlink(missing_ok=True)
 
 
+def _listener_target(listener: ListenerConfig) -> str:
+    """Human-readable bind target for a listener's log line."""
+    if listener.transport == "unix":
+        return f"unix:{_expand_socket_path(listener.socket or DEFAULT_SOCKET)}"
+    if listener.transport == "tcp":
+        return f"tcp:{listener.host}:{listener.port}"
+    return f"vsock:{HOST_CID}:{listener.port}"
+
+
+def _bind_listener(listener: ListenerConfig, ssl_ctx) -> TCPServer:
+    """Bind one server listener and attach its per-listener server attributes.
+
+    Raises on any bind failure (address in use, unavailable `AF_VSOCK`, a
+    non-socket path, ...) so `run_proxy` can close every already-bound listener
+    and abort before serving a single request. `app_config` (the shared policy)
+    is set by the caller.
+    """
+    if listener.transport == "unix":
+        path = _expand_socket_path(listener.socket or DEFAULT_SOCKET)
+        _prepare_unix_socket(
+            path, _parse_mode(listener.socket_dir_mode, DEFAULT_SOCKET_DIR_MODE)
+        )
+        old_umask = umask(0o177)
+        try:
+            server = ThreadedUnixServer(path, Handler)
+        finally:
+            umask(old_umask)
+        Path(path).chmod(_parse_mode(listener.socket_mode, DEFAULT_SOCKET_MODE))
+    elif listener.transport == "tcp":
+        server = ThreadedTcpServer((listener.host, listener.port), Handler)
+    else:
+        server = ThreadedVsockServer((HOST_CID, listener.port), Handler)
+    server.listener_config = listener  # type: ignore[attr-defined]
+    server.ssl_context = ssl_ctx  # type: ignore[attr-defined]
+    server._mtls_config = {  # type: ignore[attr-defined]
+        "peer_required_oid": listener.mtls_peer_required_oid
+    }
+    return server
+
+
+def _unlink_listener_socket(listener: ListenerConfig) -> None:
+    """Best-effort removal of a unix listener's bound socket path on shutdown."""
+    if listener.transport != "unix":
+        return
+    Path(_expand_socket_path(listener.socket or DEFAULT_SOCKET)).unlink(
+        missing_ok=True
+    )
+
+
 def run_proxy(config: Config) -> None:
-    ssl_ctx = create_ssl_context(config, server=True)
+    """Serve every listener in `config.listeners` from one process.
+
+    All listeners are bound (and their mTLS contexts built) before any of them
+    starts serving, so a failure on listener *k* closes listeners `0..k-1` and
+    aborts the whole server rather than exposing a half-initialised one.
+    """
+    bound: list[tuple[TCPServer, ListenerConfig]] = []
     try:
-        if config.transport == "unix":
-            path = _expand_socket_path(config.socket or DEFAULT_SOCKET)
-            dir_mode = _parse_mode(config.socket_dir_mode, DEFAULT_SOCKET_DIR_MODE)
-            _prepare_unix_socket(path, dir_mode)
-            old_umask = umask(0o177)
-            try:
-                server = ThreadedUnixServer(path, Handler)
-            finally:
-                umask(old_umask)
-            Path(path).chmod(_parse_mode(config.socket_mode, DEFAULT_SOCKET_MODE))
-            with server:
-                server.app_config = config  # type: ignore
-                server.ssl_context = ssl_ctx
-                server._mtls_config = {"peer_required_oid": config.mtls_peer_required_oid}
-                log.info(
-                    f"SSH Agent Proxy listening on unix:{path} "
-                    f"(tls={ssl_ctx is not None})"
-                )
-                server.serve_forever()
-        elif config.transport == "tcp":
-            # `tcp_bind` is the deprecated combined form; the new form is
-            # `host`/`port` (default 127.0.0.1:65000).
-            host, port = (
-                _split_bind(config.tcp_bind)
-                if config.tcp_bind
-                else (config.host, config.port)
+        for listener in config.listeners:
+            ssl_ctx = create_ssl_context(listener, server=True)
+            server = _bind_listener(listener, ssl_ctx)
+            server.app_config = config  # type: ignore[attr-defined]
+            bound.append((server, listener))
+        for server, listener in bound:
+            log.info(
+                f"SSH Agent Proxy listening on {_listener_target(listener)} "
+                f"(tls={server.ssl_context is not None})"
             )
-            with ThreadedTcpServer((host, port), Handler) as server:
-                server.app_config = config  # type: ignore
-                server.ssl_context = ssl_ctx
-                server._mtls_config = {"peer_required_oid": config.mtls_peer_required_oid}
-                log.info(
-                    f"SSH Agent Proxy listening on tcp:{host}:{port} "
-                    f"(tls={ssl_ctx is not None})"
-                )
-                server.serve_forever()
-        else:
-            with ThreadedVsockServer(
-                (HOST_CID, config.vsock_port), Handler
-            ) as server:  # type: ignore[arg-type]
-                server.app_config = config  # type: ignore
-                server.ssl_context = ssl_ctx
-                server._mtls_config = {"peer_required_oid": config.mtls_peer_required_oid}
-                log.info(
-                    f"SSH Agent Proxy listening on vsock:{HOST_CID}:{config.vsock_port} "
-                    f"(tls={ssl_ctx is not None})"
-                )
-                server.serve_forever()
+    except BaseException:
+        # Fail the WHOLE server before serving a single request.
+        for server, listener in bound:
+            with suppress(Exception):
+                server.server_close()
+            with suppress(Exception):
+                _unlink_listener_socket(listener)
+        raise
+
+    threads = [
+        Thread(target=server.serve_forever, daemon=True) for server, _ in bound
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for thread in threads:
+            thread.join()
     except KeyboardInterrupt:
         log.info("Shutting down...")
-        exit(0)
+    finally:
+        for server, listener in bound:
+            with suppress(Exception):
+                server.shutdown()
+            with suppress(Exception):
+                server.server_close()
+            with suppress(Exception):
+                _unlink_listener_socket(listener)
 
 
 def run_client(config: Config) -> None:

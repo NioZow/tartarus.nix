@@ -15,6 +15,15 @@
 #
 #   sudo-auth-proxy --config ~/.config/sudo-auth-proxy/config.toml
 #
+# This is the **flat** (single-transport) form: a top-level `transport` plus the
+# `[security]`/`[acl]`/`[mtls]` tables. The server still accepts it and treats
+# the whole document as **one implicit listener**, so existing hand-written
+# configs keep working. To bind several transports in one process (a `vsock` VM
+# *and* a `tcp` container *and* an `ssh -R` forwarded `unix` socket), use the
+# multi-listener form instead: `examples/sudo-auth-proxy-listeners.toml` — a
+# `[transport_defaults]` table plus one `[[transports]]` entry per listener. This
+# file and that one are the same server, one listener versus many.
+#
 # Paths inside this file are resolved relative to the file's own directory, so
 # `./ca.crt` means "next to this config".
 #

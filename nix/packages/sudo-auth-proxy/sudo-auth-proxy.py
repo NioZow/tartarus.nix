@@ -557,23 +557,79 @@ def load_config(path: str) -> dict:
             return str(config_dir / pth)
         return str(pth)
 
-    # Top-level mtls paths are resolved so a hand-written config can use
-    # paths relative to the config file. `[security]` holds no paths any more:
-    # the removed ssh/x509/signature methods owned every key reference, and
-    # mTLS carries its own `[mtls]` section.
-    mtls = config.get("mtls")
-    if isinstance(mtls, dict):
-        for key in ("ca_file", "cert_file", "key_file"):
-            if key in mtls and mtls[key]:
-                mtls[key] = resolve(mtls[key])
+    # `[mtls]`/`[acl]` paths are resolved against the config file's own
+    # directory, so a hand-written config can use paths relative to itself. In
+    # the multi-listener schema the same tables appear inside every
+    # `[[transports]]` entry and inside `[transport_defaults]`, so the resolution
+    # runs there too -- before `listener_views` merges the two. `[security]`
+    # holds no paths any more: the removed ssh/x509/signature methods owned
+    # every key reference, and mTLS carries its own `[mtls]` section.
+    def resolve_tables(container: dict) -> None:
+        mtls = container.get("mtls")
+        if isinstance(mtls, dict):
+            for key in ("ca_file", "cert_file", "key_file"):
+                if mtls.get(key):
+                    mtls[key] = resolve(mtls[key])
+        acl = container.get("acl")
+        if isinstance(acl, dict) and acl.get("ca_file"):
+            acl["ca_file"] = resolve(acl["ca_file"])
 
-    # `[acl]` (doc §8): `ca_file` is a path like every other; the fingerprint
-    # lists are opaque strings (never paths) and are left untouched.
-    acl = config.get("acl")
-    if isinstance(acl, dict) and acl.get("ca_file"):
-        acl["ca_file"] = resolve(acl["ca_file"])
+    resolve_tables(config)
+    defaults = config.get("transport_defaults")
+    if isinstance(defaults, dict):
+        resolve_tables(defaults)
+    entries = config.get("transports")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                resolve_tables(entry)
 
     return config
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge `override` onto `base`, returning a new dict.
+
+    Lists and scalars are replaced wholesale (a listener's `acl.rule` is a
+    single list, never concatenated with the defaults'), while nested tables
+    (`security`/`mtls`/`acl`) merge field by field so an entry can override just
+    the one knob it cares about.
+    """
+    merged = dict(base)
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def listener_views(config: dict) -> list[dict]:
+    """Return the flat, legacy-shaped config for each server listener.
+
+    A document with a non-empty `transports` list expands to one view per entry,
+    each the entry deep-merged over `[transport_defaults]`, with `type` renamed
+    to the `transport` key every reader already uses, the global keys carried
+    down and `_listener_index` stamped on it. A flat document (no `transports`)
+    is one implicit listener -- the document itself, unchanged -- so every
+    existing hand-written and shipped config keeps working with zero edits.
+    """
+    entries = config.get("transports")
+    if not isinstance(entries, list) or not entries:
+        return [config]
+    defaults = config.get("transport_defaults") or {}
+    views: list[dict] = []
+    for index, entry in enumerate(entries):
+        view = _deep_merge(defaults, entry)
+        if "type" in view:
+            view["transport"] = view["type"]
+            del view["type"]
+        for key in GLOBAL_KEYS:
+            if key in config:
+                view.setdefault(key, config[key])
+        view["_listener_index"] = index
+        views.append(view)
+    return views
 
 
 # --- configuration schema (doc §7.9, §15.1) -------------------------------
@@ -625,8 +681,10 @@ CONFIG_TOP_LEVEL_KEYS = frozenset(
         "security",
         "acl",
         "mtls",
-        # internal: the `SecurityConfig` cache `build_security` writes back
+        # internal: the `SecurityConfig` cache `build_security` writes back, and
+        # the index `listener_views` stamps on each expanded listener view
         "_security",
+        "_listener_index",
     }
 )
 
@@ -669,6 +727,58 @@ CONFIG_TABLE_KEYS = {
     "acl": CONFIG_ACL_KEYS,
     "mtls": CONFIG_MTLS_KEYS,
 }
+
+# The keys a `[[transports]]` entry (or the `[transport_defaults]` block) may
+# carry: the flat server key set minus the non-transport globals (`mode`,
+# `dialog_program`, `debug`, the client metadata), which stay at the document
+# top level, plus `type` -- the wire key `listener_views` renames to `transport`.
+CONFIG_LISTENER_KEYS = frozenset(
+    {
+        "type",
+        "port",
+        "cid",
+        "host",
+        "socket",
+        "socket_dir_mode",
+        "socket_mode",
+        "connect_timeout",
+        "decision_timeout",
+        "recv_timeout",
+        "max_connections",
+        "server_read_timeout",
+        "resolution",
+        "security",
+        "acl",
+        "mtls",
+    }
+)
+
+# The top level of a multi-listener document: the global keys plus the two new
+# tables. A flat transport/security/mtls/acl key alongside `transports` is
+# ambiguous and refused (`validate_document_schema`).
+CONFIG_DOCUMENT_KEYS = frozenset(
+    {
+        "mode",
+        "dialog_program",
+        "debug",
+        "approver",
+        "client_version",
+        "guest_hint",
+        "transport_defaults",
+        "transports",
+    }
+)
+
+# Keys `listener_views` copies from the document onto every expanded listener;
+# `Handler` and the transports read them as globals, not per listener.
+GLOBAL_KEYS = (
+    "mode",
+    "dialog_program",
+    "debug",
+    "approver",
+    "client_version",
+    "guest_hint",
+)
 
 # Below this length a fuzzy match has more false positives than value (`post`
 # must not be answered with `host`), so short typos get the plain message.
@@ -798,6 +908,81 @@ def validate_config_schema(config: dict, *, source: str | None = None) -> None:
     if sentences:
         source_suffix = f" in {source}" if source else ""
         raise SecurityConfigError("; ".join(sentences) + source_suffix)
+
+
+def validate_listener_table(
+    entry: dict, *, where: str, require_type: bool = True
+) -> None:
+    """Refuse any key a listener table cannot carry (doc §3).
+
+    Used for each `[[transports]]` entry (`require_type = True`, it must name
+    its `type`) and for the `[transport_defaults]` block (`require_type =
+    False`). It reuses the flat validator's naming and `did-you-mean` helpers,
+    so a typo inside a listener is reported exactly like a typo at the top level,
+    and the nested `[security]`/`[mtls]`/`[acl]` tables are checked against the
+    same key sets as their flat counterparts.
+    """
+    if not isinstance(entry, dict):
+        raise SecurityConfigError(f"'{where}' must be a table")
+
+    unknown = sorted(set(entry) - CONFIG_LISTENER_KEYS)
+    if unknown:
+        raise SecurityConfigError(
+            _unknown_keys_sentence(f"in {where}", unknown, CONFIG_LISTENER_KEYS)
+        )
+    if require_type and "type" not in entry:
+        raise SecurityConfigError(f"{where} is missing the required 'type' key")
+    if entry.get("type") is not None and entry["type"] not in ("vsock", "tcp", "unix"):
+        raise SecurityConfigError(
+            f"unknown {where}.type {entry['type']!r} "
+            "(expected one of 'vsock', 'tcp', 'unix')"
+        )
+    for name, allowed in CONFIG_TABLE_KEYS.items():
+        table = entry.get(name)
+        if table is None:
+            continue
+        if not isinstance(table, dict):
+            raise SecurityConfigError(f"[{where}.{name}] must be a table")
+        nested_unknown = sorted(set(table) - allowed)
+        if nested_unknown:
+            raise SecurityConfigError(
+                _unknown_keys_sentence(
+                    f"inside [{where}.{name}]", nested_unknown, allowed
+                )
+            )
+
+
+def validate_document_schema(config: dict, *, source: str | None = None) -> None:
+    """Validate a whole document, multi-listener or legacy flat (doc §4.6).
+
+    A document that carries `transports` is the new schema: its top level may
+    only hold the global keys plus the two new tables (a flat
+    transport/security/mtls/acl key alongside `transports` is ambiguous and
+    refused), `transports` must be a non-empty array and `transport_defaults`,
+    when present, a table. Every entry is then checked by
+    `validate_listener_table`. A document without `transports` is the legacy
+    flat form and is validated by `validate_config_schema`, unchanged.
+    """
+    if "transports" not in config:
+        validate_config_schema(config, source=source)
+        return
+
+    unknown = sorted(set(config) - CONFIG_DOCUMENT_KEYS)
+    if unknown:
+        raise SecurityConfigError(
+            _unknown_keys_sentence("at the top level", unknown, CONFIG_DOCUMENT_KEYS)
+        )
+    if not isinstance(config["transports"], list) or not config["transports"]:
+        raise SecurityConfigError("'transports' must be a non-empty array of tables")
+    defaults = config.get("transport_defaults")
+    if "transport_defaults" in config and not isinstance(defaults, dict):
+        raise SecurityConfigError("'[transport_defaults]' must be a table")
+    for index, entry in enumerate(config["transports"]):
+        validate_listener_table(entry, where=f"transports[{index}]")
+    if isinstance(defaults, dict):
+        validate_listener_table(
+            defaults, where="transport_defaults", require_type=False
+        )
 
 
 # --- security model: validation, keyrings, auth blocks (doc §7) -----------
@@ -3571,39 +3756,96 @@ def server_handle_error(self, request, client_address):
     BaseServer.handle_error(self, request, client_address)
 
 
+def _close_listener(server: BaseServer, transport: Transport) -> None:
+    """Stop and release one bound listener.
+
+    `shutdown()` is only called once the server is actually serving: on a server
+    whose `serve_forever` never started it blocks forever waiting for a loop
+    that will never run, which is exactly the state of the already-bound
+    listeners when a later listener fails to bind. `server_close()` and
+    `transport.cleanup()` (which unlinks a unix socket by the inode it bound)
+    always run.
+    """
+    if getattr(server, "_sap_serving", False):
+        with contextlib.suppress(Exception):
+            server.shutdown()
+    with contextlib.suppress(Exception):
+        server.server_close()
+    with contextlib.suppress(Exception):
+        transport.cleanup()
+
+
 def run_server(config: dict) -> None:
+    """Bind every configured listener, then serve them in one process (doc §4.2).
+
+    `listener_views` expands a `transports` document into one flat view per
+    listener; a flat legacy document is a single implicit view. Every listener
+    is bound **before** any serves, so a bind failure closes the listeners
+    already bound and re-raises before a single request is handled
+    (fail-whole-server). Each view gets its own `SecurityConfig` and transport,
+    so two listeners may resolve different `transport_encryption`/`mtls`/`acl`;
+    `Handler.handle` reads both back from `self.server`.
+    """
     set_debug(config)
+    if isinstance(config.get("transports"), list):
+        validate_document_schema(config)
+    views = listener_views(config)
+    bound: list[tuple[BaseServer, Transport, SecurityConfig]] = []
     try:
-        security = build_security(config, "server")
+        for view in views:
+            validate_config_schema(view)
+            security = build_security(view, "server")
+            if not acl_allows_any(security.acl):
+                print(
+                    "sudo-auth-proxy server: WARNING: the [acl] allows nobody "
+                    "(empty trust list); every request will be denied",
+                    file=sys.stderr,
+                )
+            transport = make_transport(view)
+            server = transport.listen(Handler)
+            # `listen` builds a dynamic `SudoAuthProxyServer` class, so `setattr`
+            # is the honest way to hang the per-listener security model on it:
+            # `Handler.handle` reads it back with `getattr`, and a static checker
+            # cannot see the attribute on a class that only exists at runtime.
+            setattr(server, "_security", security)
+            bound.append((server, transport, security))
     except (SecurityConfigError, AuthError) as error:
+        for server, transport, _ in bound:
+            _close_listener(server, transport)
         print(f"sudo-auth-proxy server: {error}", file=sys.stderr)
         sys.exit(1)
-    transport = make_transport(config)
-    server = transport.listen(Handler)
-    # `listen` builds a dynamic `SudoAuthProxyServer` class, so `setattr` is the
-    # honest way to hang the per-listener security model on it: `Handler.handle`
-    # reads it back with `getattr`, and a static checker cannot see the attribute
-    # on a class that only exists at runtime.
-    setattr(server, "_security", security)  # noqa: B010 -- dynamic class attribute
-    tls_enabled = getattr(server, "ssl_context", None) is not None
-    if not acl_allows_any(security.acl):
-        print(
-            "sudo-auth-proxy server: WARNING: the [acl] allows nobody "
-            "(empty trust list); every request will be denied",
-            file=sys.stderr,
-        )
-    try:
+    except BaseException:
+        # Fail the whole server before serving a single request.
+        for server, transport, _ in bound:
+            _close_listener(server, transport)
+        raise
+
+    threads: list[tuple[threading.Thread, BaseServer]] = []
+    for server, transport, _ in bound:
+        tls_enabled = getattr(server, "ssl_context", None) is not None
         print(
             f"sudo-auth-proxy server listening on {transport.describe()} "
             f"(transport={transport.name}, tls={tls_enabled})",
             flush=True,
         )
-        server.serve_forever()
+        threads.append(
+            (threading.Thread(target=server.serve_forever, daemon=True), server)
+        )
+    try:
+        for thread, _server in threads:
+            thread.start()
+        for _thread, server in threads:
+            # Marked only once every `serve_forever` is running, so
+            # `_close_listener` may safely call `shutdown()`; see its docstring
+            # for why a never-started server cannot take one.
+            setattr(server, "_sap_serving", True)
+        for thread, _server in threads:
+            thread.join()
     except KeyboardInterrupt:
-        server.shutdown()
+        pass
     finally:
-        server.server_close()
-        transport.cleanup()
+        for server, transport, _ in bound:
+            _close_listener(server, transport)
 
 
 def collect_request_fields() -> dict:
@@ -3878,11 +4120,12 @@ def main() -> None:
     _debug(f"config loaded: mode={config.get('mode')!r}")
     # The whole file is validated against the exact schema first, so a typo or a
     # key on the wrong side of a TOML table header is named here rather than
-    # surfacing as a missing-knob error further down (doc §7.9). This runs before
-    # the `mode` check so `Mode = "server"` reports the misspelled key instead of
-    # "missing required 'mode'".
+    # surfacing as a missing-knob error further down (doc §7.9). `transports`
+    # documents are validated by the multi-listener schema, a flat document by
+    # the legacy one. This runs before the `mode` check so `Mode = "server"`
+    # reports the misspelled key instead of "missing required 'mode'".
     try:
-        validate_config_schema(config, source=args.config)
+        validate_document_schema(config, source=args.config)
     except SecurityConfigError as error:
         print(f"sudo-auth-proxy: {error}", file=sys.stderr)
         sys.exit(1)

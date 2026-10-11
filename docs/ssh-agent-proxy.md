@@ -69,22 +69,65 @@ A guest can reach the server two ways:
   (CID or IP) exists, so an external name resolver (`tartarus`/`mofos`) or a
   static table can name the peer.
 - **host-dials-guest** (`unix`): the host `ssh` carries an
-  `ssh -R` RemoteForward of the server's single AF_UNIX socket into the guest.
+  `ssh -R` RemoteForward of the server's AF_UNIX listener socket into the guest.
   No address exists on the host socket.
+
+The server may expose **several listeners at once** — one per `transports` entry
+(§3) — so a single host can offer callback to a container and `unix` to a remote
+guest at the same time.
 
 ---
 
 ## 3. Transports
 
-| `transport` | direction | host listens on | guest side | identity sources |
-| ----------- | --------- | --------------- | ---------- | ---------------- |
+Each **listener** is an entry in `tartarus.ssh-agent-proxy.server.transports`;
+its `type` selects the transport, and the server binds one listener per entry —
+any mix, any number. A `transportDefaults` block supplies per-field defaults that
+the Python deep-merges into every entry.
+
+| `type` | direction | listener binds | guest side | identity sources |
+| ------ | --------- | -------------- | ---------- | ---------------- |
 | `vsock` | guest → host | AF_VSOCK port | bridge | `none`/`certificate`/`tartarus`/`mofos` |
 | `tcp` | guest → host | TCP host:port | bridge | `none`/`certificate`/`tartarus`/`mofos` |
-| `unix` | host → guest | **one** AF_UNIX socket | forwarded socket or bridge | `none`/`certificate` only |
+| `unix` | host → guest | AF_UNIX socket | forwarded socket or bridge | `none`/`certificate` only |
 
-There is exactly **one host server socket in every mode**. No listener names a
-guest: identity comes from `resolution` (and only `certificate`/`none` are
-meaningful on `unix`).
+No listener names a guest: identity comes from the listener's `resolution` (and
+only `certificate`/`none` are meaningful on `unix`), never from the socket path.
+Multiple listeners of the same `type` are allowed (e.g. two `unix` listeners with
+different `socket` paths).
+
+### 3.1 Multiple listeners and the shared policy
+
+Unlike the bridge, the server binds a **list** of listeners in one process:
+
+```nix
+tartarus.ssh-agent-proxy.server = {
+  enable = true;
+  settings = { /* vm, tcp_vm, key, rule, forward_sockets, ... -- global */ };
+  transportDefaults = { connectTimeout = 10.0; decisionTimeout = 120; };
+  transports = [
+    { type = "vsock"; cid = 2; resolution = "tartarus"; }
+    { type = "unix";  socket = "%t/ssh-agent-proxy/server.sock";
+      resolution = "certificate";
+      security = {transportEncryption = "mtls";
+                  clientAuth = "transport"; serverAuth = "transport";}; }
+  ];
+};
+```
+
+- `resolution` is **per listener**: `certificate` for a `unix` listener, and
+  `tartarus`/`mofos` only for the callback types. An unset listener defaults to
+  `certificate` when it is mTLS and `none` otherwise.
+- The `settings` freeform (the `vm`/`tcp_vm` id maps, `key`, `rule`,
+  `forward_sockets`, `default_agent_socket_path`, `known_hosts_files`,
+  `libvirt_uri`) stays **global** — shared policy parsed once by the Python, not
+  per listener. `settings.vm` / `settings.tcp_vm` are **always emitted** (even
+  for a `unix`-only server): a server may carry a `vsock`/`tcp` listener
+  alongside the `unix` one, so the CID/IP maps must always be present for the
+  callback listeners to resolve names.
+- Binding is all-or-nothing: every listener is bound (and every mTLS context
+  built) before any serves; a failure exits non-zero and no listener serves.
+  Runtime failures stay per listener.
 
 `unix` has two sub-modes:
 
@@ -100,7 +143,7 @@ meaningful on `unix`).
 
 ## 4. The `unix` transport in detail
 
-### 4.1 `unix + none` — one socket, transparent
+### 4.1 `unix + none` — transparent
 
 ```
 guest: client (ssh/git) ──▶ /run/ssh-agent-proxy/<tok>.sock   (AF_UNIX)
@@ -109,7 +152,7 @@ guest: client (ssh/git) ──▶ /run/ssh-agent-proxy/<tok>.sock   (AF_UNIX)
                              SSH channel (host→guest)
                                     │
 host:                        ssh ──▶ %t/ssh-agent-proxy/server.sock
-                                          │ (one socket, all sessions)
+                                          │ (the unix listener's socket, all sessions)
                                           ▼
                                      server (resolution = none)
 ```
@@ -175,7 +218,7 @@ same guest cert and are handled identically. The host keeps `ControlMaster`,
 | `tartarus`    | local VM bookkeeping by CID/IP        | `vsock`/`tcp`    | needs state dir |
 | `mofos`       | `mofos ls --json` by CID/`ipv4_address` | `vsock`/`tcp`  | needs `mofos` binary |
 
-Defaults: `certificate` when mTLS is on, else `none`.
+Defaults (per listener): `certificate` when mTLS is on, else `none`.
 
 ### 5.1 Display label vs matching identity
 
@@ -199,7 +242,8 @@ it can only use keys whose rules are deliberately world-scoped.
 
 ## 6. The `[security]` model
 
-`[security]` has three knobs plus bounds, identical in shape to sudo-auth-proxy:
+Each **listener** has its own `[security]` block with three knobs plus bounds,
+identical in shape to sudo-auth-proxy:
 
 | key | values | meaning |
 | --- | ------ | ------- |
@@ -353,7 +397,7 @@ pid, so there is no `/proc` equivalent — macOS relies on the directory scan.
   `unix + mtls` (or a callback transport with `tartarus`/`mofos`/`certificate`)
   when per-guest isolation is required.
 - **R4** `unix + mtls` still has two guest sockets (bridge listener + forwarded);
-  the host has exactly one.
+  the host binds one `unix` listener socket for that transport.
 - **R5** A directory merge scans all sockets in the directory at connect time; if
   a directory mixed sockets pointing at different servers the merge would union
   them (still allow-all, but broader than one session).
@@ -384,6 +428,11 @@ pid, so there is no `/proc` equivalent — macOS relies on the directory scan.
 - `resolution = "tartarus"`/`"mofos"` are the only tartarus/mofos-coupled bits
   and are optional; on `unix` they are rejected by design.
 
+The server may instead declare a `[[transports]]` list (one per listener) with a
+`[transport_defaults]` table shared across them (§3.1); a flat `mode`+`transport`
+document is kept as one implicit listener for compatibility. The **bridge** is
+unchanged and always takes a single `transport`.
+
 See `examples/ssh-agent-proxy-server.toml` and
 `examples/ssh-agent-proxy-client.toml`.
 
@@ -391,7 +440,16 @@ See `examples/ssh-agent-proxy-server.toml` and
 
 ## 11. Compatibility and aliases
 
-Nothing breaks at evaluation or in existing `config.toml`s:
+**Nix (server).** The flat server options are **removed with no aliases**:
+`tartarus.ssh-agent-proxy.server.{transport,host,port,cid,socket,socketDirMode,
+socketMode,connectTimeout,handshakeTimeout,decisionTimeout,resolution,security,
+mtls}` are gone. Migrate to `server.transports = [ { type = …; … } ]` plus
+`server.transportDefaults = { … }`; a partially-migrated config fails evaluation
+loudly rather than binding the wrong transport. The bridge/agent/merge options
+are unchanged (one transport each).
+
+**Python (legacy config).** Existing `config.toml`s keep working: a document
+with no `transports` array is read as one implicit listener.
 
 - `vsock_port` / `tcp_bind` → derive `transport` (`vsock`/`tcp`) and log a
   deprecation warning.

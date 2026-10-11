@@ -137,84 +137,109 @@
     else instances.vm.hostIP;
 
   # ---- sudo-auth-proxy host wiring (audit A1) ----------------------------
-  # A guest asks for the SSH-forwarded `unix` transport through the per-guest
+  # One listener per distinct transport the requesting guests ask for: a guest
+  # asks for the SSH-forwarded `unix` transport through the per-guest
   # `services.sudoAuthProxyTransport` marker; every other value keeps the
-  # platform's callback transport (`transportOf`). The server exposes exactly
-  # ONE socket per host user, so all requesting guests must share one transport;
-  # that single-transport invariant is what `sudoTransport` below enforces.
-  #
-  # There are two kinds of conflict (audit N1):
-  #   * `unix` mixed with any callback transport is a genuine conflict: `unix`
-  #     is host-dials-guest (one AF_UNIX socket, SSH-forwarded) while `vsock`/
-  #     `tcp` are guest-dials-host, and the server binds a single socket with
-  #     one direction -- so this stays a hard evaluation error.
-  #   * `vsock` + `tcp` are two callback variants of the same direction, so we
-  #     restore the previous deterministic behaviour (`vsock` wins) and emit a
-  #     `lib.warn` instead of failing the whole host. A common Linux host with
-  #     one vsock VM and one tcp container therefore still evaluates; the tcp
-  #     guest is simply not reachable until the transports are unified.
+  # platform's callback transport (`transportOf`). The server process binds
+  # every listener at once, so a vsock VM, a tcp container and an SSH-forwarded
+  # unix guest are all served simultaneously -- the old mixed-transport
+  # `throw`/`lib.warn` are gone.
   sapMarker = g: (g.services or {}).sudoAuthProxyTransport or "vsock";
   sapGuestTransport = g:
     if sapMarker g == "unix"
     then "unix"
     else transportOf g;
-  sudoTransports = lib.unique (map (e: sapGuestTransport e.g) (listOf sudoReq));
-  sudoTransport =
-    if sudoTransports == []
-    then "tcp" # unused (no sudo guests); keeps the binding total
-    else if builtins.length sudoTransports == 1
-    then builtins.head sudoTransports
-    else if builtins.elem "unix" sudoTransports
-    then
-      throw (
-        "tartarus: the enabled guests requesting sudo-auth-proxy mix the "
-        + "SSH-forwarded `unix` transport with a callback transport "
-        + "(${lib.concatStringsSep ", " sudoTransports}); the server exposes a "
-        + "single socket and the two call directions are incompatible. Set "
-        + "services.sudoAuthProxyTransport consistently."
-      )
-    else
-      lib.warn (
-        "tartarus: the enabled guests requesting sudo-auth-proxy use mixed "
-        + "callback transports (${lib.concatStringsSep ", " sudoTransports}); "
-        + "defaulting to `vsock` (the previous behaviour). The `tcp` guests are "
-        + "not reachable until services.sudoAuthProxyTransport is unified."
-      ) "vsock";
-  sudoIsUnix = sudoTransport == "unix";
+  sudoKinds = lib.unique (map (e: sapGuestTransport e.g) (listOf sudoReq));
+
+  # `unix` is host-dials-guest (one AF_UNIX socket, SSH-forwarded) and runs mTLS
+  # inside the SSH tunnel -- the only authentication mechanism left (doc §7);
+  # the guest presents its tartarus CA-chained client certificate, the host its
+  # server certificate. Callback transports (`vsock`/`tcp`) are private by
+  # construction and run with no crypto and no authentication (their
+  # `security`/`acl` defaults live in `transportDefaults` below).
+  unixSecurity = {
+    transportEncryption = "mtls";
+    clientAuth = "transport";
+    serverAuth = "transport";
+  };
+
+  sudoVsockListener = {
+    type = "vsock";
+    cid = 2;
+  };
+  sudoTcpListener = {
+    type = "tcp";
+    host = mkTcpHost sudoReq;
+    port = 65001;
+  };
+  sudoUnixListener = {
+    type = "unix";
+    socket = "%t/sudo-auth-proxy/server.sock";
+    security = unixSecurity;
+    mtls = {
+      enable = true;
+      caFile = x509Ca;
+      certFile = x509HostCert;
+      keyFile = x509HostKey;
+      requiredOid = "1.3.6.1.4.1.99999.1.1";
+      peerOid = sudoClientOid;
+    };
+    # `acl.mode = "ca"` authorizes the CA-chained guests without an operator
+    # fingerprint list; the callback listeners keep `acl.mode = "none"` (set in
+    # `transportDefaults`).
+    acl = {
+      mode = "ca";
+      caFile = x509Ca;
+      requiredOid = sudoClientOid;
+    };
+  };
+  # Stable, deterministic listener order: vsock, tcp, unix.
+  sudoListeners =
+    lib.optional (builtins.elem "vsock" sudoKinds) sudoVsockListener
+    ++ lib.optional (builtins.elem "tcp" sudoKinds) sudoTcpListener
+    ++ lib.optional (builtins.elem "unix" sudoKinds) sudoUnixListener;
 
   # ---- ssh-agent-proxy host wiring (mirrors the sudo block above) ----------
   # A guest asks for the SSH-forwarded `unix` transport through the per-guest
   # `services.sshAgentProxyTransport` marker; every other value keeps the
-  # platform's callback transport (`transportOf`). One server socket per host
-  # user, so all requesting guests must share one transport.
+  # platform's callback transport (`transportOf`). `resolution` is per listener
+  # (`certificate` for unix, `tartarus` otherwise).
   sshMarker = g: (g.services or {}).sshAgentProxyTransport or "vsock";
   sshGuestTransport = g:
     if sshMarker g == "unix"
     then "unix"
     else transportOf g;
-  sshTransports = lib.unique (map (e: sshGuestTransport e.g) (listOf sshReq));
-  sshTransport =
-    if sshTransports == []
-    then "tcp" # unused (no ssh guests); keeps the binding total
-    else if builtins.length sshTransports == 1
-    then builtins.head sshTransports
-    else if builtins.elem "unix" sshTransports
-    then
-      throw (
-        "tartarus: the enabled guests requesting ssh-agent-proxy mix the "
-        + "SSH-forwarded `unix` transport with a callback transport "
-        + "(${lib.concatStringsSep ", " sshTransports}); the server exposes a "
-        + "single socket and the two call directions are incompatible. Set "
-        + "services.sshAgentProxyTransport consistently."
-      )
-    else
-      lib.warn (
-        "tartarus: the enabled guests requesting ssh-agent-proxy use mixed "
-        + "callback transports (${lib.concatStringsSep ", " sshTransports}); "
-        + "defaulting to `vsock` (the previous behaviour). The `tcp` guests are "
-        + "not reachable until services.sshAgentProxyTransport is unified."
-      ) "vsock";
-  sshIsUnix = sshTransport == "unix";
+  sshKinds = lib.unique (map (e: sshGuestTransport e.g) (listOf sshReq));
+
+  sshVsockListener = {
+    type = "vsock";
+    cid = 2;
+    resolution = "tartarus";
+  };
+  sshTcpListener = {
+    type = "tcp";
+    host = mkTcpHost sshReq;
+    port = 65000;
+    resolution = "tartarus";
+  };
+  sshUnixListener = {
+    type = "unix";
+    socket = "%t/ssh-agent-proxy/server.sock";
+    resolution = "certificate";
+    security = unixSecurity;
+    mtls = {
+      enable = true;
+      caFile = x509Ca;
+      certFile = x509HostCert;
+      keyFile = x509HostKey;
+      requiredOid = "1.3.6.1.4.1.99999.2.1";
+      peerOid = "1.3.6.1.4.1.99999.2.2";
+    };
+  };
+  sshListeners =
+    lib.optional (builtins.elem "vsock" sshKinds) sshVsockListener
+    ++ lib.optional (builtins.elem "tcp" sshKinds) sshTcpListener
+    ++ lib.optional (builtins.elem "unix" sshKinds) sshUnixListener;
   # The sudo-auth-proxy client OID (doc §7.6). Every tartarus client cert
   # carries it today (audit A4 documents that the OIDs separate roles, not
   # services), so `acl.mode = "ca"` authorizes the guests without an operator
@@ -256,86 +281,28 @@ in {
       {imports = [sudoHm sshHm clipHm];}
 
       (mkIf needsSudo {
-        tartarus.sudo-auth-proxy = {
-          # The server emitter reads the *top-level* `security` group (not
-          # `server.security`) for the resolved knobs, so they are set here.
-          #
-          # `unix` (audit A1): the SSH tunnel protects the channel and mTLS
-          # authenticates both ends inside it -- the only mechanism left (doc
-          # §7). The guest presents its tartarus CA-chained client certificate,
-          # the host presents its server certificate, and the ACL authorizes
-          # the guest's SPKI against the tartarus CA + client OID.
-          #
-          # Callback transports (`vsock`/`tcp`): the tartarus-internal channel
-          # is private by construction, so it runs with no crypto and no
-          # authentication -- `transportEncryption = "none"`,
-          # `serverAuth = "none"`, `clientAuth = "none"` and the fail-closed
-          # matching `acl.mode = "none"`. The Python warns about `none` and
-          # refuses a `client_auth`/`acl.mode` mismatch. No CA material, no
-          # mTLS.
-          security = {
-            transportEncryption = mkDefault (
-              if sudoIsUnix
-              then "mtls"
-              else "none"
-            );
-            serverAuth = mkDefault (
-              if sudoIsUnix
-              then "transport"
-              else "none"
-            );
-            clientAuth = mkDefault (
-              if sudoIsUnix
-              then "transport"
-              else "none"
-            );
-          };
-          server = {
-            enable = mkDefault true;
-            # One socket per host user: unix if any requesting guest asked for
-            # it, else the shared callback transport (vsock/tcp).
-            transport = mkDefault sudoTransport;
-            host = mkDefault (mkTcpHost sudoReq);
+        tartarus.sudo-auth-proxy.server = {
+          enable = mkDefault true;
+          # One `{ type, ...; }` per distinct requesting transport, all bound by
+          # the single server process.
+          transports = mkDefault sudoListeners;
+          # Shared defaults for every listener. Callback transports
+          # (`vsock`/`tcp`) run with no crypto and no authentication -- the
+          # tartarus-internal channel is private by construction -- and the
+          # fail-closed matching `acl.mode = "none"`; the `unix` listener
+          # overrides both with mTLS + `acl.mode = "ca"`. The Python refuses a
+          # `client_auth`/`acl.mode` mismatch and warns about `none`.
+          transportDefaults = {
             port = mkDefault 65001;
-            cid = mkDefault 2;
             # A2: the first frame (the pre-dialog ack) is bounded by the
             # client's recvTimeout; the human decision is bounded by
             # decisionTimeout. Keep the server values in the same shape.
             recvTimeout = mkDefault 0.5;
             decisionTimeout = mkDefault 120;
-            # Usable, default-secure ACL: `ca` authorizes the CA-chained guests
-            # on the `unix` path; `none` deliberately authorizes the
-            # unauthenticated callback path and is only accepted because
-            # `client_auth = "none"` above. Operators can override with
-            # `mode = "list"` + `trustedFingerprints` (leaf SPKI pins).
-            acl.mode = mkDefault (
-              if sudoIsUnix
-              then "ca"
-              else "none"
-            );
-            # `acl.mode = "ca"` reads its own CA/OID: there is no
-            # `security.caFile` to fall back on any more (that option went with
-            # the removed x509 requester method).
-            acl.caFile = mkDefault (
-              if sudoIsUnix
-              then x509Ca
-              else null
-            );
-            acl.requiredOid = mkDefault (
-              if sudoIsUnix
-              then sudoClientOid
-              else null
-            );
-            # mTLS is on for the `unix` path only; the callback channel is
-            # unauthenticated by design.
-            mtls = {
-              enable = mkDefault sudoIsUnix;
-              caFile = mkDefault x509Ca;
-              certFile = mkDefault x509HostCert;
-              keyFile = mkDefault x509HostKey;
-              requiredOid = mkDefault "1.3.6.1.4.1.99999.1.1";
-              peerOid = mkDefault sudoClientOid;
-            };
+            security.transportEncryption = mkDefault "none";
+            security.clientAuth = mkDefault "none";
+            security.serverAuth = mkDefault "none";
+            acl.mode = mkDefault "none";
           };
         };
       })
@@ -343,31 +310,21 @@ in {
       (mkIf needsSsh {
         tartarus.ssh-agent-proxy.server = {
           enable = mkDefault true;
-          # `unix` is host-dials-guest over one AF_UNIX socket (no port, no
-          # firewall change); vsock/tcp keep the callback direction.
-          transport = mkDefault sshTransport;
-          host = mkDefault (mkTcpHost sshReq);
-          port = mkDefault 65000;
-          cid = mkDefault 2;
-          # `unix` runs mTLS inside the SSH tunnel (identity = client cert CN,
-          # so per-guest `vm_names` rules keep working); callback transports are
-          # private by construction and run with no crypto/auth (plan §1.3).
-          security = {
-            transportEncryption = mkDefault (if sshIsUnix then "mtls" else "none");
-            serverAuth = mkDefault (if sshIsUnix then "transport" else "none");
-            clientAuth = mkDefault (if sshIsUnix then "transport" else "none");
+          transports = mkDefault sshListeners;
+          # Defaults from the module cover connect/handshake/decision timeouts;
+          # only the shared bind port and the callback security are overridden
+          # here. Callback transports (`vsock`/`tcp`) are private by construction
+          # and run with no crypto and no authentication (mirrors the sudo
+          # block); the `unix` listener overrides with mTLS.
+          transportDefaults = {
+            port = mkDefault 65000;
+            security.transportEncryption = mkDefault "none";
+            security.clientAuth = mkDefault "none";
+            security.serverAuth = mkDefault "none";
           };
-          resolution = mkDefault (if sshIsUnix then "certificate" else "tartarus");
-          mtls = {
-            enable = mkDefault sshIsUnix;
-            caFile = mkDefault x509Ca;
-            certFile = mkDefault x509HostCert;
-            keyFile = mkDefault x509HostKey;
-            requiredOid = mkDefault "1.3.6.1.4.1.99999.2.1";
-            peerOid = mkDefault "1.3.6.1.4.1.99999.2.2";
-          };
-          # `vm`/`tcp_vm` feed `resolution = "tartarus"` and are omitted by the
-          # module on the `unix` transport (no CID/IP exists there).
+          # `vm`/`tcp_vm` feed `resolution = "tartarus"`. A server can now have
+          # a unix listener *and* a vsock/tcp listener, so the CID/IP maps are
+          # always emitted (the old omit-on-unix hack is gone).
           settings = {
             vm = mkDefault sshVmEntries;
             tcp_vm = mkDefault sshTcpEntries;

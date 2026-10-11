@@ -112,9 +112,11 @@ cryptographic credential it can prove and the authorization model (§5, §8).
   fingerprints).
   This ACL gates the **proxy**, not `sudo` itself: other PAM methods still apply
   if enabled (§8, §10.3).
-- Expose exactly **one listening socket per transport** (one callback
-  `vsock`/`tcp` endpoint, one host Unix socket), so the transport layer has the
-  same shape in every mode (§3).
+- Let one server process bind **one listener per entry in `transports`** (any
+  mix of `vsock`/`tcp`/`unix`), each with its own bind target, security and ACL,
+  so a single host can serve a `vsock` VM, a `tcp` container and an
+  SSH-forwarded `unix` guest at once (§3). There is still no per-guest or
+  per-session server socket: the guest is identified cryptographically (§5, §8).
 - Fail fast and stay optional in the PAM stack. **This is a security property,
   not only an availability one:** by default a human `deny` falls through, so
   the mechanism is explicitly _not_ a sole gate (see the warning at the top of
@@ -156,10 +158,11 @@ cryptographic credential it can prove and the authorization model (§5, §8).
 - A per-host-user service (`systemd --user` on Linux, launchd user agent on
   macOS). It must be tied to the approver's login session because it needs that
   user's GUI to show the dialog.
-- Listens on **exactly one socket per transport**: one `vsock` or `tcp` endpoint,
-  or one Unix socket (`%t/sudo-auth-proxy/server.sock`) for `unix`. There is no
-  per-guest socket (review log S1, §19.7) — the guest is identified
-  cryptographically, not by the socket it connected to.
+- Binds **one listener per entry in `tartarus.sudo-auth-proxy.server.transports`**
+  (§3.4): each entry is a `vsock`, `tcp` or `unix` endpoint with its own
+  address/port/socket, `[security]`, `[mtls]` and `[acl]`. All listeners run in
+  the one server process. There is no per-guest socket (review log S1, §19.7) —
+  the guest is identified cryptographically, not by the socket it connected to.
 - Authenticates the requester (§7.3) and the channel (§7.4), authorizes the
   credential (§8), shows the dialog (§11), and relies on the mTLS channel for
   its own response authentication (§7.2) — or sends the response
@@ -189,9 +192,9 @@ transport. Any `proxy_socket`/`mode = "proxy"` configuration is invalid (§14).
 and the guests. `vsock` for local Linux VMs (fast), `unix` for anything remote.
 
 **T2 — shared host, several people, different Unix accounts.** Each has their own
-server (per host user) listening on their own single socket in their own runtime
-directory, their own SSH config and their own trust roots. The kernel enforces
-isolation via directory/socket ownership and `SO_PEERCRED`.
+server (per host user), binding their own listeners in their own runtime
+directory, with their own SSH config and their own trust roots. The kernel
+enforces isolation via directory/socket ownership and `SO_PEERCRED`.
 
 **T3 — shared host, several people, the _same_ Unix account.** They share a
 server and a socket directory. They are, by construction, the same principal at
@@ -211,16 +214,19 @@ shared-account case (§12.6 R6).
 
 ## 3. Transports, call direction and transport security
 
-The transport is selected with `transport = "vsock" | "tcp" | "unix"`. It also
-determines the **call direction**. In every mode the server exposes **exactly
-one listening endpoint**; there is no per-guest or per-session server socket
-(review log S1, §19.7).
+Each **listener** selects its transport with `type = "vsock" | "tcp" | "unix"`,
+which also determines the **call direction**. The server takes a **list** of
+listeners (`tartarus.sudo-auth-proxy.server.transports`) plus a
+`transportDefaults` block that the Python deep-merges into every entry (§3.4).
+There is no per-guest or per-session server socket (review log S1, §19.7): a
+listener's address is not an identity, and the guest is identified
+cryptographically (§5, §8).
 
-| Transport | Direction              | Server endpoint (one)                                | Encryption default                                    | Typical use                                                                                              |
+| Transport | Direction              | Listener endpoint (per entry)                        | Encryption default                                    | Typical use                                                                                              |
 | --------- | ---------------------- | ---------------------------------------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | `vsock`   | Callback: guest → host | `(CID, port)`                                        | `none` (point-to-point)                               | Local Linux MicroVMs: no IP stack, fast, no firewall port.                                               |
 | `tcp`     | Callback: guest → host | `(host, port)`                                       | `mtls` (recommended; `none` allowed but **insecure**) | Containers, machines without VSOCK, networks where the guest can dial the host.                          |
-| `unix`    | Tunnel: host → guest   | `%t/sudo-auth-proxy/server.sock` (one per host user) | `none` (SSH already protects it)                      | Remote machines / real networks, and any case where the guest should not know or reach the host address. |
+| `unix`    | Tunnel: host → guest   | `%t/sudo-auth-proxy/server.sock`                     | `none` (SSH already protects it)                      | Remote machines / real networks, and any case where the guest should not know or reach the host address. |
 
 All three end in the same JSON request/response exchange; only the byte path
 differs.
@@ -236,7 +242,7 @@ differs.
 ### 3.1 Callback transports (`vsock`, `tcp`)
 
 - The guest knows where the host is (CID, IP or `_gateway`).
-- The host listens on a single port; the guest connects.
+- The listener binds one port; the guest connects.
 - **`tcp` defaults to `transport_encryption = "mtls"`, but `none` is allowed**
   (§7.4). Plaintext TCP is MITM-able, so with `none` the stream is neither
   confidential nor protected from an active attacker: with mTLS off there is
@@ -269,8 +275,8 @@ differs.
   ```
 
 - The guest's PAM client connects to the **local** socket path named by
-  `SUDO_AUTH_PROXY_SOCK`. It never needs the host's address. The host server
-  socket is a _single_ file; every session of that host user forwards to it.
+  `SUDO_AUTH_PROXY_SOCK`. It never needs the host's address. The `unix` listener
+  binds one socket file; every session of that host user forwards to it.
 - The snippet above is illustrative: OpenSSH cannot generate a random value, so
   the real mechanism is the `custom.programs.ssh.sudoAuthProxy` **wrapper**
   (§15.1), not a static `Host` block. The wrapper runs the real `ssh` with
@@ -321,6 +327,47 @@ back to plaintext, and a config that turns authentication off must say so
 literally on all three knobs (§7.5). Choosing `none` is an explicit operator
 decision, never a runtime fallback.
 
+### 3.4 Multiple listeners in one process
+
+The server binds **one listener per entry in `server.transports`**, and a single
+process may bind any number of them — including several of the same kind:
+
+```nix
+tartarus.sudo-auth-proxy.server = {
+  enable = true;
+  transportDefaults = {              # deep-merged into every entry
+    port = 65001;
+    recvTimeout = 0.5;
+    decisionTimeout = 120;
+  };
+  transports = [
+    { type = "vsock"; cid = 2; }                    # local Linux VM (callback)
+    { type = "unix";                                # SSH-forwarded remote (tunnel)
+      socket = "%t/sudo-auth-proxy/server.sock";
+      security = {transportEncryption = "mtls";
+                  clientAuth = "transport"; serverAuth = "transport";};
+      mtls = {enable = true; /* CA + host cert/key */};
+      acl  = {mode = "ca";   /* CA + sudo client OID */}; }
+  ];
+};
+```
+
+- Each entry is **independent**: its own `type`, bind target and — crucially —
+  its own `security`, `mtls`, `acl` and `resolution`. A `vsock` listener can be
+  `none`/`none` while a `unix` listener on the same server is `mtls`.
+- `transportDefaults` supplies the shared values once; the Python deep-merges it
+  into every entry, and an entry's explicitly-set field wins.
+- Multiple entries of the same `type` are allowed (e.g. two `unix` listeners
+  with different `socket` paths and different ACLs).
+- All listeners are bound **before any serves a request**: if one bind or one
+  `[security]`/mTLS setup fails, the whole server exits non-zero and no listener
+  ever serves. A runtime failure in one listener's thread does not stop the
+  others (§13).
+- The **automatic host wiring** (`nix/host/services.nix`) emits one listener per
+  distinct transport the host's guests request. Mixing `vsock`/`tcp` or
+  `unix`+callback across guests is **no longer an evaluation error or warning**:
+  the listeners simply coexist (§14.3, §15.1).
+
 ---
 
 ## 4. The SSH-forwarded Unix transport in detail
@@ -349,16 +396,16 @@ guest: PAM → client ──connect──▶ /run/.../<user>@<host>-<token>.sock
                                    SSH channel (host→guest)
                                           │
 host:                             ssh (as host user) ──connect──▶ %t/sudo-auth-proxy/server.sock
-                                                                        │  (one socket, all sessions)
-                                                                        ▼
+                                                                         │  (the unix listener's socket, all sessions)
+                                                                         ▼
                                                                    server → dialog
 ```
 
 Because the host's SSH client makes the host-side connection, the server sees a
 peer that is the `ssh` process **run by the host user**. That is the basis of the
 host-side `SO_PEERCRED` check (§9.1). It is _not_ how the guest is identified:
-with a single socket, the guest identity comes solely from the requester's
-cryptographic credential (`client_auth`, §7.3).
+the socket path carries no identity, so the guest identity comes solely from the
+requester's cryptographic credential (`client_auth`, §7.3).
 
 ### 4.2 Socket naming and per-person isolation
 
@@ -383,13 +430,13 @@ The design resolves both **without** any per-guest server socket:
   per-session. Randomising it closes a predictable-path race: without the token a
   same-UID guest process could pre-bind or race the name `RemoteForward` is about
   to use (review log NF7; residual **R9**).
-- The **host server socket is a single socket for the whole host user**
-  (`%t/sudo-auth-proxy/server.sock`), exactly like the one callback endpoint.
-  Its identity is therefore irrelevant to routing: the server learns **who is
-  asking** from the requester's cryptographic credential and the **approver**
-  from the socket's owner (`SO_PEERCRED`, §9.1). A guest cannot claim another
-  guest's identity by choosing a socket, because no socket carries identity any
-  more.
+- The **`unix` listener binds one socket for the whole host user**
+  (`%t/sudo-auth-proxy/server.sock`), just as each callback listener binds its own
+  endpoint. Its identity is therefore irrelevant to routing: the server learns
+  **who is asking** from the requester's cryptographic credential and the
+  **approver** from the socket's owner (`SO_PEERCRED`, §9.1). A guest cannot
+  claim another guest's identity by choosing a socket, because no socket carries
+  identity any more.
 
 A `sudo` in `/run/.../alice@laptop-<token>.sock` therefore reaches _Alice's_
 server, on _Alice's_ session; the server independently verifies the requester's
@@ -1121,15 +1168,41 @@ written and never mentions where it went. The exact schema is what makes the
 failure diagnosable in one line, and it is fail-closed in the same direction as
 everything else here: an unread key is refused, never assumed.
 
-The accepted names are: top level `mode`, `transport`, `cid`, `host`, `port`,
-`socket`, `socket_dir_mode`, `socket_mode`, `connect_timeout`,
-`decision_timeout`, `recv_timeout`, `max_connections`, `server_read_timeout`,
-`dialog_program`, `resolution`, `debug`, `approver`, `client_version`,
-`guest_hint`; the tables `[security]`, `[acl]` and `[mtls]`; and the keys listed
-for each in this section, §8.5 and §7.7. `[acl].labels` is the one free-form
-table (fingerprint → display label). Values are still typed where they are used,
-so the schema checks *names*; `examples/sudo-auth-proxy-server.toml` is checked
-against it by the test suite.
+The service accepts **two document shapes**, both validated against an exact
+schema (every key, at every level, must be one it reads):
+
+**New schema (preferred).** The top level may carry only the global keys plus the
+two listener tables:
+
+- globals: `mode`, `dialog_program`, `debug`, `approver`, `client_version`,
+  `guest_hint`;
+- `[transport_defaults]` — one table of default listener fields, deep-merged
+  into every entry by the Python;
+- `[[transports]]` — a **non-empty array** of listener tables, each requiring
+  `type`.
+
+Each listener table (`[transport_defaults]` and every `[[transports]]` entry)
+accepts exactly: `type` (entry only), `port`, `cid`, `host`, `socket`,
+`socket_dir_mode`, `socket_mode`, `connect_timeout`, `decision_timeout`,
+`recv_timeout`, `max_connections`, `server_read_timeout`, `resolution`, and the
+per-listener tables `[security]`, `[mtls]` and `[acl]` (with the keys of this
+section, §7.7 and §8.5). A flat `transport`/`cid`/`security`/… key written
+alongside `transports` is **ambiguous and rejected**. Duplicate `type`s are
+allowed (two `unix` listeners); duplicate `socket` paths fail at bind time, not
+in the schema.
+
+**Legacy flat schema.** For Python compatibility only (§14.3), a document with no
+`transports` array is read as a **single implicit listener**: top level `mode`,
+`transport`, `cid`, `host`, `port`, `socket`, `socket_dir_mode`, `socket_mode`,
+`connect_timeout`, `decision_timeout`, `recv_timeout`, `max_connections`,
+`server_read_timeout`, `dialog_program`, `resolution`, `debug`, `approver`,
+`client_version`, `guest_hint`; the tables `[security]`, `[acl]` and `[mtls]`;
+and the keys listed for each in this section, §8.5 and §7.7. `[acl].labels` is
+the one free-form table (fingerprint → display label).
+
+Values are still typed where they are used, so the schema checks *names*;
+`examples/sudo-auth-proxy-server.toml` (legacy flat) is checked against it by the
+test suite.
 
 | Key                   | Used by | Type / values                 | Notes                                                                                                     |
 | --------------------- | ------- | ----------------------------- | --------------------------------------------------------------------------------------------------------- |
@@ -1206,20 +1279,27 @@ Server config `[acl]`:
 
 ### 8.4 Worked examples
 
+Any credential that chains to the tartarus CA with the client EKU (the shipped
+configuration for the `unix` transport):
+
 ```toml
-# Any credential that chains to the tartarus CA with the client EKU
-# (the shipped configuration for the `unix` transport).
 [acl]
 mode = "ca"
 ca_file = "./ca.crt"
 required_oid = "1.3.6.1.4.1.99999.1.2"
+```
 
-# Or pin specific mTLS leaf SPKI fingerprints.
+Or pin specific mTLS leaf SPKI fingerprints:
+
+```toml
 [acl]
 mode = "list"
 trusted_fingerprints = ["SHA256:AbCdEf...", "SHA256:GhIjKl..."]
+```
 
-# Unauthenticated callback transport: authorizes every request on purpose.
+Unauthenticated callback transport: authorizes every request on purpose:
+
+```toml
 [acl]
 mode = "none"
 ```
@@ -1256,13 +1336,15 @@ Validation rules (all fail closed, at startup):
 > `mode = "list"` (leaf SPKI pins) for a multi-tier mTLS deployment until the
 > chain is plumbed through.
 
-The Nix home-manager module exposes the same table as
-`tartarus.sudo-auth-proxy.server.acl.{mode, trustedFingerprints, caFile,
-requiredOid, rule}`; `labels` is currently only reachable through the free-form
-`extraSettings`/`settings` escape hatch. The shipped host module defaults the
-whole table to `mode = "ca"` with the tartarus CA and the sudo client OID (audit
-A1), so a configured guest is authorized without an operator-maintained
-fingerprint list.
+The Nix home-manager module exposes this table **per listener** as
+`tartarus.sudo-auth-proxy.server.transports[*].acl.{mode, trustedFingerprints,
+caFile, requiredOid, rule}` (and `transportDefaults.acl.*` for the shared
+defaults); `labels` is currently only reachable through the free-form
+`extraSettings`/`settings` escape hatch. The shipped host module gives its
+`unix` listener `acl.mode = "ca"` with the tartarus CA and the sudo client OID
+(audit A1), and `acl.mode = "none"` on the unauthenticated callback listeners, so
+a configured guest is authorized without an operator-maintained fingerprint
+list.
 
 ### 8.6 Approval rules (`[[acl.rule]]`)
 
@@ -1426,9 +1508,10 @@ Three independent bounds are configured. With the pre-dialog acknowledgement
 | `decision_timeout` | `120 s` | the wait for the final `auth_response` — the human decision                 | wait indefinitely |
 
 The **server** has its own two pre-authentication resource bounds (audit A3/N2),
-exposed as the server options `maxConnections` / `serverReadTimeout` and emitted
-into the generated server TOML as `max_connections` / `server_read_timeout`
-(audit N5). Their defaults match the Python constants.
+exposed **per listener** as the `transports`/`transportDefaults` fields
+`maxConnections` / `serverReadTimeout` and emitted into the generated server TOML
+as `max_connections` / `server_read_timeout` (audit N5). Each listener carries its
+own cap and read timeout; their defaults match the Python constants.
 
 | Server key            | Default | Applied where                                                  | Invalid value     |
 | --------------------- | ------- | -------------------------------------------------------------- | ----------------- |
@@ -1720,10 +1803,12 @@ it never gates anything and is sanitised like every other field.
 `mofos` shells out to `mofos ls --json`, caches the listing for 30 seconds, and
 degrades to the raw label when the binary is missing, exits non-zero, or returns
 malformed JSON — resolution is cosmetic and must never delay or fail a prompt.
-The Nix module exposes it as
-`tartarus.sudo-auth-proxy.server.resolution`; unset defaults to `certificate`
-when `mtls` is enabled and `tartarus` otherwise. The resolved name is one of the
-candidates an `[[acl.rule]]` `identity` selector matches (§8.6).
+`resolution` is **per listener**: the Nix module exposes it as
+`tartarus.sudo-auth-proxy.server.transports[*].resolution` (or
+`transportDefaults.resolution` for the shared default). An unset (`null`)
+listener defaults to `certificate` when it is mTLS and `tartarus` otherwise. The
+resolved name is one of the candidates an `[[acl.rule]]` `identity` selector
+matches (§8.6).
 
 **`resolution = "none"` is wildcard-only.** The resolved name is a *display*
 label, never a matching identity: with `none` the identity is unset, so only an
@@ -1791,8 +1876,8 @@ untrusted; host user space is trusted but not other host users; CA keys are root
 | T1  | Forge an `allow` into the client                                                                                       | ADV1      | mTLS (`server_auth = "transport"`); the TLS channel authenticates the responder, and the client verifies nonce + request digest. With `server_auth = "none"` this is **not** mitigated (§7.2, §6.6) |
 | T2  | Replay an old `allow`                                                                                                  | ADV1      | Client **single-use nonce** + request digest + expiry; no server-side cache needed. (§6.6)                                                                                                |
 | T3  | Change request fields between approval and execution                                                                   | ADV1/ADV2 | `request_digest` recomputed by the client and bound to the nonce; mismatch rejected. (§6.4)                                                                                                |
-| T4  | Guest/user B impersonates A                                                                                            | ADV2      | The mTLS client certificate is verified against the server's trust roots and the ACL; the single socket carries no identity. **Caveat A4:** the service EKU OIDs do not isolate services today — a guest's tartarus client certificate is valid for every tartarus service (§7.6). With `client_auth = "none"` there is nothing to verify at all (§7.3, §8) |
-| T5  | Person B receives/answers person A's prompt (different host users)                                                     | ADV3      | Per-host-user server and single socket in the owner's runtime dir; `SO_PEERCRED` uid check. (§4.2, §9.1)                                                                                  |
+| T4  | Guest/user B impersonates A                                                                                            | ADV2      | The mTLS client certificate is verified against the server's trust roots and the ACL; the listener's socket carries no identity. **Caveat A4:** the service EKU OIDs do not isolate services today — a guest's tartarus client certificate is valid for every tartarus service (§7.6). With `client_auth = "none"` there is nothing to verify at all (§7.3, §8) |
+| T5  | Person B receives/answers person A's prompt (different host users)                                                     | ADV3      | Per-host-user server and its listeners in the owner's runtime dir; `SO_PEERCRED` uid check. (§4.2, §9.1)                                                                                  |
 | T6  | Person B receives person A's prompt (same guest account, different host users)                                         | ADV3      | Per-session guest bind path + `SUDO_AUTH_PROXY_SOCK` (guaranteed by `sudoers env_keep`) selects the session owner. Same-UID redirection remains R6; multiplexer caveat §4.6.              |
 | T7  | A non-whitelisted requester triggers elevation                                                                         | ADV1      | Cryptographic ACL evaluated before the dialog, default deny. (§8)                                                                                                                         |
 | T8  | Network attacker MITM on a callback transport                                                                          | ADV4      | `tcp` defaults to mTLS (EKU + CA), `vsock` optional. `tcp` + `none` is allowed but leaves both confidentiality *and* authentication to the network: a MITM can forge a decision. (§7.4) |
@@ -1947,6 +2032,29 @@ untrusted; host user space is trusted but not other host users; CA keys are root
 
 ### 14.3 Configuration
 
+**Server listeners (hard break, no aliases).** The flat server options are
+**removed outright** — `tartarus.sudo-auth-proxy.server.{transport,host,port,cid,
+socket,socketDirMode,socketMode,connectTimeout,decisionTimeout,recvTimeout,
+maxConnections,serverReadTimeout,resolution,security,mtls,acl}` no longer exist
+(the same applies to `extraServer`). A consumer that set them must migrate to:
+
+- `server.transports = [ { type = "…"; … } ]` — one entry per listener, and
+- `server.transportDefaults = { … }` — shared per-field defaults deep-merged into
+  every entry by the Python.
+
+A partially-migrated config therefore **fails evaluation loudly**, rather than
+silently binding the wrong transport. The old mixed-`vsock`/`tcp` warning and the
+`unix`+callback `throw` in `nix/host/services.nix` are **gone**: the module emits
+one listener per kind and both call directions coexist (§3.4). The client/PAM
+options (`tartarus.sudo-auth-proxy.*`, i.e. everything outside `server.*`) are
+**unchanged** and still take one transport each.
+
+**Python legacy fallback (not a Nix option).** The Python keeps accepting a legacy
+**flat** server `config.toml` as one implicit listener, so
+`examples/sudo-auth-proxy-server.toml`, hand-written files and the standalone
+package keep working unchanged (§7.9). This compatibility rule lives only in the
+Python; there is no Nix option for it.
+
 - `transport` gains `"unix"` alongside `"vsock"`/`"tcp"`.
 - The `[security]` model (`transport_encryption`, `server_auth`, `client_auth`)
   replaces the loose `mtls`/`protocol` options. `mtls.enable = true` is still
@@ -2046,8 +2154,8 @@ start.
 
 A host can run one additional, independent server alongside the legacy
 `server`. The home-manager option
-`tartarus.sudo-auth-proxy.extraServer` has its own `transport`, `security`,
-`acl`, `mtls`, settings and `name`; it runs as the unit
+`tartarus.sudo-auth-proxy.extraServer` has its own `transports` /
+`transportDefaults`, `extraSettings` and `name`; it runs as the unit
 `sudo-auth-proxy-<name>` with the config file
 `~/.config/sudo-auth-proxy/<name>.toml` (and its own runtime directory). This is
 what lets one host serve its tartarus guests on the callback transport **and** a
@@ -2065,14 +2173,17 @@ the root config and recurses.)
 #### NixOS / nix-darwin (the shipped path)
 
 1. Ensure the host's SSH config reaches the guest (existing tartarus setup).
-2. Enable the server and its trust roots: the `[acl]` policy and the `[mtls]`
-   certificate material. **The shipped tartarus host module derives all of this
-   (audit A1):** `nix/host/services.nix` emits a usable `[acl]` (`mode = "ca"`
-   with the tartarus CA + the sudo client OID), selects one server transport from
-   the guests' `services.sudoAuthProxyTransport` markers (mixing transports
-   across the guests of one host is an evaluation error), and turns mTLS on for
-   the `unix` path. Set these options by hand only when not using the tartarus
-   host module.
+2. Enable the server and its trust roots: the per-listener `[acl]` policy and
+   `[mtls]` certificate material. **The shipped tartarus host module derives all
+   of this (audit A1):** `nix/host/services.nix` emits a `server.transports` list
+   with one listener per distinct transport the guests'
+   `services.sudoAuthProxyTransport` markers ask for (`vsock`/`tcp` for
+   containers and no-VSOCK guests, `unix` for the SSH-forwarded path), gives the
+   `unix` listener `acl.mode = "ca"` with the tartarus CA + sudo client OID and
+   mTLS, and gives the callback listeners `acl.mode = "none"` with no
+   encryption. Mixing transports across the guests of one host is **no longer an
+   evaluation error or warning** — the listeners coexist. Set these options by
+   hand only when not using the tartarus host module.
 3. Enable the SSH-forward wrapper for the chosen host patterns. The guest-side
    path template uses `%r` (resolved login user) and `%h` (destination as typed);
    the wrapper expands them, expands `%t` for the host socket itself, and appends
@@ -2093,9 +2204,9 @@ the root config and recurses.)
 
    `hosts` defaults to the VMs (`<name>.trs`) and containers (`<name>`) of every
    enabled guest whose `services.sudoAuthProxyTransport = "unix"`.
-   `%t/sudo-auth-proxy/server.sock` is the single host server socket every
-   session forwards to; there is no per-guest socket. With an empty `hosts` the
-   wrapper is a pure pass-through.
+   `%t/sudo-auth-proxy/server.sock` is the unix listener's socket every session
+   forwards to; there is no per-guest socket. With an empty `hosts` the wrapper
+   is a pure pass-through.
 
    The wrapper is installed as **`sudo-auth-proxy-ssh`**; it does not shadow
    plain `ssh` unless `shadowSsh = true` (off by default). So a plain
@@ -2125,6 +2236,63 @@ ready-to-edit pair:
 | ----------------------------------- | -------------------------------------------------------------- |
 | `examples/sudo-auth-proxy-server.toml` | Annotated `~/.config/sudo-auth-proxy/config.toml` for a `vsock` server with no encryption and no authentication. |
 | `examples/sudo-auth-proxy.service`  | A systemd **user** unit that runs it inside the approver's graphical session. |
+
+**Multiple listeners without Nix.** The list form binds several listeners in one
+process; the flat file above is a single implicit listener kept for
+compatibility. A `vsock` callback and an SSH-forwarded `unix` listener can
+coexist, each with its own security:
+
+```toml
+mode = "server"
+dialog_program = "zenity"
+
+[transport_defaults]
+port = 65001
+recv_timeout = 0.5
+decision_timeout = 120
+
+[transport_defaults.security]
+transport_encryption = "auto"
+client_auth = "transport"
+server_auth = "transport"
+
+[transport_defaults.acl]
+mode = "list"
+
+[[transports]]
+type = "vsock"
+cid = 2
+
+[transports.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+[transports.acl]
+mode = "none"
+
+[[transports]]
+type = "unix"
+socket = "%t/sudo-auth-proxy/server.sock"
+
+[transports.security]
+transport_encryption = "mtls"
+client_auth = "transport"
+server_auth = "transport"
+
+[transports.mtls]
+enable = true
+ca_file = "./ca.crt"
+cert_file = "./server.crt"
+key_file = "./server.key"
+required_oid = "1.3.6.1.4.1.99999.1.1"
+peer_required_oid = "1.3.6.1.4.1.99999.1.2"
+
+[transports.acl]
+mode = "ca"
+ca_file = "./ca.crt"
+required_oid = "1.3.6.1.4.1.99999.1.2"
+```
 
 1. Install the script and its one dependency:
 
@@ -2235,7 +2403,7 @@ ready-to-edit pair:
 
 **Identity & auth**
 
-- [ ] Exactly one listening socket per transport; no per-guest server socket.
+- [ ] One listener per `server.transports` entry (any mix of `vsock`/`tcp`/`unix`); no per-guest server socket.
 - [ ] `tcp` + `none` is warned as insecure (no confidentiality, no authentication).
 - [ ] `transport_encryption = "mtls"` ⇒ **both** `client_auth` and `server_auth` are `"transport"`.
 - [ ] `client_auth`/`server_auth` are each exactly `"transport"` or `"none"` — no other value is accepted anywhere in the code.
@@ -2429,7 +2597,10 @@ is fixed inline and mapped below. Every item here is also bound to a phase in th
 A third pass applied the operator's review of the transport and authentication
 model. The **single host socket** replaces per-guest sockets; authentication
 becomes an explicit three-knob model; and several insecure or awkward features
-are removed. Inline edits above carry these IDs.
+are removed. Inline edits above carry these IDs. (The single-socket-per-transport
+part of S1 is later **superseded** by the multi-listener model of §3.4: a server
+now binds one listener per `transports` entry. The lasting point is that no
+socket carries guest identity.)
 
 | ID  | Change                                                                                                                                                                                  | Where                     |
 | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |

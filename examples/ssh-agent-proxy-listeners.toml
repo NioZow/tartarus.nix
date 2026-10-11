@@ -1,0 +1,107 @@
+# ssh-agent-proxy — multi-listener host-side server configuration (no Nix required)
+#
+# This is the *multi-transport* sibling of `examples/ssh-agent-proxy-server.toml`
+# (the legacy flat form, still accepted as a single implicit listener). It binds
+# **two listeners in the one server process**:
+#
+#   * `vsock`  a Linux MicroVM dials the host callback endpoint; the peer is
+#              named from the local VM bookkeeping (`resolution = "tartarus"`);
+#   * `unix`   the host accepts the guest's `ssh -R` forwarded socket and the
+#              bridge wraps it in mTLS; the verified certificate CN names the
+#              peer (`resolution = "certificate"`).
+#
+# The document shape is a `[transport_defaults]` table (deep-merged into every
+# listener) followed by one `[[transports]]` entry per listener. The global
+# policy — the `vm`/`tcp_vm` maps, `key`, `rule`, `forward_sockets`,
+# `default_agent_socket_path`, `known_hosts_files`, `libvirt_uri` — is written
+# once at the top level, because every listener shares it; only the bind target,
+# `resolution` and `[security]`/`[mtls]` are per listener.
+#
+# Copy to ~/.config/ssh-agent-proxy/config.toml and run:
+#
+#   ssh-agent-proxy --config ~/.config/ssh-agent-proxy/config.toml
+#
+# Paths are resolved relative to this file's directory (`./server.crt` means
+# "next to this config"), except `%t/...` which expands to the runtime dir.
+
+# ---------------------------------------------------------------------------
+mode = "proxy"
+
+# ---------------------------------------------------------------------------
+# Global policy, shared by both listeners. The agent socket identities are drawn
+# from when `forward_sockets` is not set explicitly; here it is set explicitly.
+# ---------------------------------------------------------------------------
+default_agent_socket_path = "%t/ssh-agent"
+forward_sockets = ["%t/ssh-agent"]
+debug = false
+
+# ---------------------------------------------------------------------------
+# [transport_defaults] — every field of every listener. The callback listener is
+# VSOCK (point-to-point), so authentication is explicitly off by default; the
+# `unix` entry below overrides the security to mTLS.
+# ---------------------------------------------------------------------------
+[transport_defaults]
+port = 65000
+cid = 2
+host = "127.0.0.1"
+socket = "%t/ssh-agent-proxy/server.sock"
+socket_dir_mode = "0700"
+socket_mode = "0600"
+connect_timeout = 10.0
+handshake_timeout = 10.0
+decision_timeout = 120
+
+[transport_defaults.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+# ---------------------------------------------------------------------------
+# [[transports]] #1 — the VSOCK callback. The peer's name comes from the static
+# CID map / libvirt (`"tartarus"`, and `"mofos"` when a `libvirt_uri` is set);
+# the security is the unauthenticated default.
+# ---------------------------------------------------------------------------
+[[transports]]
+type = "vsock"
+cid = 2
+resolution = "tartarus"
+
+[transports.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+# ---------------------------------------------------------------------------
+# [[transports]] #2 — the SSH-forwarded Unix socket. The guest runs the bridge,
+# which wraps the forwarded stream in TLS; this server terminates it. The
+# verified client certificate CN becomes the identity, so per-guest rules work.
+# `"tartarus"`/`"mofos"` are invalid on `unix` (there is no CID or IP to map).
+# ---------------------------------------------------------------------------
+[[transports]]
+type = "unix"
+socket = "%t/ssh-agent-proxy/server.sock"
+resolution = "certificate"
+
+[transports.security]
+transport_encryption = "mtls"
+client_auth = "transport"
+server_auth = "transport"
+
+[transports.mtls]
+enable = true
+ca_file = "./ca.crt"
+cert_file = "./server.crt"
+key_file = "./server.key"
+required_oid = "1.3.6.1.4.1.99999.2.1"      # this (server) certificate
+peer_required_oid = "1.3.6.1.4.1.99999.2.2" # the peer (client) certificate
+
+# ---------------------------------------------------------------------------
+# Global rule policy. With `resolution = "none"` on a listener only wildcard
+# rules can match; here the VSOCK listener resolves a name and the `unix`
+# listener a certificate CN, so a specific `vm_names` could be used too.
+# ---------------------------------------------------------------------------
+[[rule]]
+key = "*"
+match.vm_names = ["*"]
+auth = "ask"
+data_signing = "deny"
