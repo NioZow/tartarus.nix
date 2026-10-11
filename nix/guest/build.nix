@@ -394,6 +394,10 @@
 
   mkSpecialArgs = guest: {
     inherit inputs self system nixVersion;
+    # nixcfg home/system modules expect the hostname specialArg (the host
+    # builders always pass it); a guest's is its own name, mirroring
+    # `networking.hostName` in guest/network.nix.
+    hostname = guest.name;
     tartarusGuest = guest;
     mkServiceSystem = mkServiceSystem;
     # System-scope alias for the guest's own units (mirrors the old builder).

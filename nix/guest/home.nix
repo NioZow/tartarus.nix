@@ -42,6 +42,7 @@ in {
       inherit inputs system nixVersion pkgs-unstable self;
       mkService = mkServiceHome;
       username = g.user.name;
+      hostname = g.name;
       homeDir = g.user.home;
       # Let the user's home-manager imports see the source guest record.
       tartarusGuest = g;
