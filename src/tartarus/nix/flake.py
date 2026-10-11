@@ -51,6 +51,17 @@ def ctn_config_attr(name: str) -> str:
     return f"nixosConfigurations.{CTN_PREFIX}{name}"
 
 
+def ctn_build_attr(name: str) -> str:
+    """The buildable attribute for container ``name``.
+
+    ``nix build .#nixosConfigurations.<name>`` no longer works on recent Nix:
+    it inspects the configuration's top-level ``type`` attribute (the module
+    system's type descriptor, a set) expecting a string. Address the closure
+    explicitly, exactly like ``nixos-container`` does.
+    """
+    return f"{ctn_config_attr(name)}.config.system.build.toplevel"
+
+
 def _attr_root(config: Config, kind: str) -> str:
     return f"packages.{config.system}" if kind == "vm" else "nixosConfigurations"
 

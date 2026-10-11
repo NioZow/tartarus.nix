@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from tartarus import cli, vm  # noqa: E402
+from tartarus import cli, ctn, vm  # noqa: E402
 from tartarus.config import Config, Guest  # noqa: E402
 from tartarus.nix import flake  # noqa: E402
 
@@ -330,3 +330,26 @@ def test_upgrade_defaults_to_false(monkeypatch, command: str):
     cli.main([command, "vault"])
 
     assert seen == [False]
+
+
+# --- ctn.action_build: build the explicit toplevel, not the config attr ---
+
+
+def test_ctn_action_build_targets_toplevel(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, BOX)
+    monkeypatch.setattr(ctn, "require_template", lambda _c, _n: None)
+    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "box")
+
+    calls: list = []
+    monkeypatch.setattr(ctn.nix_eval, "build", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    ctn.action_build(config, "box")
+
+    assert len(calls) == 1
+    args, _kwargs = calls[0]
+    assert args[1] == "nixosConfigurations.ctn-box.config.system.build.toplevel"
+
+
+def test_ctn_build_attr_appends_toplevel():
+    assert flake.ctn_build_attr("box") == "nixosConfigurations.ctn-box.config.system.build.toplevel"
+    assert flake.ctn_config_attr("box") == "nixosConfigurations.ctn-box"

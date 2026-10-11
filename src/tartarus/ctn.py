@@ -422,7 +422,7 @@ def action_build(config: Config, name: str, upgrade: bool = False) -> None:
 
     state = config.state_dir(name)
     state.mkdir(parents=True, exist_ok=True)
-    nix_eval.build(flake.flake_ref(config), flake.ctn_config_attr(base), state / "result")
+    nix_eval.build(flake.flake_ref(config), flake.ctn_build_attr(base), state / "result")
     ok(f"'{name}' built. Result: {state / 'result'}")
 
 
