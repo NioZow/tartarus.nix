@@ -131,6 +131,11 @@
   # VM with `vm.containerHost.enable` receives them; a plain VM gets none.
   innerByHost = hostName: let
     host = vmGuests.${hostName} or {};
+    # A nested container inherits the host-wide `privateUsers` default too; the
+    # resolution happens here (the host-config boundary) because the nested
+    # container is declared inside the VM, which has no access to the host's
+    # `tartarus.containers.privateUsers`.
+    defaultPrivateUsers = config.tartarus.containers.privateUsers or "no";
   in
     if (host.vm.containerHost.enable or false)
     then
@@ -138,7 +143,14 @@
       (n: c: {
         name = n;
         id = ctnIds.${n};
-        cfg = c;
+        cfg =
+          c
+          // {
+            privateUsers =
+              if (c.privateUsers or null) == null
+              then defaultPrivateUsers
+              else c.privateUsers;
+          };
       })
       (lib.filterAttrs (_: c: (c.host or null) == hostName) ctnGuests)
     else [];

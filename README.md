@@ -120,6 +120,7 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `kind` | `"vm"` \| `"container"` | `"vm"` | Guest kind. |
 | `id` | null or int | `null` | Static id 3-100 (determines IP/MAC/CID); auto-assigned from 101 when null. |
 | `host` | null or str | `null` | For a `kind = "container"` guest, run it nested inside the named container-host VM (`kind = "vm"` with `vm.containerHost.enable = true`). Required on Darwin; `null` keeps the native host-kernel nspawn path on Linux. |
+| `privateUsers` | null \| `"no"` \| `"identity"` \| `"pick"` \| int | `null` | Container only. Give the container its own user namespace (`systemd-nspawn --private-users`): it still starts as host root for networking, but its internal UIDs/GIDs no longer map 1:1. `null` (default) inherits the host-wide `tartarus.containers.privateUsers`; set it here to override per guest. `"identity"` is capability isolation only; `"pick"`/an int is real UID isolation but requires ID-mapped-mount support on the CA/share source filesystems (tartarus attaches `idmap` to its bind mounts automatically). |
 | `graphical` | bool | `false` | Graphical remote display via the `wprs` transport. |
 | `internet` | bool | `true` | Direct NAT egress. Mutually exclusive with `proxy.enable`. |
 | `sharedFolder` | bool | `false` | Mount a per-guest host directory at `~/shared`. |
@@ -160,8 +161,16 @@ disabled or unknown name is refused before any build, state-dir creation or SSH
 Tartarus also exposes host options for the CA (`tartarus.ca.*`), system SSH
 trust (`tartarus.ssh.*`), the generated CLI config
 (`tartarus.flakePath`, `tartarus.stateRoot`, `tartarus.sshDir`,
-`tartarus.system`, `tartarus.log`), and the host resource ceilings that resolve
-`vm.mem` / `vm.vcpu = "host"` (`tartarus.hostMemoryMiB`, `tartarus.hostCores`).
+`tartarus.system`, `tartarus.log`), the host resource ceilings that resolve
+`vm.mem` / `vm.vcpu = "host"` (`tartarus.hostMemoryMiB`, `tartarus.hostCores`),
+`tartarus.containers.sudoNoPassword` — off by default; when enabled it adds a
+scoped `NOPASSWD` sudo rule for `systemctl <verb> container@*` so
+`tartarus start`/`stop <container>` no longer prompts (Linux only) — and
+`tartarus.containers.privateUsers`, the host-wide default user namespace for
+every `kind = "container"` guest (default `"no"`; set `"pick"` to make them all
+unprivileged in one place). A container overrides it with
+`tartarus.guests.<name>.privateUsers`; VMs ignore it. See
+[`privateUsers`](#tartarusguestsname).
 
 ### Memory management
 

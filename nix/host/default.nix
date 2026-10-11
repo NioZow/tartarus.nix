@@ -59,6 +59,10 @@
         assertion = !(guest.vmOnly && guest.kind == "container");
         message = "tartarus: guest '${name}' sets `vmOnly = true` but `kind = \"container\"`; a VM-only guest cannot run as an nspawn container.";
       }
+      {
+        assertion = guest.privateUsers == null || guest.kind == "container";
+        message = "tartarus: guest '${name}' sets `privateUsers` but is not a `kind = \"container\"`; user namespacing (`systemd-nspawn --private-users`) is container-only.";
+      }
     ])
     guests);
 
@@ -207,9 +211,14 @@ in {
     # even be imported on NixOS (a `mkIf false` definition would still require
     # the option to exist).
     ++ lib.optionals isDarwin [./linux-builder.nix]
-    # Native host-side containers are the NixOS `containers.<name>` model, which
-    # nix-darwin does not define; import this only where the option exists.
-    ++ lib.optionals isLinux [(import ./containers.nix {inherit inputs self;})];
+    # Both of these define NixOS-only options that nix-darwin does not have
+    # (native `containers.<name>`, and `security.sudo.extraRules` for their
+    # passwordless rule), so they must not even be imported where the option
+    # does not exist -- a `mkIf false` definition would still require it.
+    ++ lib.optionals isLinux [
+      (import ./containers.nix {inherit inputs self;})
+      ./container-sudo.nix
+    ];
 
   options.tartarus.internalAssertions = mkOption {
     type = types.listOf types.unspecified;

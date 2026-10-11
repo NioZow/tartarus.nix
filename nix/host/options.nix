@@ -9,6 +9,10 @@
     types
     ;
   shared = import ../lib/types.nix {inherit lib;};
+
+  # A `--private-users` value: nspawn's modes plus a numeric UID/GID base.
+  # Shared by the host-wide default and the per-guest override.
+  privateUsersType = types.either types.ints.u32 (types.enum ["no" "identity" "pick"]);
 in {
   options.tartarus.proxy = {
     enable = mkEnableOption "the tartarus HTTP proxy";
@@ -59,6 +63,60 @@ in {
     };
   };
 
+  # Passwordless sudo for the `container@<name>` units the tartarus CLI drives.
+  # Starting/stopping a container is a root operation (`sudo systemctl start
+  # container@<name>`, see src/tartarus/ctn.py), so without this every
+  # `tartarus start`/`stop` prompts. Enabling it adds a scoped `NOPASSWD` rule
+  # for `systemctl <verb> container@*` only; nothing else is unlocked.
+  options.tartarus.containers.sudoNoPassword = {
+    enable = mkEnableOption "passwordless sudo for `systemctl <verb> container@*` (starting/stopping tartarus containers)";
+
+    verbs = mkOption {
+      type = types.listOf (types.enum ["start" "stop" "restart"]);
+      default = ["start"];
+      description = "`systemctl` verbs granted without a password.";
+    };
+
+    users = mkOption {
+      type = types.listOf (types.either types.str types.int);
+      default = [];
+      description = "Users granted the passwordless container rule.";
+    };
+
+    groups = mkOption {
+      type = types.listOf (types.either types.str types.int);
+      default = ["wheel"];
+      description = "Groups granted the passwordless container rule.";
+    };
+  };
+
+  # Host-wide default user namespace for every `kind = "container"` guest. The
+  # per-guest `tartarus.guests.<name>.privateUsers` overrides it (including back
+  # to `"no"`); VMs ignore it entirely.
+  options.tartarus.containers.privateUsers = mkOption {
+    type = privateUsersType;
+    default = "no";
+    description = ''
+      Give every `kind = "container"` guest on this host its own user namespace
+      (`systemd-nspawn --private-users`), unless the guest overrides it. The
+      container still starts as host root -- networking, bridges and nftables
+      are unchanged -- but its internal UIDs/GIDs no longer map 1:1 to the
+      host's.
+
+      `"no"` (default) disables it. `"identity"` maps UIDs 1:1 and only
+      provides process-capability isolation. `"pick"` lets nspawn choose a
+      disjoint UID range per container automatically (the recommended mode);
+      a number pins the range's base (usually 65536 or above). `"pick"`/a
+      number is the real UID isolation but requires the kernel and the
+      bind-mount source filesystems to support ID-mapped mounts: tartarus
+      attaches the `idmap` mount option to its CA/shares bind mounts so their
+      host ownership stays visible inside the guest. On source filesystems
+      without ID-mapped-mount support those binds fall back to
+      `nobody`/`nogroup` and the guest will not start cleanly. A guest opts out
+      (or picks a different range) with `tartarus.guests.<name>.privateUsers`.
+    '';
+  };
+
   options.tartarus.guests = mkOption {
     type = types.attrsOf (types.submodule {
       options = {
@@ -97,6 +155,28 @@ in {
             Run this `kind = "container"` guest nested inside the named
             container-host VM (`kind = "vm"` with `vm.containerHost.enable =
             true`). Required on Darwin.
+          '';
+        };
+
+        privateUsers = mkOption {
+          type = types.nullOr privateUsersType;
+          default = null;
+          description = ''
+            Per-container override for the user namespace
+            (`systemd-nspawn --private-users`). When `null` (default) the guest
+            inherits the host-wide `tartarus.containers.privateUsers`; set it
+            here to give one container a different range (or `"no"` to opt a
+            single container out of a host-wide default).
+
+            The container still starts as root on the host -- networking,
+            bridges and nftables are unchanged -- but its internal UIDs/GIDs no
+            longer map 1:1 to the host's. `"identity"` maps UIDs 1:1 and only
+            provides process-capability isolation; `"pick"`/a number is the real
+            UID isolation but requires ID-mapped-mount support on the CA/share
+            source filesystems (tartarus attaches `idmap` to its binds
+            automatically).
+
+            Containers only (VMs cannot use it).
           '';
         };
 

@@ -123,6 +123,11 @@
     relays = g.relays;
     requires = g.requires;
     host = g.host or null;
+    # Raw per-guest value: `null` means "inherit
+    # `tartarus.containers.privateUsers`". The native container module resolves
+    # it; the container-only assertion reads this raw value so an explicit
+    # `privateUsers` on a VM is still rejected.
+    privateUsers = g.privateUsers or null;
     containerHost = g.vm.containerHost.enable or false;
   };
 
@@ -140,7 +145,8 @@
     in
       if resolver == null
       then null
-      else resolver
+      else
+        resolver
         // {
           hostVm =
             if resolver.host != null

@@ -1008,6 +1008,69 @@
   nestedAndNativeNft = nftOf hostNestedAndNative;
   nestedAndNativeCtn = nestedAndNativeNft.tartarus_container.content;
 
+  # ==== passwordless container sudo + container user namespacing =========
+  # Feature 1: `tartarus.containers.sudoNoPassword` adds a scoped NOPASSWD rule
+  # for the `container@<name>` units the CLI drives.
+  hostSudoCtn = mkHost {
+    guests.dns = {
+      enable = true;
+      kind = "container";
+      id = 4;
+      internet = true;
+    };
+    modules = [{tartarus.containers.sudoNoPassword.enable = true;}];
+  };
+
+  # Feature 2: a native container asking for its own user namespace.
+  hostCtnPrivate = mkHost {
+    guests.dns = {
+      enable = true;
+      kind = "container";
+      id = 4;
+      internet = true;
+      privateUsers = "pick";
+    };
+  };
+
+  # Feature 3: a host-wide `tartarus.containers.privateUsers` default applies to
+  # every container (native and nested) unless the guest overrides it. `box` is
+  # a VM and must be left untouched by the default.
+  hostCtnPrivateDefault = mkHost {
+    modules = [{tartarus.containers.privateUsers = "pick";}];
+    guests = {
+      dns = {
+        enable = true;
+        kind = "container";
+        id = 4;
+        internet = true;
+      };
+      over = {
+        enable = true;
+        kind = "container";
+        id = 5;
+        internet = true;
+        privateUsers = "no";
+      };
+      box = {
+        enable = true;
+        kind = "vm";
+        id = 6;
+        internet = true;
+      };
+    };
+  };
+
+  # `privateUsers` is container-only; a VM asking for it must be rejected.
+  hostBadPrivateVm = mkHost {
+    guests.box = {
+      enable = true;
+      kind = "vm";
+      id = 5;
+      internet = true;
+      privateUsers = "pick";
+    };
+  };
+
   # A nested container that opts into the host proxy. The step-7 assertion
   # rejects it, but the option-level `tartarus.proxy.clients` must exclude it
   # defensively -- hence this host is only ever inspected through the option,
@@ -1271,6 +1334,9 @@
     # exercised faithfully.
     hostMemoryMiB ? null,
     hostCores ? null,
+    # Host-wide `tartarus.containers.privateUsers`; omitted when null so the
+    # "option unset" path is exercised faithfully.
+    containersPrivateUsers ? null,
   }:
     self.lib.mkGuests {
       inherit inputs;
@@ -1287,7 +1353,10 @@
             guests = guests;
           }
           // (lib.optionalAttrs (hostMemoryMiB != null) {inherit hostMemoryMiB;})
-          // (lib.optionalAttrs (hostCores != null) {inherit hostCores;});
+          // (lib.optionalAttrs (hostCores != null) {inherit hostCores;})
+          // (lib.optionalAttrs (containersPrivateUsers != null) {
+            containers.privateUsers = containersPrivateUsers;
+          });
       };
     };
 
@@ -1488,6 +1557,54 @@
     };
   };
   chAutoVm = chAutoGuests.nixosConfigurations."vm-ch";
+
+  # The same nesting with the inner container asking for its own user namespace,
+  # so its nested binds must be re-expressed as id-mapped `extraFlags` too.
+  chPrivateGuests = mkGuests {
+    globalProxy.enable = false;
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        privateUsers = "pick";
+      };
+    };
+  };
+  chPrivateVm = chPrivateGuests.nixosConfigurations."vm-ch";
+
+  # The host-wide `privateUsers` default must reach a *nested* container (whose
+  # declaration lives inside the VM, with no access to the host's option).
+  chPrivateDefaultGuests = mkGuests {
+    globalProxy.enable = false;
+    containersPrivateUsers = "pick";
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+      };
+    };
+  };
+  chPrivateDefaultVm = chPrivateDefaultGuests.nixosConfigurations."vm-ch";
 
   # A container-host VM whose nested container requests host services, declares
   # a host relay, and has user shares + sharedFolder -- the feature-parity
@@ -2173,6 +2290,16 @@ in {
         == "/var/lib/tartarus-inner/certs/x509/inner")
       "containers.inner key bind mounts are missing or wrong";
 
+    "container-host/nested-private-users-idmap" =
+      T
+      (chPrivateVm.config.containers.inner.privateUsers
+        == "pick"
+        && chPrivateVm.config.containers.inner.bindMounts == {}
+        && lib.any
+        (f: hasInfix ":/etc/tartarus/ssh:idmap" f)
+        chPrivateVm.config.containers.inner.extraFlags)
+      "a nested privateUsers container did not get id-mapped extraFlags";
+
     # Native (host-side) containers must be declared as NixOS `containers.<name>`
     # so activation writes the `/etc/nixos-containers/<name>.conf` registration
     # the CLI keys off; without it `trs list` reports "not provisioned".
@@ -2213,6 +2340,69 @@ in {
         == "10.201.0.1"
         && dnsNativeCtn.config.networking.defaultGateway.interface == "eth0")
       "a native container did not get a default route via its host bridge";
+
+    # Passwordless container sudo: a scoped NOPASSWD rule for `systemctl <verb>
+    # container@*` is emitted (and only that command).
+    "host-containers/sudo-no-password" =
+      T
+      (let
+        cmds = lib.concatMap (r: r.commands) hostSudoCtn.config.security.sudo.extraRules;
+      in
+        lib.any
+        (c:
+          c.command
+          == "/run/current-system/sw/bin/systemctl start container@*"
+          && lib.elem "NOPASSWD" c.options)
+        cmds)
+      "tartarus.containers.sudoNoPassword did not add the passwordless container rule";
+
+    # A private user namespace moves the CA binds off plain `bindMounts` onto
+    # id-mapped nspawn binds (`extraFlags`) and sets `privateUsers` through.
+    "host-containers/private-users-idmap-binds" =
+      T
+      (hostCtnPrivate.config.containers.dns.privateUsers
+        == "pick"
+        && hostCtnPrivate.config.containers.dns.bindMounts == {}
+        && (let
+          flags = hostCtnPrivate.config.containers.dns.extraFlags;
+          expected = "--bind-ro=${hostCtnPrivate.config.tartarus.ca.ssh.machinesDir}/containers/dns:/etc/tartarus/ssh:idmap";
+        in
+          lib.any (f: f == expected) flags))
+      "privateUsers did not re-express the CA binds as id-mapped extraFlags";
+
+    # A host-wide `tartarus.containers.privateUsers` default applies to every
+    # container, is overridable per guest, and leaves VMs alone.
+    "host-containers/private-users-host-default" =
+      T
+      (hostCtnPrivateDefault.config.containers.dns.privateUsers
+        == "pick"
+        && hostCtnPrivateDefault.config.containers.dns.bindMounts == {}
+        && lib.any
+        (f: hasInfix ":/etc/tartarus/ssh:idmap" f)
+        hostCtnPrivateDefault.config.containers.dns.extraFlags
+        && hostCtnPrivateDefault.config.containers.over.privateUsers == "no"
+        && hostCtnPrivateDefault.config.containers.over.bindMounts
+        ? "/etc/tartarus/ssh")
+      "the host-wide privateUsers default was not applied or not overridable";
+
+    "assertions/private-users-host-default-vm-ok" =
+      T
+      (assertionsPass hostCtnPrivateDefault)
+      "a VM on a host with a container privateUsers default was rejected";
+
+    "assertions/private-users-vm-rejected" =
+      T (!assertionsPass hostBadPrivateVm) "a VM with `privateUsers` was accepted";
+
+    # The host-wide default must also reach a nested (container-host) container.
+    "container-host/nested-private-users-host-default" =
+      T
+      (chPrivateDefaultVm.config.containers.inner.privateUsers
+        == "pick"
+        && chPrivateDefaultVm.config.containers.inner.bindMounts == {}
+        && lib.any
+        (f: hasInfix ":/etc/tartarus/ssh:idmap" f)
+        chPrivateDefaultVm.config.containers.inner.extraFlags)
+      "the host-wide privateUsers default did not reach a nested container";
 
     # Feature parity: a nested container's services, relays and shares are wired
     # into the container-host VM (the VM DNATs services/relays out to the host /

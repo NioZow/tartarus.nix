@@ -17,7 +17,11 @@
 # cgroup-v2 delegation, host-key permissions over virtiofs, persisted state
 # across a VM restart) was intentionally skipped. Everything here evaluates,
 # but the runtime behaviours are unverified until that spike is run.
-{innerContainers ? [], dnsLocation ? null, proxyLocation ? null}: {
+{
+  innerContainers ? [],
+  dnsLocation ? null,
+  proxyLocation ? null,
+}: {
   config,
   lib,
   pkgs,
@@ -44,6 +48,7 @@
     ;
   g = tartarusGuest;
   ids = import ../lib/ids.nix {inherit lib;};
+  binds = import ../lib/binds.nix {inherit lib;};
   sharePolicy = import ../lib/shares.nix {inherit lib;};
 
   ch = g.vm.containerHost;
@@ -77,7 +82,8 @@
         ++ optional (
           (inner.cfg.services.sshAgentProxy or false)
           && ((inner.cfg.services.sshAgentProxyTransport or "vsock") != "unix")
-        ) 65000
+        )
+        65000
         ++ optional (inner.cfg.services.clipboardBridge or false) 27795
     )
     innerContainers);
@@ -314,7 +320,13 @@ in {
       # Bind when the address appears rather than requiring the bridge to be up
       # at dnsmasq start; the bridge is created by systemd-networkd.
       bind-dynamic = true;
-      server = [(if ch.dns.upstream != null then ch.dns.upstream else g.platform.gateway)];
+      server = [
+        (
+          if ch.dns.upstream != null
+          then ch.dns.upstream
+          else g.platform.gateway
+        )
+      ];
       no-resolv = true;
     };
   };
@@ -327,7 +339,59 @@ in {
   # container claim the same host address.
   containers = listToAttrs (
     map (
-      inner:
+      inner: let
+        # The host's CA-signed host key and mTLS client material reach the VM
+        # via shares.nix. The host key is staged root-owned under /run (sshd
+        # refuses a key it does not own) and bound from there; `/run/tartarus`
+        # covers the host-key path a MicroVM uses. The X509 client material is
+        # bound straight from the share (owned by the guest user, as the
+        # clients need), so it needs no staging and self-heals if the host
+        # provisions it after the VM booted.
+        bindMounts =
+          {
+            "/etc/tartarus/ssh" = {
+              hostPath = "${stageDir inner.name}/ssh";
+              isReadOnly = true;
+            };
+            "/etc/tartarus/x509" = {
+              hostPath = certsX509 inner.name;
+              isReadOnly = true;
+            };
+            "/run/tartarus" = {
+              hostPath = "${stageDir inner.name}/ssh";
+              isReadOnly = true;
+            };
+          }
+          # The inner container's user shares and `~/shared`. A share whose
+          # source is store-snapshotted is bound straight from `/nix/store`
+          # (visible via the VM's ro-store, no device needed); the rest come
+          # from the VM path `nix/guest/shares.nix` mounts under the
+          # container's inner directory. Either way, read-only stays read-only
+          # at the container's own mount point.
+          // listToAttrs (map (s:
+            nameValuePair s.mountPoint (
+              if sharePolicy.needsStoreSnapshot g.platform s
+              then {
+                hostPath = innerSnapshot s;
+                isReadOnly = true;
+              }
+              else {
+                hostPath = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
+                isReadOnly = s.readOnly or false;
+              }
+            ))
+          (inner.cfg.shares or []))
+          // optionalAttrs (inner.cfg.sharedFolder or false) {
+            "/home/user/shared" = {
+              hostPath = innerShared inner.name;
+              isReadOnly = false;
+            };
+          };
+
+        # A shifted UID range (`privateUsers`) forces these binds onto
+        # id-mapped `extraFlags`; otherwise they stay plain bind mounts.
+        bindSpec = binds.render (inner.cfg.privateUsers or "no") bindMounts;
+      in
         nameValuePair inner.name {
           # Only the inner containers that asked for it autostart, driven by
           # each guest's own `tartarus.guests.<name>.autostart`. The
@@ -339,6 +403,7 @@ in {
           # State persists on the /var/lib/nixos-containers volume below.
           ephemeral = false;
           privateNetwork = true;
+          privateUsers = inner.cfg.privateUsers or "no";
           hostBridge = bridge;
 
           # `config` is a single NixOS module, not a list: nixos-containers.nix
@@ -349,54 +414,7 @@ in {
           # so home-manager can activate (see homeTmpfilesModule).
           config = {imports = inner.modules ++ [(homeTmpfilesModule inner)];};
           specialArgs = inner.specialArgs;
-
-          # The host's CA-signed host key and mTLS client material reach the VM
-          # via shares.nix. The host key is staged root-owned under /run (sshd
-          # refuses a key it does not own) and bound from there; `/run/tartarus`
-          # covers the host-key path a MicroVM uses. The X509 client material is
-          # bound straight from the share (owned by the guest user, as the
-          # clients need), so it needs no staging and self-heals if the host
-          # provisions it after the VM booted.
-          bindMounts =
-            {
-              "/etc/tartarus/ssh" = {
-                hostPath = "${stageDir inner.name}/ssh";
-                isReadOnly = true;
-              };
-              "/etc/tartarus/x509" = {
-                hostPath = certsX509 inner.name;
-                isReadOnly = true;
-              };
-              "/run/tartarus" = {
-                hostPath = "${stageDir inner.name}/ssh";
-                isReadOnly = true;
-              };
-            }
-            # The inner container's user shares and `~/shared`. A share whose
-            # source is store-snapshotted is bound straight from `/nix/store`
-            # (visible via the VM's ro-store, no device needed); the rest come
-            # from the VM path `nix/guest/shares.nix` mounts under the
-            # container's inner directory. Either way, read-only stays read-only
-            # at the container's own mount point.
-            // listToAttrs (map (s:
-              nameValuePair s.mountPoint (
-                if sharePolicy.needsStoreSnapshot g.platform s
-                then {
-                  hostPath = innerSnapshot s;
-                  isReadOnly = true;
-                }
-                else {
-                  hostPath = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
-                  isReadOnly = s.readOnly or false;
-                }
-              ))
-            (inner.cfg.shares or []))
-            // optionalAttrs (inner.cfg.sharedFolder or false) {
-              "/home/user/shared" = {
-                hostPath = innerShared inner.name;
-                isReadOnly = false;
-              };
-            };
+          inherit (bindSpec) bindMounts extraFlags;
         }
     )
     innerContainers

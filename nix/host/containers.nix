@@ -37,6 +37,7 @@
     optionalAttrs
     ;
   ids = import ../lib/ids.nix {inherit lib;};
+  binds = import ../lib/binds.nix {inherit lib;};
   nixVersion = import ../../lib/version.nix;
 
   # Raw module args: this nixpkgs resolves defaulted arguments through
@@ -109,6 +110,14 @@ in {
     containers = listToAttrs (map (name: let
       g = instances.guests.${name};
       attrs = build.mkContainerAttrs name (config.tartarus.guests.${name});
+      # Resolve the per-guest override against the host-wide default.
+      privateUsers =
+        if g.privateUsers == null
+        then config.tartarus.containers.privateUsers
+        else g.privateUsers;
+      # `privateUsers` (when it shifts UIDs) forces the CA/share binds onto
+      # id-mapped `extraFlags`; otherwise they stay plain bind mounts.
+      bindSpec = binds.render privateUsers (mkBindMounts name g);
     in
       nameValuePair name {
         # The CLI owns autostart: a `tartarus start` user service (`autostart.nix`)
@@ -120,8 +129,9 @@ in {
         # so it survives restarts and rebuilds.
         ephemeral = false;
         privateNetwork = true;
+        privateUsers = privateUsers;
         hostBridge = bridge;
-        bindMounts = mkBindMounts name g;
+        inherit (bindSpec) bindMounts extraFlags;
         # `config` is a single NixOS module (nixos-containers.nix appends it
         # to the eval-config module list). Pin `nixpkgs.pkgs` to the host's
         # already-overlaid pkgs so the consumer's overlays survive the
