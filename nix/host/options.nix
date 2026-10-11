@@ -1,7 +1,7 @@
 # The unified `tartarus.*` host option surface: `tartarus.proxy` holds only
 # global transport config (never filtering), and `tartarus.guests.<name>` holds
 # the per-guest metadata + host-enforced networking.
-{lib, ...}: let
+{lib, config, ...}: let
   inherit
     (lib)
     mkEnableOption
@@ -9,6 +9,10 @@
     types
     ;
   shared = import ../lib/types.nix {inherit lib;};
+
+  # The outer (host) config, captured before the guest submodule shadows the
+  # name with its own per-guest `config`.
+  hostConfig = config;
 
   # A `--private-users` value: nspawn's modes plus a numeric UID/GID base.
   # Shared by the host-wide default and the per-guest override.
@@ -117,8 +121,28 @@ in {
     '';
   };
 
+  # Host-wide default container-host VM for every `kind = "container"` guest.
+  # This is what makes "native container on Linux, nested container on macOS"
+  # transparent to the guest author: a guest is declared once (host = null) and
+  # a host that needs nesting sets this single option instead of annotating
+  # every container with `kind`/`host`. A guest's own `host` still wins.
+  options.tartarus.containers.containerHost = mkOption {
+    type = types.nullOr types.str;
+    default = null;
+    description = ''
+      Name of the enabled `kind = "vm"` guest with `vm.containerHost.enable =
+      true` that every `kind = "container"` guest without an explicit `host` is
+      nested into. `null` (default) leaves them as native host-side containers.
+
+      A Linux host keeps containers native and leaves this unset; a Darwin host
+      has no native container support, so it sets this to its container-host VM
+      (e.g. `"ch"`). A guest that must nest elsewhere (or run natively on a host
+      that sets a default) still overrides it with its own `host`.
+    '';
+  };
+
   options.tartarus.guests = mkOption {
-    type = types.attrsOf (types.submodule {
+    type = types.attrsOf (types.submodule ({config, ...}: {
       options = {
         enable = mkEnableOption "this tartarus guest";
 
@@ -150,11 +174,23 @@ in {
 
         host = mkOption {
           type = types.nullOr types.str;
-          default = null;
+          # Defaults to the host-wide `tartarus.containers.containerHost`, so a
+          # host only has to name its container-host VM once and every
+          # container guest nests into it without per-guest `kind`/`host`
+          # boilerplate. `null` on a host that leaves the option unset keeps the
+          # guest a native host-side container. Only containers inherit it; a
+          # VM keeps `host = null` (the option is container-only).
+          default =
+            if config.kind == "container"
+            then hostConfig.tartarus.containers.containerHost
+            else null;
           description = ''
             Run this `kind = "container"` guest nested inside the named
             container-host VM (`kind = "vm"` with `vm.containerHost.enable =
-            true`). Required on Darwin.
+            true`). Defaults to the host-wide
+            `tartarus.containers.containerHost`; set it explicitly to nest a
+            single guest elsewhere. Required on Darwin unless the host-wide
+            option is set.
           '';
         };
 
@@ -288,7 +324,7 @@ in {
           description = "User-defined home-manager configuration for this guest.";
         };
       };
-    });
+    }));
     default = {};
     description = "Declarative tartarus guest definitions.";
   };

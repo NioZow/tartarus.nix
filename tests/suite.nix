@@ -956,6 +956,48 @@
     };
   };
 
+  # The host-wide `tartarus.containers.containerHost` default: a container with
+  # no explicit `host` inherits it, so native-vs-nested stays transparent to the
+  # guest author (Linux leaves it unset, Darwin names its container-host VM).
+  hostCtnHostDefault = mkHost {
+    modules = [{tartarus.containers.containerHost = "ch";}];
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+      };
+    };
+  };
+
+  # A host-wide `containerHost` naming a plain VM (no `vm.containerHost`) is a
+  # mistake and must be rejected rather than silently nesting nowhere.
+  hostCtnHostDefaultBad = mkHost {
+    modules = [{tartarus.containers.containerHost = "plain";}];
+    guests = {
+      plain = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+      };
+    };
+  };
+
   # `host` is container-only; a VM using it fails even when the target is a
   # valid container host.
   hostHostOnVm = mkHost {
@@ -2507,6 +2549,21 @@ in {
 
     "assertions/private-users-vm-rejected" =
       T (!assertionsPass hostBadPrivateVm) "a VM with `privateUsers` was accepted";
+
+    # A host-wide `tartarus.containers.containerHost` nests every container
+    # without an explicit `host`, so the guest author never annotates
+    # native-vs-nested per host.
+    "host-containers/containerhost-default-resolves" =
+      T
+      (hostCtnHostDefault.config.tartarus.instances.guests.inner.host == "ch"
+        && !(lib.elem "inner" hostCtnHostDefault.config.tartarus.instances.container.hostSideNames)
+        && lib.elem "inner" hostCtnHostDefault.config.tartarus.instances.container.enabledNames)
+      "the host-wide containerHost default did not nest a host-less container";
+
+    "assertions/containerhost-default-bad-rejected" =
+      T
+      (!(assertionsPass hostCtnHostDefaultBad))
+      "a containerHost naming a non-container-host VM was accepted";
 
     # The host-wide default must also reach a nested (container-host) container.
     "container-host/nested-private-users-host-default" =

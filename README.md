@@ -119,7 +119,7 @@ the host module at rebuild time; it never points at the tartarus repo itself.
 | `enable` | bool | `false` | Whether this guest *exists* on this host: gates the `vm-`/`ctn-<name>` flake outputs, the host-side CA cert, firewall rules, proxy entries and autostart. It does not force an eager build — builds stay lazy, on `tartarus start` / `nix build`. Disabled guests are absent from the generated `config.toml`. |
 | `kind` | `"vm"` \| `"container"` | `"vm"` | Guest kind. |
 | `id` | null or int | `null` | Static id 3-100 (determines IP/MAC/CID); auto-assigned from 101 when null. |
-| `host` | null or str | `null` | For a `kind = "container"` guest, run it nested inside the named container-host VM (`kind = "vm"` with `vm.containerHost.enable = true`). Required on Darwin; `null` keeps the native host-kernel nspawn path on Linux. |
+| `host` | null or str | `tartarus.containers.containerHost` | For a `kind = "container"` guest, run it nested inside the named container-host VM (`kind = "vm"` with `vm.containerHost.enable = true`). Defaults to the host-wide `tartarus.containers.containerHost`; set it explicitly to nest a single guest elsewhere. `null` keeps the native host-kernel nspawn path on Linux. Required on Darwin unless the host-wide option is set. |
 | `privateUsers` | null \| `"no"` \| `"identity"` \| `"pick"` \| int | `null` | Container only. Give the container its own user namespace (`systemd-nspawn --private-users`): it still starts as host root for networking, but its internal UIDs/GIDs no longer map 1:1. `null` (default) inherits the host-wide `tartarus.containers.privateUsers`; set it here to override per guest. `"identity"` is capability isolation only; `"pick"`/an int is real UID isolation but requires ID-mapped-mount support on the CA/share source filesystems (tartarus attaches `idmap` to its bind mounts automatically). |
 | `graphical` | bool | `false` | Graphical remote display via the `wprs` transport. |
 | `internet` | bool | `true` | Direct NAT egress. Mutually exclusive with `proxy.enable`. |
@@ -170,7 +170,13 @@ scoped `NOPASSWD` sudo rule for `systemctl <verb> container@*` so
 every `kind = "container"` guest (default `"no"`; set `"pick"` to make them all
 unprivileged in one place). A container overrides it with
 `tartarus.guests.<name>.privateUsers`; VMs ignore it. See
-[`privateUsers`](#tartarusguestsname).
+[`privateUsers`](#tartarusguestsname) — and
+`tartarus.containers.containerHost`, the host-wide container-host VM that every
+`kind = "container"` guest without an explicit `host` nests into. A Linux host
+leaves it unset (containers stay native); a Darwin host sets it once to its
+container-host VM (e.g. `"ch"`), so a guest is declared identically on both and
+never annotates native-vs-nested itself. See
+[`host`](#tartarusguestsname).
 
 ### Memory management
 

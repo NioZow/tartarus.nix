@@ -172,7 +172,7 @@
       }
       {
         assertion = !(isDarwin && guest.kind == "container" && hostName == null);
-        message = "tartarus: guest '${name}' is a `kind = \"container\"` on Darwin with no `host`; containers need a Linux kernel, so set `host` to a `kind = \"vm\"` guest with `vm.containerHost.enable = true`.";
+        message = "tartarus: guest '${name}' is a `kind = \"container\"` on Darwin with no `host`; containers need a Linux kernel, so set `host` on the guest, or set the host-wide `tartarus.containers.containerHost` to a `kind = \"vm\"` guest with `vm.containerHost.enable = true`.";
       }
       {
         assertion = !(guest.containerHost && guest.kind == "container");
@@ -180,6 +180,24 @@
       }
     ])
     guests);
+
+  # The host-wide `tartarus.containers.containerHost` must name a valid
+  # container host, so a typo surfaces as an evaluation error rather than every
+  # container silently falling back to native (Linux) or failing the Darwin
+  # no-host assertion with a confusing message.
+  containerHostDefaultAssertion = let
+    hostName = config.tartarus.containers.containerHost;
+    hostGuest =
+      if hostName == null
+      then null
+      else guests.${hostName} or null;
+  in {
+    assertion =
+      hostName
+      == null
+      || (hostGuest != null && hostGuest.kind == "vm" && hostGuest.containerHost);
+    message = "tartarus: `tartarus.containers.containerHost = \"${toString hostName}\"` must name an enabled `kind = \"vm\"` guest with `vm.containerHost.enable = true`.";
+  };
 
   # The full tartarus assertion list. Exposed read-only under an internal
   # option so the eval-level test suite can inspect *these* predicates without
@@ -191,7 +209,8 @@
     ++ requiresAssertions
     ++ mkIdAssertions "vm"
     ++ mkIdAssertions "container"
-    ++ containerHostAssertions;
+    ++ containerHostAssertions
+    ++ [containerHostDefaultAssertion];
 in {
   imports =
     [
