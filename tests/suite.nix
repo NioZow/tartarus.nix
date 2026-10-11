@@ -2748,17 +2748,27 @@ in {
     "hostSudoMixedTransports" =
       T
       (let
-        kinds = hostServerKinds hostSudoMixedTransports "sudo-auth-proxy";
+        transports = hostServerTransports hostSudoMixedTransports "sudo-auth-proxy";
+        kinds = map (t: t.type) transports;
+        tcp = lib.findFirst (t: t.type == "tcp") null transports;
       in
-        hasKind kinds "vsock" && hasKind kinds "tcp")
-      "the sudo server did not bind both a vsock and a tcp listener for a mixed host";
+        hasKind kinds "vsock"
+        && hasKind kinds "tcp"
+        && tcp != null
+        && tcp.host == ids.ctnHostIP)
+      "the sudo server did not bind both a vsock and a tcp listener for a mixed host, or bound the tcp listener on the VM bridge instead of the container bridge";
     "hostSshMixedTransports" =
       T
       (let
-        kinds = hostServerKinds hostSshMixedTransports "ssh-agent-proxy";
+        transports = hostServerTransports hostSshMixedTransports "ssh-agent-proxy";
+        kinds = map (t: t.type) transports;
+        tcp = lib.findFirst (t: t.type == "tcp") null transports;
       in
-        hasKind kinds "vsock" && hasKind kinds "tcp")
-      "the ssh-agent server did not bind both a vsock and a tcp listener for a mixed host";
+        hasKind kinds "vsock"
+        && hasKind kinds "tcp"
+        && tcp != null
+        && tcp.host == ids.ctnHostIP)
+      "the ssh-agent server did not bind both a vsock and a tcp listener for a mixed host, or bound the tcp listener on the VM bridge instead of the container bridge";
     # `unix` (host-dials-guest) and a callback transport used to throw; both
     # listeners must now coexist.
     "hostSudoUnixPlusCallback" =

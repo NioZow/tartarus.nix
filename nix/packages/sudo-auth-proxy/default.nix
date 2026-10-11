@@ -1124,6 +1124,14 @@
           RuntimeDirectory = instance.runtimeDir;
           RuntimeDirectoryMode = "0700";
         };
+        # The server reads its config once at startup, so a changed
+        # `[[transports]]`/`security`/`acl` document must restart the unit.
+        # `home-manager switch` only diffs the *unit*, not the files it reads;
+        # pinning the generated config path into `X-Restart-Triggers` makes the
+        # unit change whenever the config content does, so sd-switch restarts it.
+        extraSystemdUnitConfig = {
+          X-Restart-Triggers = [instance.configFile];
+        };
       })
       {
         home.file.${instance.configPath}.source = instance.configFile;
@@ -1189,6 +1197,11 @@
         extraSystemdServiceConfig = {
           RuntimeDirectory = "sudo-auth-proxy";
           RuntimeDirectoryMode = "0700";
+        };
+        # Restart the server when its generated config changes; see the
+        # `extraServer` instance above for why `home-manager switch` needs this.
+        extraSystemdUnitConfig = {
+          X-Restart-Triggers = [configFile];
         };
       })
       {

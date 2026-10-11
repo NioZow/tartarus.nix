@@ -25,6 +25,7 @@
     mkDefault
     mkIf
     mkMerge
+    optional
     ;
   # Read from the raw module args (specialArgs), not via a defaulted formal:
   # this nixpkgs resolves defaulted module args through `_module.args`, so a
@@ -125,16 +126,36 @@
     then "vsock"
     else "tcp";
 
-  mkTcpHost = req: let
-    e = listOf req;
-    hasVm = any (x: x.g.kind == "vm") e;
-    hasCtn = any (x: x.g.kind == "container") e;
+  # Host address(es) a callback `tcp` listener must bind. `entries` is the set
+  # of requesting guests whose *effective* transport is `tcp` (the callers
+  # filter out vsock and `unix`-marker guests); only those decide the bind
+  # address. This is what stops a vsock VM from dragging the tcp listener onto
+  # the VM bridge (`10.200.0.1`) while the containers that need it dial their
+  # own bridge gateway (`10.201.0.1`) and get a connection refused. Darwin has
+  # no vsock, so every guest is tcp and the server binds all interfaces. A host
+  # with both a `disableVsock` VM and a container on tcp yields one address per
+  # kind (same port, distinct binds).
+  mkTcpHosts = entries: let
+    hasVm = any (e: e.g.kind == "vm") entries;
+    hasCtn = any (e: e.g.kind == "container") entries;
   in
     if isDarwin
-    then "0.0.0.0"
-    else if hasCtn && !hasVm
-    then instances.container.hostIP
-    else instances.vm.hostIP;
+    then ["0.0.0.0"]
+    else optional hasVm instances.vm.hostIP ++ optional hasCtn instances.container.hostIP;
+
+  # Single-address convenience for the clipboard server, whose module binds one
+  # socket. `entries` must already be tcp-only (as for `mkTcpHosts`).
+  mkTcpHost = entries: let
+    hosts = mkTcpHosts entries;
+  in
+    if hosts == []
+    then
+      (
+        if isDarwin
+        then "0.0.0.0"
+        else instances.vm.hostIP
+      )
+    else builtins.head hosts;
 
   # ---- sudo-auth-proxy host wiring (audit A1) ----------------------------
   # One listener per distinct transport the requesting guests ask for: a guest
@@ -167,11 +188,18 @@
     type = "vsock";
     cid = 2;
   };
-  sudoTcpListener = {
-    type = "tcp";
-    host = mkTcpHost sudoReq;
-    port = 65001;
-  };
+  # One tcp listener per bridge address the tcp-using guests actually dial (see
+  # `mkTcpHosts`): a vsock VM is excluded, so on a mixed host the container
+  # listener lands on the container bridge, not the VM bridge.
+  sudoTcpEntries = filter (e: sapGuestTransport e.g == "tcp") (listOf sudoReq);
+  sudoTcpListeners =
+    lib.optionals (builtins.elem "tcp" sudoKinds)
+    (map (host: {
+        type = "tcp";
+        inherit host;
+        port = 65001;
+      })
+      (mkTcpHosts sudoTcpEntries));
   sudoUnixListener = {
     type = "unix";
     socket = "%t/sudo-auth-proxy/server.sock";
@@ -196,7 +224,7 @@
   # Stable, deterministic listener order: vsock, tcp, unix.
   sudoListeners =
     lib.optional (builtins.elem "vsock" sudoKinds) sudoVsockListener
-    ++ lib.optional (builtins.elem "tcp" sudoKinds) sudoTcpListener
+    ++ sudoTcpListeners
     ++ lib.optional (builtins.elem "unix" sudoKinds) sudoUnixListener;
 
   # ---- ssh-agent-proxy host wiring (mirrors the sudo block above) ----------
@@ -216,12 +244,19 @@
     cid = 2;
     resolution = "tartarus";
   };
-  sshTcpListener = {
-    type = "tcp";
-    host = mkTcpHost sshReq;
-    port = 65000;
-    resolution = "tartarus";
-  };
+  # One tcp listener per bridge address the tcp-using guests actually dial (see
+  # `mkTcpHosts`); a vsock VM is excluded so the container listener binds the
+  # container bridge.
+  sshTcpReq = filter (e: sshGuestTransport e.g == "tcp") (listOf sshReq);
+  sshTcpListeners =
+    lib.optionals (builtins.elem "tcp" sshKinds)
+    (map (host: {
+        type = "tcp";
+        inherit host;
+        port = 65000;
+        resolution = "tartarus";
+      })
+      (mkTcpHosts sshTcpReq));
   sshUnixListener = {
     type = "unix";
     socket = "%t/ssh-agent-proxy/server.sock";
@@ -238,7 +273,7 @@
   };
   sshListeners =
     lib.optional (builtins.elem "vsock" sshKinds) sshVsockListener
-    ++ lib.optional (builtins.elem "tcp" sshKinds) sshTcpListener
+    ++ sshTcpListeners
     ++ lib.optional (builtins.elem "unix" sshKinds) sshUnixListener;
   # The sudo-auth-proxy client OID (doc §7.6). Every tartarus client cert
   # carries it today (audit A4 documents that the OIDs separate roles, not
@@ -336,7 +371,7 @@ in {
         tartarus.clipboard-bridge.server = {
           enable = mkDefault true;
           transport = mkDefault (mkTransport clipReq);
-          host = mkDefault (mkTcpHost clipReq);
+          host = mkDefault (mkTcpHost (filter (e: transportOf e.g == "tcp") (listOf clipReq)));
           port = mkDefault 27795;
           mtls = {
             enable = mkDefault true;
