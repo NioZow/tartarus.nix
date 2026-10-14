@@ -74,15 +74,14 @@
   # Reusable `[security]` option set. The client's top-level
   # `tartarus.sudo-auth-proxy.security` and every server listener share this
   # exact shape (doc §7). `nullable = true` yields the sparse entry variant used
-  # inside `transports`: every knob defaults to `null` and is pruned before TOML
+  # inside `listeners`: every knob defaults to `null` and is pruned before TOML
   # generation, so an entry only overrides what it sets and the Python
   # deep-merges the defaults block into the rest (including `response_ttl`/
   # `clock_skew`).
   #
   # mTLS is the ONLY authentication/signature mechanism (doc §7). The removed
   # `ssh` / `x509` requester methods and the `signature` host-signing method
-  # took every key reference with them; mTLS carries its own `[mtls]` section and
-  # the ACL carries its own `caFile`/`requiredOid`.
+  # took every key reference with them; mTLS carries its own `[mtls]` section.
   mkSecurityOptions = {
     lib,
     nullable ? false,
@@ -105,13 +104,12 @@
           How the server authenticates the requester (doc §7.3). `transport`
           means the identity comes from the mTLS handshake; `none` disables
           requester authentication entirely: it is an explicit, warned choice
-          that the Python only accepts when the server pairs it with
-          `acl.mode = "none"` (fail-closed XOR), and is rejected under
-          `transportEncryption = "mtls"`. Use it only on a transport that is
-          private by construction (vsock, SSH tunnel, local Unix socket).
-          Setting it to `none` is required — with `transport_encryption =
-          "none"` the Python refuses to run without an explicit `none` on both
-          auth knobs rather than silently disabling authentication.
+          and is rejected under `transportEncryption = "mtls"`. Use it only on a
+          transport that is private by construction (vsock, SSH tunnel, local
+          Unix socket). Setting it to `none` is required — with
+          `transport_encryption = "none"` the Python refuses to run without an
+          explicit `none` on both auth knobs rather than silently disabling
+          authentication.
         '';
       });
     serverAuth = mkOption ((o (types.enum ["transport" "none"]) "transport")
@@ -134,7 +132,7 @@
   };
 
   # Reusable `[mtls]` option set (extracted from the old inline server block so
-  # it can be instantiated in both `transportDefaults` and each `transports`
+  # it can be instantiated in both `listenerDefaults` and each `listeners`
   # entry). `requiredOid`/`peerOid` carry the sudo-specific EKU OIDs.
   mkMtlsOptions = {
     lib,
@@ -171,99 +169,104 @@
       });
   };
 
-  # Reusable `[acl]` option set — server-only, so it exists only in the sudo
-  # module. `rule` reuses the old `[[acl.rule]]` submodule verbatim. Emitted
-  # only in the generated server TOML; the client never receives it. The ACL
-  # matches ONLY cryptographically verified credentials (review log S11).
-  mkAclOptions = {
-    lib,
-    nullable ? false,
-  }: let
-    inherit (lib) mkOption types;
-    o = nullableOpt {inherit lib nullable;};
-  in {
-    mode = mkOption ((o (types.enum ["list" "ca" "none"]) "list")
-      // {
-        description = ''
-          How requester credentials are authorized (doc §8.1). Exactly one mode;
-          there is no `ca`+`list` combination. `list` accepts only credentials
-          whose SPKI fingerprint is explicitly listed; `ca` accepts any credential
-          that chains to `caFile` with `requiredOid`. `none` deliberately
-          authorizes every request because there is no credential to authorize; it
-          is accepted only when paired with `security.clientAuth = "none"`
-          (fail-closed XOR enforced by the Python) and must not carry any trust
-          material.
-        '';
-      });
-    trustedFingerprints = mkOption ((o (types.listOf types.str) [])
-      // {
-        description = ''
-          `mode = "list"`: mTLS leaf SubjectPublicKeyInfo fingerprints
-          (`SHA256:...`) allowed to use the mechanism. In `mode = "ca"` it
-          optionally additionally pins the leaf SPKI on top of the CA chain.
-        '';
-      });
-    caFile = mkOption ((o (types.nullOr types.str) null)
-      // {
-        description = ''
-          `mode = "ca"`: trusted CA certificate (PEM) the requester chain must
-          reach. Relative paths resolve against the config file directory.
-        '';
-      });
-    requiredOid = mkOption ((o (types.nullOr types.str) null)
-      // {
-        description = "`mode = \"ca\"`: EKU OID the requester certificate must carry.";
-      });
-    rule = mkOption ((o (types.listOf (types.submodule {
-        options = {
-          identity = mkOption {
-            type = types.str;
-            default = "*";
-            description = ''
-              Glob pattern matched against the requester's resolved names: the
-              friendly name produced by `resolution`, the ACL display label and
-              the verified credential fingerprint. `*` matches anything.
-            '';
-          };
-          targetUser = mkOption {
-            type = types.str;
-            default = "*";
-            description = "Glob pattern matched against the target (PAM) user.";
-          };
-          invokingUser = mkOption {
-            type = types.str;
-            default = "*";
-            description = "Glob pattern matched against the invoking user.";
-          };
-          service = mkOption {
-            type = types.str;
-            default = "*";
-            description = "Glob pattern matched against the PAM service name (sudo/su/login).";
-          };
-          policy = mkOption {
-            type = types.enum ["allow" "ask" "deny"];
-            default = "ask";
-            description = ''
-              Approval policy for a matching request: `allow` replies
-              immediately without a dialog, `deny` replies immediately without a
-              dialog, `ask` shows the confirmation prompt. Rules are evaluated
-              in order and the first match wins; no match means `ask`.
-            '';
+  # The document-level approval rules (`[[rule]]`) and `[labels]` display map —
+  # server-only, emitted once per server document and **never per listener**. A
+  # rule scopes itself to a listener with `match.listeners`. This is the same
+  # engine as `ssh-agent-proxy`: the mTLS transport authenticates the requester
+  # and the ordered rule list decides allow/ask/deny.
+  #
+  # **First match wins; there is no merging between rules.** A permissive rule
+  # written above a restrictive one takes precedence, so rule order is a policy
+  # decision, not a formatting detail.
+  mkRuleType = lib: lib.types.listOf (lib.types.submodule {
+    options = {
+      match = lib.mkOption {
+        type = lib.types.submodule {
+          options = {
+            machine = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              description = ''
+                Requester patterns (fnmatch): the resolved friendly name, the
+                `labels` entry and the verified credential fingerprint. Empty
+                matches any requester.
+              '';
+            };
+            listeners = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              description = ''
+                Accepting listener name patterns (fnmatch). Empty matches every
+                listener; an unnamed listener matches only an empty selector or
+                one made exclusively of `*` patterns.
+              '';
+            };
+            targetUser = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              description = "Target (PAM) user patterns (fnmatch).";
+            };
+            invokingUser = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              description = "Invoking user patterns (fnmatch).";
+            };
+            service = lib.mkOption {
+              type = lib.types.listOf lib.types.str;
+              default = [];
+              description = "PAM service patterns (fnmatch: sudo/su/login).";
+            };
           };
         };
-      })) [])
-      // {
+        default = {};
+      };
+      policy = lib.mkOption {
+        type = lib.types.enum ["allow" "ask" "deny"];
+        default = "ask";
         description = ''
-          Ordered approval rules (`[[acl.rule]]`), evaluated after the ACL
-          authorizes the credential; the first matching rule wins.
+          Decision for a matching request: `allow`/`deny` answer immediately
+          without a dialog, `ask` shows the confirmation prompt. Rules are
+          evaluated in order and the first match wins; no match means `ask`.
         '';
-      });
+      };
+    };
+  });
+
+  # `[labels]`: fingerprint -> display label. Display/log only; it is never an
+  # authorization input and is never accepted from a peer.
+  mkLabelType = lib: lib.types.attrsOf lib.types.str;
+
+  # The client-side `[acl]`: which **server** the client trusts to answer. A
+  # fake or wrong-service server is refused even if CA-signed. Crypto material
+  # only (never request metadata).
+  mkClientAclOptions = {
+    lib,
+  }: let
+    inherit (lib) mkOption types;
+  in {
+    trustedFingerprints = mkOption {
+      type = types.listOf types.str;
+      default = [];
+      description = ''
+        Server leaf SubjectPublicKeyInfo fingerprints (`SHA256:...`) the client
+        will accept. A match is authoritative on its own.
+      '';
+    };
+    trustedNames = mkOption {
+      type = types.listOf types.str;
+      default = [];
+      description = ''
+        `fnmatch` patterns matched against the server certificate's CN/DNS SAN.
+        A match is authoritative on its own. At least one of
+        `trustedFingerprints`/`trustedNames` is required when `[acl]` is set.
+      '';
+    };
   };
 
   # One per-listener option set, instantiated twice:
-  #   `nullable = false; withType = false` → the `transportDefaults` block (real
+  #   `nullable = false; withType = false` → the `listenerDefaults` block (real
   #                                          defaults, no `type`);
-  #   `nullable = true;  withType = true`  → a `transports` entry (requires
+  #   `nullable = true;  withType = true`  → a `listeners` entry (requires
   #                                          `type`; every other field is a
   #                                          sparse `nullOr` override).
   mkListenerOptions = {
@@ -345,7 +348,7 @@
         // {
           description = ''
             How to resolve a connecting client's name shown in the elevation
-            dialog and offered to the `[[acl.rule]]` identity selector:
+            dialog and offered to the `match.machine` selector:
             `none` (no resolution), `certificate` (verified peer cert CN/SAN),
             `tartarus` (local VM id/name bookkeeping via the state directory), or
             `mofos` (`mofos ls --json`, matching the peer's VSOCK CID or
@@ -353,20 +356,30 @@
             to the Python's per-listener fallback.
           '';
         });
-      # Per-listener security / mTLS / ACL.
+      # Per-listener transport security (there is no per-listener ACL: the
+      # document-level `server.rule` list scopes itself with `match.listeners`).
       security = mkSecurityOptions {inherit lib nullable;};
       mtls = mkMtlsOptions {inherit lib nullable requiredOid peerOid;};
-      acl = mkAclOptions {inherit lib nullable;};
     }
     // lib.optionalAttrs withType {
       type = mkOption {
         type = types.enum ["vsock" "tcp" "unix"];
         description = "Transport this listener binds (required for every entry).";
       };
+      name = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Optional name for this listener, unique across the server.
+          `rule.*.match.listeners` selects listeners by this name; an unnamed
+          listener matches only an empty selector or one made exclusively of
+          `*` patterns.
+        '';
+      };
     };
 
-  # Reusable `server` option set. `transportDefaults` is deep-merged
-  # (Python-side) into every `transports` entry; the genuinely non-transport
+  # Reusable `server` option set. `listenerDefaults` is deep-merged
+  # (Python-side) into every `listeners` entry; the genuinely non-transport
   # options stay flat. The old flat transport/host/port/... options are removed
   # outright: a partially-migrated config fails evaluation loudly rather than
   # binding the wrong transport.
@@ -407,7 +420,26 @@
       description = "Extra top-level keys merged into the generated TOML configuration.";
     };
 
-    transportDefaults = mkOption {
+    # Document-level, never per listener. The ordered approval rules (first
+    # match wins) and the fingerprint -> display-label map.
+    rule = mkOption {
+      type = mkRuleType lib;
+      default = [];
+      description = ''
+        Ordered approval rules (`[[rule]]`), evaluated against every listener;
+        the first matching rule wins and no rule matching means `ask`. A rule
+        scopes itself to a listener with `match.listeners` (there is no
+        per-listener ACL).
+      '';
+    };
+
+    labels = mkOption {
+      type = mkLabelType lib;
+      default = {};
+      description = "Fingerprint (`SHA256:...`) -> display-label map. Display/log only, never an authorization input.";
+    };
+
+    listenerDefaults = mkOption {
       type = types.submodule {
         options = mkListenerOptions {
           inherit lib pkgs requiredOid peerOid;
@@ -416,10 +448,10 @@
         };
       };
       default = {};
-      description = "Default values deep-merged into every entry of `transports`.";
+      description = "Default values deep-merged into every entry of `listeners`.";
     };
 
-    transports = mkOption {
+    listeners = mkOption {
       type = types.listOf (types.submodule {
         options = mkListenerOptions {
           inherit lib pkgs requiredOid peerOid;
@@ -431,7 +463,7 @@
       description = ''
         One entry per transport this server binds, all in the single server
         process. Multiple entries of the same `type` are allowed (e.g. two
-        `unix` listeners with different ACLs). Empty means the server binds
+        `unix` listeners with different transport security). Empty means the server binds
         nothing and, when enabled, the module rejects the configuration.
       '';
     };
@@ -439,7 +471,7 @@
 
   # Recursively drop `null` attributes (the spec's `pruneNulls`). Needed because
   # `pkgs.formats.toml` (json2toml) refuses `null`, and every sparse
-  # `transports` entry carries `null` for the fields it does not override.
+  # `listeners` entry carries `null` for the fields it does not override.
   mkPruneNulls = lib: let
     prune = v:
       if builtins.isAttrs v
@@ -452,7 +484,7 @@
 
   # Resolve the effective (transport_encryption, client_auth, server_auth)
   # triple for one listener entry, using the entry's own `type` and the
-  # `transportDefaults` fallback. This mirrors the Python exactly: the defaults
+  # `listenerDefaults` fallback. This mirrors the Python exactly: the defaults
   # are `recursiveUpdate`d under the entry *after* the entry's nulls are pruned
   # (otherwise every sparse entry would clobber the defaults with `null`).
   # `mtls.enable` forces mTLS; `auto` follows the type (tcp → mtls else none);
@@ -489,15 +521,15 @@
   };
 
   # Render the whole server TOML document for one server instance:
-  # `mode`/`dialog_program`/`debug`, the fully-rendered `[transport_defaults]`
-  # block, then a sparse `[[transports]]` entry per listener. `pkgs.formats.toml`
+  # `mode`/`dialog_program`/`debug`, the fully-rendered `[listener_defaults]`
+  # block, then a sparse `[[listeners]]` entry per listener. `pkgs.formats.toml`
   # is fed the already-pruned attrset (json2toml is fatal on `null`).
   renderServerToml = {
     lib,
     server,
   }: let
     prune = mkPruneNulls lib;
-    defaults = server.transportDefaults;
+    defaults = server.listenerDefaults;
     resolve = mkResolveSecurity {inherit lib defaults;} prune;
 
     # One listener (or the defaults block). `isEntry = false` renders the
@@ -547,26 +579,6 @@
             peer_required_oid = entry.mtls.peerOid;
           };
 
-      acl = prune (
-        {mode = entry.acl.mode;}
-        // lib.optionalAttrs (entry.acl.trustedFingerprints != [] && entry.acl.trustedFingerprints != null) {
-          trusted_fingerprints = entry.acl.trustedFingerprints;
-        }
-        // lib.optionalAttrs (entry.acl.caFile != null) {ca_file = entry.acl.caFile;}
-        // lib.optionalAttrs (entry.acl.requiredOid != null) {required_oid = entry.acl.requiredOid;}
-        // lib.optionalAttrs (entry.acl.rule != [] && entry.acl.rule != null) {
-          rule =
-            map (r: {
-              identity = r.identity;
-              target_user = r.targetUser;
-              invoking_user = r.invokingUser;
-              service = r.service;
-              policy = r.policy;
-            })
-            entry.acl.rule;
-        }
-      );
-
       scalars = {
         port = entry.port;
         cid = entry.cid;
@@ -585,14 +597,29 @@
       prune (
         (
           if isEntry
-          then {type = entry.type;}
+          then
+            {type = entry.type;}
+            // lib.optionalAttrs (entry.name != null) {name = entry.name;}
           else {}
         )
         // scalars
         // lib.optionalAttrs (security != {}) {security = security;}
         // lib.optionalAttrs (mtls != null && mtls != {}) {mtls = mtls;}
-        // lib.optionalAttrs (acl != {}) {acl = acl;}
       );
+
+    # One `[[rule]]` entry: `match` (pruned to the selectors that are set) plus
+    # the policy. Emitted document-level, never per listener.
+    renderRule = r:
+      prune {
+        match = prune {
+          machine = r.match.machine;
+          listeners = r.match.listeners;
+          target_user = r.match.targetUser;
+          invoking_user = r.match.invokingUser;
+          service = r.match.service;
+        };
+        policy = r.policy;
+      };
 
     document =
       {
@@ -600,17 +627,19 @@
         dialog_program = server.dialogProgram;
       }
       // lib.optionalAttrs server.debug {debug = true;}
+      // lib.optionalAttrs (server.rule != []) {rule = map renderRule server.rule;}
+      // lib.optionalAttrs (server.labels != {}) {labels = server.labels;}
       // {
-        transport_defaults = renderListener {
+        listener_defaults = renderListener {
           entry = defaults;
           isEntry = false;
         };
-        transports = map (entry:
+        listeners = map (entry:
           renderListener {
             inherit entry;
             isEntry = true;
           })
-        server.transports;
+        server.listeners;
       }
       // server.extraSettings;
   in
@@ -626,8 +655,12 @@
     server,
   }: let
     prune = mkPruneNulls lib;
-    defaults = server.transportDefaults;
+    defaults = server.listenerDefaults;
     resolve = mkResolveSecurity {inherit lib defaults;} prune;
+    namedListeners = lib.filter (n: n != null) (map (e: e.name) server.listeners);
+    duplicateNames = lib.unique (
+      lib.filter (n: lib.count (m: m == n) namedListeners > 1) namedListeners
+    );
   in
     map (entry: {
       assertion = let
@@ -637,14 +670,18 @@
         != "none"
         || (resolved.effectiveClientAuth == "none" && resolved.effectiveServerAuth == "none");
       message = ''
-        tartarus.sudo-auth-proxy.server.transports: transport_encryption = "none"
+        tartarus.sudo-auth-proxy.server.listeners: transport_encryption = "none"
         requires client_auth = server_auth = "none" (entry type = ${entry.type}).
       '';
     })
-    server.transports
-    ++ lib.optional (server.enable && server.transports == []) {
+    server.listeners
+    ++ lib.optional (server.enable && server.listeners == []) {
       assertion = false;
-      message = "tartarus.sudo-auth-proxy.server.enable = true requires at least one entry in server.transports.";
+      message = "tartarus.sudo-auth-proxy.server.enable = true requires at least one entry in server.listeners.";
+    }
+    ++ lib.optional (duplicateNames != []) {
+      assertion = false;
+      message = "tartarus.sudo-auth-proxy.server.listeners: duplicate listener name(s): ${lib.concatStringsSep ", " duplicateNames}.";
     };
 
   optionsModule = {
@@ -785,6 +822,11 @@
         };
       };
 
+      # Client-side `[acl]`: which server the client trusts to answer. Optional;
+      # without it the client still verifies the server chain + EKU, but any
+      # CA-signed server is accepted.
+      acl = mkClientAclOptions {inherit lib;};
+
       # Shared `[security]` group (doc §7.2–§7.5). The three knobs are resolved
       # per transport: `transport = tcp` defaults to mTLS, `vsock`/`unix`
       # default to none; setting `mtls.enable = true` is equivalent to
@@ -809,8 +851,8 @@
 
       server = mkServerOptions {inherit lib pkgs;};
 
-      # A second, independent server instance. It has its own `transports` /
-      # `transportDefaults` listeners and config file, and runs as a unit named
+      # A second, independent server instance. It has its own `listeners` /
+      # `listenerDefaults` listeners and config file, and runs as a unit named
       # `sudo-auth-proxy-<name>`; the `server` above stays the default instance.
       # This lets one host run, for example, the tartarus guest callback server
       # alongside an SSH-forwarded `unix` server for a remote host.
@@ -933,7 +975,15 @@
             then true
             else null;
         }
-        // connectionSettings)
+        // connectionSettings
+        // optionalAttrs
+        (cfg.acl.trustedFingerprints != [] || cfg.acl.trustedNames != [])
+        {
+          acl = {
+            trusted_fingerprints = cfg.acl.trustedFingerprints;
+            trusted_names = cfg.acl.trustedNames;
+          };
+        })
       cfg.settings;
     cleanSettings = filterAttrs (_: v: v != null) settings;
     configFile = tomlFormat.generate "sudo-auth-proxy-client.toml" cleanSettings;
@@ -1116,7 +1166,7 @@
       {home.packages = [package];}
       (mkService {
         name = instance.name;
-        description = "sudo authentication proxy server (${concatStringsSep "," (map (t: t.type) instance.server.transports)})";
+        description = "sudo authentication proxy server (${concatStringsSep "," (map (t: t.type) instance.server.listeners)})";
         command = "${package}/bin/sudo-auth-proxy --config ${instance.configPath}";
         # Its own runtime dir, matching the `sudo-auth-proxy-<name>` unit; the
         # Python re-creates/chmods it regardless (doc §9.1).
@@ -1125,7 +1175,7 @@
           RuntimeDirectoryMode = "0700";
         };
         # The server reads its config once at startup, so a changed
-        # `[[transports]]`/`security`/`acl` document must restart the unit.
+        # `[[listeners]]`/`security`/`[[rule]]` document must restart the unit.
         # `home-manager switch` only diffs the *unit*, not the files it reads;
         # pinning the generated config path into `X-Restart-Triggers` makes the
         # unit change whenever the config content does, so sd-switch restarts it.
@@ -1168,8 +1218,8 @@
       then server.configPath
       else "${config.home.homeDirectory}/.config/sudo-auth-proxy/config.toml";
 
-    # The generated server TOML: `[transport_defaults]` + `[[transports]]`, one
-    # listener per entry in `server.transports`. See `renderServerToml`.
+    # The generated server TOML: `[listener_defaults]` + `[[listeners]]`, one
+    # listener per entry in `server.listeners`. See `renderServerToml`.
     configFile = tomlFormat.generate "sudo-auth-proxy-server.toml" (renderServerToml {inherit lib server;});
   in {
     imports = [optionsModule namedServersModule];
@@ -1185,7 +1235,7 @@
       }
       (mkService {
         name = "sudo-auth-proxy";
-        description = "sudo authentication proxy server (${concatStringsSep "," (map (t: t.type) server.transports)})";
+        description = "sudo authentication proxy server (${concatStringsSep "," (map (t: t.type) server.listeners)})";
         command = "${package}/bin/sudo-auth-proxy --config ${configPath}";
         # The server binds `%t/sudo-auth-proxy/server.sock`, so the per-user
         # runtime directory must be `0700` and owned by the server user (doc

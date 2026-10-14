@@ -6,13 +6,14 @@ Linux's native `kind = "container"` (which shares the *host* kernel), and the
 density model of one VM for many workloads rather than one VM per workload.
 
 This document is the technical reference. The full design and phase history
-live in the plan: [`docs/plans/container-host-vms.md`](plans/container-host-vms.md).
+lived in an internal plan (`docs/plans/container-host-vms.md`) that is not
+shipped with the repository.
 
 **Status:** P1–P6 are implemented and evaluate cleanly, and the **P0 runtime
 gate has been verified** (nested nspawn boot, virtiofs CA-key readability,
 restart persistence and the ProxyJump SSH path). Feature parity for real
 workloads (host services, user shares, relays, proxy routing) is implemented in
-[`plans/nested-container-parity.md`](plans/nested-container-parity.md).
+an internal plan (`plans/nested-container-parity.md`).
 
 ---
 
@@ -350,6 +351,6 @@ already does. A bare `ssh <inner>` therefore works.
 
 ## See also
 
-- Plan (full design + phased history): [`docs/plans/container-host-vms.md`](plans/container-host-vms.md)
-- Manual smoke pass: [`docs/smoke.md`](smoke.md)
-- Shares and read-only enforcement: [`docs/shares.md`](shares.md)
+- Plan (full design + phased history, internal): `docs/plans/container-host-vms.md`
+- Manual smoke pass: [smoke.md](smoke.md)
+- Shares and read-only enforcement: [shares.md](shares.md)

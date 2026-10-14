@@ -41,7 +41,7 @@
   # Per-guest ssh-agent-proxy transport marker. `unix` selects the
   # host→guest SSH-forwarded Unix socket; the bridge then runs mTLS *inside*
   # the SSH tunnel with the tartarus client certificate, so per-guest
-  # `vm_names` rules keep working (plan §1.1).
+  # `machine` rules keep working (plan §1.1).
   sshUnix = (services.sshAgentProxyTransport or "vsock") == "unix";
 
   sudoAuthProxy = import ../packages/sudo-auth-proxy {inherit inputs;};
@@ -113,9 +113,10 @@ in {
         # Callback transports (vsock/tcp): the tartarus-internal channel is
         # private by construction, so use it unencrypted and unauthenticated --
         # stated explicitly on all three knobs (the module asserts it). The
-        # Python warns about `none`, and fail-closed only accepts
-        # `client_auth = "none"` when the host's server pairs it with
-        # `acl.mode = "none"`.
+        # Python warns about `none`; the server's ordered `[[rule]]` list
+        # decides allow/ask/deny. The client may additionally pin the host
+        # server identity with its own `acl` (`trustedFingerprints`/
+        # `trustedNames`) to refuse a fake server.
         security = {
           transportEncryption = if sapUnix then "mtls" else "none";
           serverAuth = if sapUnix then "transport" else "none";
@@ -164,12 +165,39 @@ in {
                 clientMtls "1.3.6.1.4.1.99999.2.2" "1.3.6.1.4.1.99999.2.1"
                 // {enable = sshUnix;};
             };
-            # Guest-local agent, merged with the host-forwarded one.
+            # Guest-local agent.
             agent.enable = true;
-            merge = {
+            # Merge the local agent with the host-forwarded one: a local
+            # allow-all proxy server whose transport is a unix socket. A
+            # distinct `configPath` keeps it from colliding with the bridge's
+            # default `~/.config/ssh-agent-proxy/config.toml`.
+            server = {
               enable = true;
+              configPath = "${g.user.home}/.config/ssh-agent-proxy/server.toml";
               setSshAuthSock = true;
-              sockets = ["%t/ssh-agent" "%t/ssh-agent-host"];
+              settings = {
+                agent_sockets = ["%t/ssh-agent" "%t/ssh-agent-host"];
+                rule = [
+                  {
+                    key = "*";
+                    auth = "allow";
+                    data_signing = "allow";
+                    notify = false;
+                  }
+                ];
+              };
+              listeners = [
+                {
+                  type = "unix";
+                  socket = "%t/ssh-agent-merged";
+                  resolution = "none";
+                  security = {
+                    transportEncryption = "none";
+                    clientAuth = "none";
+                    serverAuth = "none";
+                  };
+                }
+              ];
             };
           };
         })

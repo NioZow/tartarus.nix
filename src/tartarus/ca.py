@@ -61,8 +61,8 @@ X509_LEAF_RSA_BITS = "2048"
 # certificate with **all three client OIDs** (see `_ensure_x509_host_cert` /
 # `_ensure_x509_client_cert`), so an OID check distinguishes the *server* from
 # the *client* role but does **not** isolate one service from another. In
-# particular, under `acl.mode = "ca"` any guest's client certificate is valid
-# for sudo-auth-proxy (and for the other tartarus services). Per-service
+# particular, any guest's CA-chained client certificate is valid for
+# sudo-auth-proxy (and for the other tartarus services). Per-service
 # isolation is future work; the threat model documents this shared-identity
 # reality rather than the isolation the OID names suggest.
 OID_CLIPBOARD_SERVER = "1.3.6.1.4.1.99999.3.1"

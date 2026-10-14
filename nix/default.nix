@@ -98,7 +98,7 @@ in {
     # A standalone home-manager config whose sudo-auth-proxy server binds two
     # listeners (a `unix` one that disables auth explicitly, a `tcp` one that
     # resolves to mTLS via `auto`). The generated TOML must therefore carry a
-    # `[transport_defaults]` block and two `[[transports]]` headers.
+    # `[listener_defaults]` block and two `[[listeners]]` headers.
     sudoTomlHm = inputs.home-manager.lib.homeManagerConfiguration {
       inherit pkgs;
       modules = [
@@ -110,7 +110,7 @@ in {
           home.stateVersion = "26.05";
           tartarus.sudo-auth-proxy.server = {
             enable = true;
-            transports = [
+            listeners = [
               {
                 type = "unix";
                 socket = "/tmp/sudo-auth-proxy.sock";
@@ -120,7 +120,6 @@ in {
                   clientAuth = "none";
                   serverAuth = "none";
                 };
-                acl.mode = "none";
               }
               {
                 type = "tcp";
@@ -138,8 +137,8 @@ in {
       .source;
     tomlShape = pkgs.runCommand "tartarus-sudo-auth-proxy-toml-shape" {} ''
       set -eu
-      grep -qF '[transport_defaults]' ${sudoToml}
-      test "$(grep -c '^\[\[transports\]\]' ${sudoToml})" -ge 2
+      grep -qF '[listener_defaults]' ${sudoToml}
+      test "$(grep -c '^\[\[listeners\]\]' ${sudoToml})" -ge 2
       echo ok > $out
     '';
   in

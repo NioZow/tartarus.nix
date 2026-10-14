@@ -9,12 +9,12 @@
 #   "unix" + transport_encryption = "none"  The guest's ssh/git talks plain
 #           agent protocol to the `ssh -R` forwarded socket, which this server
 #           accepts on its single AF_UNIX socket. Identity is unset, so only
-#           wildcard rules match (a specific `vm_names` never matches).
+#           wildcard rules match (a specific `machine` never matches).
 #
 #   "unix" + transport_encryption = "mtls"  The guest runs the bridge, which
 #           wraps the forwarded stream in TLS; this server terminates it. The
 #           verified client certificate CN becomes the identity, so per-guest
-#           `vm_names` rules work. The `[mtls]` block below is for this mode.
+#           `machine` rules work. The `[mtls]` block below is for this mode.
 #
 #   "vsock" / "tcp"  The guest dials the host callback endpoint. See the
 #           sudo-auth-proxy example for the callback shape.
@@ -29,7 +29,7 @@
 # transports in one process (a `vsock` VM *and* an `ssh -R` forwarded `unix`
 # socket, with a per-listener `resolution`/`[security]`), use the
 # multi-listener form instead: `examples/ssh-agent-proxy-listeners.toml` — a
-# `[transport_defaults]` table plus one `[[transports]]` entry per listener.
+# `[listener_defaults]` table plus one `[[listeners]]` entry per listener.
 #
 # Paths are resolved relative to this file's directory (`./server.crt` means
 # "next to this config"), except `%t/...` which expands to the runtime dir.
@@ -64,15 +64,11 @@ handshake_timeout = 10.0
 # Seconds to wait for a human decision (0 = wait indefinitely).
 decision_timeout = 120
 
-# The agent socket this server draws identities from when `forward_sockets`
-# is not set explicitly. Here it is set explicitly below.
-default_agent_socket_path = "%t/ssh-agent"
-
-# Upstream agent sockets whose identities are offered to clients. A directory
-# is also accepted and is scanned per connection (pick up per-session sockets).
-# One matches the ssh-agent started by the desktop session or the guest's own
-# agent.
-forward_sockets = ["%t/ssh-agent"]
+# Upstream agent sockets whose identities are offered to clients; the first
+# entry is also the default socket for `key` entries without an explicit
+# `socket`. Here it is the ssh-agent started by the desktop session (or the
+# guest's own agent).
+agent_sockets = ["%t/ssh-agent"]
 
 # Log timing/selection detail to stderr.
 debug = false
@@ -107,7 +103,7 @@ server_auth = "none"
 # peer_required_oid = "1.3.6.1.4.1.99999.2.2" # the peer (client) certificate
 
 # ---------------------------------------------------------------------------
-# Explicit keys and rules. With `resolution = "none"` only wildcard `vm_names`
+# Explicit keys and rules. With `resolution = "none"` only wildcard `machine`
 # rules can match, so a `[[rule]]` with a specific selector is pointless here.
 # ---------------------------------------------------------------------------
 # [[key]]
@@ -116,6 +112,6 @@ server_auth = "none"
 
 [[rule]]
 key = "*"
-match.vm_names = ["*"]   # required on `unix + none`: identity is unset
+match.machine = ["*"]   # required on `unix + none`: identity is unset
 auth = "ask"
 data_signing = "deny"

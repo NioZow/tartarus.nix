@@ -177,7 +177,7 @@
   # the guest presents its tartarus CA-chained client certificate, the host its
   # server certificate. Callback transports (`vsock`/`tcp`) are private by
   # construction and run with no crypto and no authentication (their
-  # `security`/`acl` defaults live in `transportDefaults` below).
+  # `security` defaults live in `listenerDefaults` below).
   unixSecurity = {
     transportEncryption = "mtls";
     clientAuth = "transport";
@@ -212,14 +212,10 @@
       requiredOid = "1.3.6.1.4.1.99999.1.1";
       peerOid = sudoClientOid;
     };
-    # `acl.mode = "ca"` authorizes the CA-chained guests without an operator
-    # fingerprint list; the callback listeners keep `acl.mode = "none"` (set in
-    # `transportDefaults`).
-    acl = {
-      mode = "ca";
-      caFile = x509Ca;
-      requiredOid = sudoClientOid;
-    };
+    # The mTLS handshake verifies the CA-chained guest certificate (no separate
+    # ACL any more: authorization is the ordered `[[rule]]` list, and no rule
+    # matching means `ask`). The callback listeners run with
+    # `client_auth = none` (set in `listenerDefaults`).
   };
   # Stable, deterministic listener order: vsock, tcp, unix.
   sudoListeners =
@@ -277,8 +273,8 @@
     ++ lib.optional (builtins.elem "unix" sshKinds) sshUnixListener;
   # The sudo-auth-proxy client OID (doc §7.6). Every tartarus client cert
   # carries it today (audit A4 documents that the OIDs separate roles, not
-  # services), so `acl.mode = "ca"` authorizes the guests without an operator
-  # fingerprint list.
+  # services), so the unix listener's mTLS EKU check admits the guests without
+  # an operator fingerprint list.
   sudoClientOid = "1.3.6.1.4.1.99999.1.2";
   homeDir =
     args.homeDir
@@ -320,14 +316,14 @@ in {
           enable = mkDefault true;
           # One `{ type, ...; }` per distinct requesting transport, all bound by
           # the single server process.
-          transports = mkDefault sudoListeners;
+          listeners = mkDefault sudoListeners;
           # Shared defaults for every listener. Callback transports
           # (`vsock`/`tcp`) run with no crypto and no authentication -- the
-          # tartarus-internal channel is private by construction -- and the
-          # fail-closed matching `acl.mode = "none"`; the `unix` listener
-          # overrides both with mTLS + `acl.mode = "ca"`. The Python refuses a
-          # `client_auth`/`acl.mode` mismatch and warns about `none`.
-          transportDefaults = {
+          # tartarus-internal channel is private by construction -- while the
+          # `unix` listener overrides both with mTLS. The document-level
+          # `[[rule]]` list decides allow/ask/deny; with no rules every request
+          # is prompted.
+          listenerDefaults = {
             port = mkDefault 65001;
             # A2: the first frame (the pre-dialog ack) is bounded by the
             # client's recvTimeout; the human decision is bounded by
@@ -337,7 +333,6 @@ in {
             security.transportEncryption = mkDefault "none";
             security.clientAuth = mkDefault "none";
             security.serverAuth = mkDefault "none";
-            acl.mode = mkDefault "none";
           };
         };
       })
@@ -345,13 +340,13 @@ in {
       (mkIf needsSsh {
         tartarus.ssh-agent-proxy.server = {
           enable = mkDefault true;
-          transports = mkDefault sshListeners;
+          listeners = mkDefault sshListeners;
           # Defaults from the module cover connect/handshake/decision timeouts;
           # only the shared bind port and the callback security are overridden
           # here. Callback transports (`vsock`/`tcp`) are private by construction
           # and run with no crypto and no authentication (mirrors the sudo
           # block); the `unix` listener overrides with mTLS.
-          transportDefaults = {
+          listenerDefaults = {
             port = mkDefault 65000;
             security.transportEncryption = mkDefault "none";
             security.clientAuth = mkDefault "none";

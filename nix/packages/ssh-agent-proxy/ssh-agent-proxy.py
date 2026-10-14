@@ -19,8 +19,7 @@ import threading
 
 # AF_VSOCK is a Linux-only address family -- the macOS socket module has no
 # such constant, so an unconditional `from socket import ... AF_VSOCK` crashes
-# at import time on darwin. Only the VSOCK proxy path needs it; --merge mode
-# never constructs a VSOCK server. Import it defensively so the module loads
+# at import time on darwin. Import it defensively so the module loads
 # cleanly on macOS (ThreadedVsockServer is only ever instantiated on Linux).
 try:
     from socket import AF_VSOCK
@@ -140,15 +139,14 @@ DEFAULT_CONFIG_PATH = "~/.config/ssh-agent-proxy/config.toml"
 MAX_AGENT_MSG_LEN = 256 * 1024
 # Bound slowloris / hung upstream: recv() gives up after this many seconds.
 SOCKET_TIMEOUT = 300
-# In --merge mode, identity enumeration probes every upstream; a short
-# per-upstream timeout lets a hung upstream (e.g. Apple's ssh-agent waiting on
-# a keychain-unlock prompt, or a stale gpg-agent socket) be skipped quickly
-# instead of making `ssh-add -l` appear to hang. Forwarded requests are NOT
-# bounded by this: a sign request may legitimately block on user interaction
-# (an authorization dialog on a host proxy, or a YubiKey PIN/touch prompt via
-# gpg-agent) and uses SOCKET_TIMEOUT instead. This is the same handler on the
-# host and in guests, so the long timeout must hold at every hop in the chain.
-MERGE_UPSTREAM_TIMEOUT = 5
+# Bound the connect() to an upstream agent socket so a hung/dead upstream
+# (e.g. Apple's ssh-agent waiting on a keychain-unlock prompt, or a stale
+# gpg-agent socket) is skipped quickly instead of making `ssh-add -l` appear to
+# hang. Data reads/forwarded requests are NOT bounded by this: a sign request
+# may legitimately block on user interaction (an authorization dialog on a host
+# proxy, or a YubiKey PIN/touch prompt via gpg-agent) and uses SOCKET_TIMEOUT
+# instead.
+UPSTREAM_TIMEOUT = 5
 # SSH public key algorithms accepted in config (user keys + destination host keys).
 _ACCEPTED_KEY_TYPES = {
     "ssh-rsa",
@@ -163,6 +161,22 @@ log = getLogger("ssh-agent-proxy")
 # A host/key selector that contains any of these must be evaluated with fnmatch
 # instead of exact equality.
 _WILDCARD_RE = re_compile(r"[*?\[\]]")
+
+
+def _as_pattern_list(value: Any, *, field: str) -> list[str]:
+    """Normalize a rule selector (`machine`, `listeners`) to a list of strings.
+
+    A bare string is accepted as a one-element list so `match.listeners = "vm-a"`
+    and `match.listeners = ["vm-a", "vm-b"]` are both valid; `None`/absent is an
+    empty (match-any) selector.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(p, str) for p in value):
+        return list(value)
+    raise ValueError(f"match.{field} must be a string or a list of strings, got {value!r}")
 
 
 def _fingerprint(blob: bytes) -> str:
@@ -186,23 +200,32 @@ class KeyConfig:
 
 @dataclass(frozen=True)
 class Rule:
-    """A policy binding: which VMs may use which key, and how.
+    """A policy binding: which machines may use which key, over which listener.
 
-    A rule matches a (key, VM) pair when the key selector matches (an id or "*")
-    and the VM selector matches (vm_names; an empty selector matches any VM).
-    Rules are evaluated in file order and the first match wins -- it fully
-    defines the policy, there is no merging between rules.
+    A rule matches a (key, machine, listener) triple when the key selector
+    matches (an id or "*"), the machine selector matches (machine; an empty
+    selector matches any machine) and the listener selector matches (listeners;
+    an empty selector matches any listener). Rules are evaluated in file order
+    and the first match wins -- it fully defines the policy, there is no merging
+    between rules.
 
     Matching is against the **verified identity** (`Resolution = none` -> no
     identity at all), never against the human display label (which may be an
     `unknown-*`/`local` placeholder). An unauthenticated peer (`identity is
     None`) therefore matches **only** wildcard rules: an empty selector or a
-    selector made exclusively of `*` patterns. A specific `vm_names` pattern
+    selector made exclusively of `*` patterns. A specific `machine` pattern
     can never match a peer whose identity was not established.
+
+    The listener selector (`match.listeners`) matches the **name** a listener was
+    given in its `[[listeners]]` entry (a listener is a socket; see §3 of the
+    docs). A listener is allowed to be unnamed: an unnamed listener matches only
+    an empty `listeners` selector (or one made exclusively of `*` patterns), so
+    `match.listeners = "vm-a"` never applies to an unnamed listener.
     """
 
     key: str  # a key id, or "*" for any key
-    vm_names: list[str] = field(default_factory=list)
+    machine: list[str] = field(default_factory=list)
+    listeners: list[str] = field(default_factory=list)
     auth: str = "ask"  # "deny" | "ask" | "allow"
     data_signing: str = "deny"  # "deny" | "ask" | "allow"
     notify: bool = True
@@ -213,19 +236,28 @@ class Rule:
             return self.key == "*" or self.key == key_id
         return fnmatchcase(key_id, self.key)
 
-    def matches_vm(self, identity: Optional[str]) -> bool:
+    def matches_machine(self, identity: Optional[str]) -> bool:
         if identity is None:
             # Identity intentionally unset (resolution = "none", or the peer did
             # not resolve): only wildcard rules apply. A specific name can never
             # match an unauthenticated peer.
-            return not self.vm_names or all(p == "*" for p in self.vm_names)
-        if not self.vm_names:
-            return True  # empty selector -> any VM
-        return any(fnmatchcase(identity, pattern) for pattern in self.vm_names)
+            return not self.machine or all(p == "*" for p in self.machine)
+        if not self.machine:
+            return True  # empty selector -> any machine
+        return any(fnmatchcase(identity, pattern) for pattern in self.machine)
+
+    def matches_listener(self, listener_name: Optional[str]) -> bool:
+        if not self.listeners:
+            return True  # empty selector -> any listener
+        if listener_name is None:
+            # The accepting listener is unnamed: only a wildcard selector can
+            # match it (mirrors the unauthenticated-peer rule above).
+            return all(p == "*" for p in self.listeners)
+        return any(fnmatchcase(listener_name, pattern) for pattern in self.listeners)
 
 
 # Fallback policy for a key that isn't governed by any explicit `rule` (see
-# `forward_sockets`): any key, any VM, prompt before use, never sign arbitrary
+# `agent_sockets`): any key, any VM, prompt before use, never sign arbitrary
 # data. Keeps the proxy usable out of the box with zero `key`/`rule` config --
 # explicit rules only need to be added to *override* this for specific keys
 # (e.g. allow one without prompting, or restrict/deny it).
@@ -341,10 +373,19 @@ class KnownHosts:
 class ListenerConfig:
     """One server listener: bind target + resolved security + per-listener identity.
 
-    A proxy-mode `Config` owns a list of these (one per emitted `transports`
+    A proxy-mode `Config` owns a list of these (one per emitted `listeners`
     entry, or a single implicit one for a legacy flat config). Each listener
     resolves its own `[security]`/`[mtls]` and `resolution`, so a single server
-    process can bind many transports with independent security and identity.
+    process can bind many listeners with independent security and identity.
+
+    `name` is an optional label (unique per server) that `rule.match.listeners`
+    selects on; an unnamed listener matches only an empty/wildcard listener
+    selector.
+
+    `scan_agent_socket_dirs`/`resolve_session_socket` are opt-in, `unix`-only
+    upstream-resolution strategy flags: the former expands a directory entry in
+    the global `agent_sockets` list per connection, the latter (Linux only)
+    prefers the connecting peer's `$SSH_AUTH_PROXY_SOCK`.
     """
 
     transport: str
@@ -367,12 +408,14 @@ class ListenerConfig:
     mtls_key_file: Optional[str]
     mtls_required_oid: Optional[str]
     mtls_peer_required_oid: Optional[str]
+    name: Optional[str] = None
+    scan_agent_socket_dirs: bool = False
+    resolve_session_socket: bool = False
 
 
 class Config:
     def __init__(self) -> None:
         self.mode: Optional[str] = None
-        self.merge_sockets: list[str] = []
         self.listen_socket: Optional[str] = None
         # `transport` is the single source of truth: "vsock" | "tcp" | "unix".
         # `host`/`port`/`cid` are the callback (client) destination; `socket`
@@ -418,14 +461,12 @@ class Config:
         # load() resolves it to "certificate" if transport_encryption is mtls
         # else "none" unless the config sets it explicitly. Proxy-mode only.
         self.resolution: Optional[str] = None
-        self.default_agent_socket_path: Optional[str] = environ.get("SSH_AUTH_SOCK")
-        # Upstream agent sockets whose identities are forwarded to every VM by
-        # default (DEFAULT_RULE: ask, no data signing) -- no `key`/`rule`
-        # entries required. None (unset in config) means "not loaded yet";
-        # `load()` resolves it to [default_agent_socket_path] unless the
-        # config explicitly sets forward_sockets (including explicitly to []
-        # to disable auto-forwarding entirely).
-        self.forward_sockets: list[str] = []
+        # Upstream agent sockets whose identities are forwarded to every VM
+        # (DEFAULT_RULE: ask, no data signing) -- no `key`/`rule` entries
+        # required. Empty until `load()` runs; an unset `agent_sockets`
+        # defaults to `[$SSH_AUTH_SOCK]`. The first entry is the default socket
+        # for `key` entries that omit `socket`.
+        self.agent_sockets: list[str] = []
         self.keys: dict[bytes, KeyConfig] = {}
         self.rules: list[Rule] = []
         # VSOCK CID -> VM name, statically declared in config (e.g. generated
@@ -474,6 +515,17 @@ class Config:
         with p.open("rb") as fp:
             data = load(fp)
 
+        # Merge mode was removed: merging is now a normal proxy server whose
+        # transport is a local unix socket and whose rule allows all keys.
+        # Refuse legacy merge configs loudly rather than silently binding the
+        # wrong transport.
+        if data.get("mode") == "merge" or "merge_sockets" in data:
+            raise ValueError(
+                "merge mode was removed; run a proxy server with a local unix "
+                "listener and a wildcard 'allow' rule instead "
+                "(see docs/technical/ssh-agent-proxy.md §7)"
+            )
+
         def resolve(value):
             if not isinstance(value, str):
                 return value
@@ -493,7 +545,6 @@ class Config:
         self.mode = data.get("mode", self.mode)
         if mode is not None:
             self.mode = mode
-        self.merge_sockets = data.get("merge_sockets", self.merge_sockets)
         self.listen_socket = resolve(data.get("listen_socket", self.listen_socket))
         self.socket = resolve(data.get("socket", self.socket))
         self.socket_dir_mode = data.get("socket_dir_mode", self.socket_dir_mode)
@@ -569,9 +620,13 @@ class Config:
         if tcp_bind is not None:
             _split_bind(str(tcp_bind))
         self.tcp_bind = tcp_bind
-        self.default_agent_socket_path = resolve(
-            data.get("default_agent_socket_path", self.default_agent_socket_path)
-        )
+        agent_sockets = data.get("agent_sockets")
+        if agent_sockets is None:
+            # Unset -> default to the ambient agent socket ($SSH_AUTH_SOCK), so
+            # the proxy is useful with zero key/rule config.
+            env_sock = environ.get("SSH_AUTH_SOCK")
+            agent_sockets = [env_sock] if env_sock else []
+        self.agent_sockets = [resolve(s) for s in agent_sockets]
         self.libvirt_uri = data.get("libvirt_uri")
         if self.libvirt_uri and libvirt_open is None:
             raise ValueError(
@@ -596,26 +651,16 @@ class Config:
 
         log.debug(
             f"Config: mode={self.mode}, transport={self.transport}, "
-            f"vsock_port={self.vsock_port}, default_socket={self.default_agent_socket_path}, "
+            f"vsock_port={self.vsock_port}, agent_sockets={self.agent_sockets}, "
             f"libvirt_uri={self.libvirt_uri}, resolution={self.resolution}, "
             f"transport_encryption={self.transport_encryption}"
         )
 
-        if not self.default_agent_socket_path:
+        if not self.agent_sockets:
             raise ValueError(
-                "Failed to load path to the actual SSH agent socket (SSH_AUTH_SOCK empty)"
+                "Failed to load path to the actual SSH agent socket "
+                "(no agent_sockets configured and SSH_AUTH_SOCK empty)"
             )
-
-        forward_sockets = data.get("forward_sockets")
-        if forward_sockets is None:
-            # Not set at all -> auto-forward the default agent socket, so the
-            # proxy is useful with zero key/rule config. Set forward_sockets
-            # explicitly (even to []) to opt out of this.
-            self.forward_sockets = (
-                [self.default_agent_socket_path] if self.default_agent_socket_path else []
-            )
-        else:
-            self.forward_sockets = [resolve(s) for s in forward_sockets]
 
         for entry in data.get("vm", []):
             cid = entry.get("cid")
@@ -643,7 +688,7 @@ class Config:
         self.known_hosts.load([resolve(path) for path in data.get("known_hosts_files", [])])
 
         for entry in data.get("key", []):
-            socket_path = resolve(entry.get("socket", self.default_agent_socket_path))
+            socket_path = resolve(entry.get("socket", self.agent_sockets[0]))
             k_type, blob, fingerprint = self._parse_pubkey(entry.get("pubkey", ""))
 
             if blob in self.keys:
@@ -667,10 +712,20 @@ class Config:
             if key_sel != "*" and key_sel not in key_ids:
                 raise ValueError(f"rule references unknown key {key_sel!r}")
             match = entry.get("match", {})
+            # The selectors were renamed (`vm_names` -> `machine`, `listener` ->
+            # `listeners`). A silently-ignored old key would widen the rule to
+            # every machine/listener, so refuse it loudly instead.
+            for old, new in (("vm_names", "machine"), ("listener", "listeners")):
+                if old in match:
+                    raise ValueError(
+                        f"rule match.{old!r} was renamed to match.{new!r}; "
+                        f"update the configuration"
+                    )
             self.rules.append(
                 Rule(
                     key=key_sel,
-                    vm_names=match.get("vm_names", []),
+                    machine=_as_pattern_list(match.get("machine"), field="machine"),
+                    listeners=_as_pattern_list(match.get("listeners"), field="listeners"),
                     auth=self._policy(entry, "auth", "ask"),
                     data_signing=self._policy(entry, "data_signing", "deny"),
                     notify=entry.get("notify", True),
@@ -681,29 +736,47 @@ class Config:
             )
 
         # Global policy above is shared by every listener. Now expand the
-        # listener list: the `transports` array (defaults deep-merged into each
-        # entry), or a single implicit listener for a legacy flat config.
-        raw_transports = data.get("transports")
-        if isinstance(raw_transports, list) and raw_transports:
+        # listener list: the `[[listeners]]` array (a `[listener_defaults]`
+        # table deep-merged into each entry), or a single implicit listener for
+        # a legacy flat config. The old `transports`/`transport_defaults` names
+        # are rejected loudly rather than silently ignored.
+        if "transports" in data or "transport_defaults" in data:
+            raise ValueError(
+                "the 'transports'/'transport_defaults' keys were renamed to "
+                "'listeners'/'listener_defaults' (one [[listeners]] entry is one "
+                "listener); update the configuration"
+            )
+        raw_listeners = data.get("listeners")
+        if isinstance(raw_listeners, list) and raw_listeners:
             for flat_key in ("transport", "tcp_bind", "vsock_port", "security", "mtls"):
                 if flat_key in data:
                     raise ValueError(
-                        f"transports cannot be combined with the flat "
+                        f"listeners cannot be combined with the flat "
                         f"{flat_key!r} key (the configuration is ambiguous)"
                     )
-            defaults = data.get("transport_defaults") or {}
-            for index, entry in enumerate(raw_transports):
+            defaults = data.get("listener_defaults") or {}
+            for index, entry in enumerate(raw_listeners):
                 if not isinstance(entry, dict):
                     raise ValueError(
-                        f"transports[{index}] must be a table, "
+                        f"listeners[{index}] must be a table, "
                         f"got {type(entry).__name__}"
                     )
             self.listeners = [
                 self._parse_listener(_deep_merge(defaults, entry), resolve)
-                for entry in raw_transports
+                for entry in raw_listeners
             ]
         else:
             self.listeners = [self._parse_listener_from_flat(data)]
+
+        # Listener names are optional but, when present, identify a listener for
+        # `match.listeners` rules, so they must be unique.
+        seen_names: set[str] = set()
+        for listener in self.listeners:
+            if listener.name is None:
+                continue
+            if listener.name in seen_names:
+                raise ValueError(f"duplicate listener name: {listener.name!r}")
+            seen_names.add(listener.name)
 
         log.info(
             f"Loaded {len(self.keys)} key(s) and {len(self.rules)} rule(s) from {p}"
@@ -738,7 +811,7 @@ class Config:
     def _parse_listener(
         self, data: dict, resolve: Callable[[Any], Any]
     ) -> ListenerConfig:
-        """Build one `ListenerConfig` from a defaults-merged `transports` entry.
+        """Build one `ListenerConfig` from a defaults-merged `listeners` entry.
 
         Security and identity are resolved **per listener**: each entry resolves
         its own `[security]`/`[mtls]` through `validate_security_config` and its
@@ -748,6 +821,10 @@ class Config:
         transport = data.get("type") or data.get("transport")
         if transport not in ("vsock", "tcp", "unix"):
             raise ValueError(f"invalid transport: {transport!r}")
+
+        name = data.get("name")
+        if name is not None and (not isinstance(name, str) or not name):
+            raise ValueError(f"listener name must be a non-empty string, got {name!r}")
 
         transport_encryption, client_auth, server_auth = validate_security_config(
             data, transport
@@ -766,6 +843,16 @@ class Config:
             raise ValueError(
                 f"resolution = {resolution!r} is not valid on the unix transport "
                 "(use 'certificate' or 'none')"
+            )
+
+        scan_agent_socket_dirs = bool(data.get("scan_agent_socket_dirs", False))
+        resolve_session_socket = bool(data.get("resolve_session_socket", False))
+        if transport != "unix" and (
+            scan_agent_socket_dirs or resolve_session_socket
+        ):
+            raise ValueError(
+                "scan_agent_socket_dirs/resolve_session_socket are only valid "
+                f"on the unix transport (got {transport!r})"
             )
 
         return ListenerConfig(
@@ -795,6 +882,9 @@ class Config:
             mtls_key_file=resolve(mtls.get("key_file")),
             mtls_required_oid=mtls.get("required_oid"),
             mtls_peer_required_oid=mtls.get("peer_required_oid"),
+            name=name,
+            scan_agent_socket_dirs=scan_agent_socket_dirs,
+            resolve_session_socket=resolve_session_socket,
         )
 
     def _parse_listener_from_flat(self, data: dict) -> ListenerConfig:
@@ -810,6 +900,18 @@ class Config:
             port = self.vsock_port
         elif self.tcp_bind:
             host, port = _split_bind(self.tcp_bind)
+        scan_agent_socket_dirs = bool(data.get("scan_agent_socket_dirs", False))
+        resolve_session_socket = bool(data.get("resolve_session_socket", False))
+        if self.transport != "unix" and (
+            scan_agent_socket_dirs or resolve_session_socket
+        ):
+            raise ValueError(
+                "scan_agent_socket_dirs/resolve_session_socket are only valid "
+                f"on the unix transport (got {self.transport!r})"
+            )
+        name = data.get("name")
+        if name is not None and (not isinstance(name, str) or not name):
+            raise ValueError(f"listener name must be a non-empty string, got {name!r}")
         return ListenerConfig(
             transport=self.transport,
             host=host,
@@ -831,6 +933,9 @@ class Config:
             mtls_key_file=self.mtls_key_file,
             mtls_required_oid=self.mtls_required_oid,
             mtls_peer_required_oid=self.mtls_peer_required_oid,
+            name=name,
+            scan_agent_socket_dirs=scan_agent_socket_dirs,
+            resolve_session_socket=resolve_session_socket,
         )
 
 
@@ -1404,7 +1509,7 @@ def resolve_peer(
 
     The two are deliberately separate: `display_label` is always a non-empty
     human string for logs/dialogs (falling back to `unknown_label`, e.g.
-    `unknown-cid-7`), while `matching_identity` is the value `Rule.matches_vm`
+    `unknown-cid-7`), while `matching_identity` is the value `Rule.matches_machine`
     sees and is **None** whenever no identity was established. `none`
     resolution always yields `(unknown_label, None)`; `certificate` uses the
     verified mTLS CN; `tartarus` the static/libvirt bookkeeping; `mofos` the
@@ -1479,7 +1584,7 @@ def create_ssl_context(
 
 class AgentIO:
     """Shared SSH agent protocol framing, used by both the policy-enforcing
-    vsock Handler, the allow-all merge Handler, and the client Handler."""
+    server Handler and the client Handler."""
 
     def _recv_exactly(self, sock: socket, n: int) -> Optional[bytes]:
         """Read exactly n bytes, looping over short reads. None on EOF."""
@@ -1563,6 +1668,9 @@ class Handler(AgentIO, BaseRequestHandler):
 
         address_family = getattr(self.server, "address_family", AF_UNIX)
         resolution = self.server.listener_config.resolution
+        # The accepting listener's optional name, used by `rule.match.listeners`
+        # (None when the listener is unnamed -> only wildcard/empty selectors).
+        self.listener_name = self.server.listener_config.name
         if address_family == AF_VSOCK:
             cid, _ = self.client_address
             static_name = self.config.vm_by_cid.get(cid)
@@ -1619,13 +1727,16 @@ class Handler(AgentIO, BaseRequestHandler):
             if k_cfg.socket not in self.allowed_sockets:
                 self.allowed_sockets.append(k_cfg.socket)
 
-        # forward_sockets are always probed, regardless of whether any
+        # agent_sockets are always probed, regardless of whether any
         # explicit rule matched above -- identities coming back from them are
         # admitted opportunistically in _handle_identities/_maybe_autoregister,
         # governed by an explicit rule if one matches or DEFAULT_RULE otherwise.
-        for sock_path in self.config.forward_sockets:
+        # A listener with `scan_agent_socket_dirs`/`resolve_session_socket` set
+        # replaces this static list per connection in `handle`.
+        for sock_path in self.config.agent_sockets:
             if sock_path not in self.allowed_sockets:
                 self.allowed_sockets.append(sock_path)
+        self.resolved_agent_sockets: list[str] = list(self.config.agent_sockets)
 
         log.debug(
             f"Client {self.vm_name} initialized with "
@@ -1634,10 +1745,15 @@ class Handler(AgentIO, BaseRequestHandler):
         )
 
     def _match_rule(self, key_id: str) -> Optional[Rule]:
-        # First rule (in file order) matching this key and identity defines the
-        # policy. Matching uses the verified identity, never the display label.
+        # First rule (in file order) matching this key, identity and listener
+        # defines the policy. Matching uses the verified identity and the
+        # listener's name, never the display label.
         for rule in self.config.rules:
-            if rule.matches_key(key_id) and rule.matches_vm(self.vm_identity):
+            if (
+                rule.matches_key(key_id)
+                and rule.matches_machine(self.vm_identity)
+                and rule.matches_listener(self.listener_name)
+            ):
                 return rule
         return None
 
@@ -1645,15 +1761,17 @@ class Handler(AgentIO, BaseRequestHandler):
         self, key_blob: bytes, comment: bytes, socket_path: str
     ) -> Optional[KeyConfig]:
         """Admit a key discovered from an upstream agent that wasn't already
-        pre-ruled in setup() (see forward_sockets). Only keys arriving from a
-        forward_sockets upstream are eligible. A configured `key` entry for
+        pre-ruled in setup() (see agent_sockets). Only keys arriving from an
+        agent upstream resolved for this connection (`resolved_agent_sockets`,
+        which a directory scan / per-session selector may have expanded) are
+        eligible. A configured `key` entry for
         this blob keeps its declared id (so rules can target it reliably even
         without a match at connection setup, e.g. a rule scoped to a different
         VM); an unrecognized blob is named after its agent comment (falling
         back to its fingerprint). Either way, the first explicit rule matching
         that id and this VM governs it, or DEFAULT_RULE if none matches.
         """
-        if socket_path not in self.config.forward_sockets:
+        if socket_path not in self.resolved_agent_sockets:
             return None
 
         named = self.config.keys.get(key_blob)
@@ -1688,16 +1806,46 @@ class Handler(AgentIO, BaseRequestHandler):
         client.settimeout(SOCKET_TIMEOUT)
         log.info(f"Connection from {self.vm_name}")
 
+        # Per-connection upstream resolution: a `unix` listener may opt into
+        # expanding directory entries and/or preferring the connecting peer's
+        # own per-session socket. Off by default, so the static global
+        # `agent_sockets` list is used unchanged everywhere else.
+        listener = self.server.listener_config
+        if listener.scan_agent_socket_dirs or listener.resolve_session_socket:
+            session_socket = (
+                _peer_env_socket(self.request)
+                if listener.resolve_session_socket
+                else None
+            )
+            resolved = _resolve_agent_sockets(
+                self.config.agent_sockets,
+                scan_dirs=listener.scan_agent_socket_dirs,
+                session_socket=session_socket,
+            )
+            self.resolved_agent_sockets = resolved
+            key_sockets = [
+                p for p in self.allowed_sockets if p not in self.config.agent_sockets
+            ]
+            self.allowed_sockets = key_sockets + [
+                p for p in resolved if p not in key_sockets
+            ]
+
         real_agents = {}
         for path in self.allowed_sockets:
+            # `path` stays the configured identifier (also used to key
+            # `real_agents` and match `key.socket`/`resolved_agent_sockets`);
+            # only the AF_UNIX connect expands a `%t/...` runtime-dir
+            # placeholder to $XDG_RUNTIME_DIR (see `_expand_socket_path`).
+            target = _expand_socket_path(path)
             try:
                 sock = Socket(AF_UNIX, SOCK_STREAM)
+                sock.settimeout(UPSTREAM_TIMEOUT)
+                sock.connect(target)
                 sock.settimeout(SOCKET_TIMEOUT)
-                sock.connect(path)
                 real_agents[path] = sock
-                log.debug(f"Connected to upstream agent at {path}")
+                log.debug(f"Connected to upstream agent at {target}")
             except Exception as e:
-                log.error(f"Could not connect to real agent at {path}: {e}")
+                log.error(f"Could not connect to real agent at {target}: {e}")
 
         try:
             while True:
@@ -2060,7 +2208,7 @@ class Handler(AgentIO, BaseRequestHandler):
 
 def _peer_env_socket(sock, var: str = "SSH_AUTH_PROXY_SOCK") -> Optional[str]:
     """Linux only: the per-session forwarded socket of the process that connected
-    to the merge socket, read from its environment.
+    to the local unix listener, read from its environment.
 
     The client (`ssh`, `git`, ...) inherits `SSH_AUTH_PROXY_SOCK` from the SSH
     session (the host wrapper's `SetEnv`, accepted by the guest `sshd`), so
@@ -2099,17 +2247,20 @@ def _peer_env_socket(sock, var: str = "SSH_AUTH_PROXY_SOCK") -> Optional[str]:
     return None
 
 
-def _merge_upstream_paths(
-    entries: list[str], *, session_socket: Optional[str] = None
+def _resolve_agent_sockets(
+    entries: list[str],
+    *,
+    scan_dirs: bool = False,
+    session_socket: Optional[str] = None,
 ) -> list[str]:
-    """Resolve merge upstream entries to an ordered, de-duplicated list of
-    AF_UNIX socket paths, evaluated **per client connection**.
+    """Resolve upstream `agent_sockets` entries to an ordered, de-duplicated
+    list of AF_UNIX socket paths, evaluated **per client connection**.
 
     An entry is one of:
 
-      * a **directory** -- scanned (non-recursive) for socket files *right now*,
-        so per-session forwarded sockets that appear/disappear between sessions
-        are picked up without restarting the merge;
+      * a **directory** -- scanned (non-recursive) for socket files *right now*
+        when `scan_dirs` is set, so per-session forwarded sockets that
+        appear/disappear between sessions are picked up without a restart;
       * an existing socket path -- used as-is;
       * anything absent -- skipped (a not-yet-created directory or agent is not
         an error; it simply contributes no upstream this time).
@@ -2117,8 +2268,7 @@ def _merge_upstream_paths(
     `session_socket` is an already-resolved, authoritative per-session socket
     (Linux `_peer_env_socket`). When it is known it is added first and directory
     entries are **not** scanned: the exact session socket replaces the broad
-    union of every session's forwarded socket. Directory scanning remains the
-    fallback (macOS always, Linux when the peer environment cannot be read).
+    union of every session's forwarded socket.
 
     De-duplication is by resolved real path, so the same socket reached through
     both a directory scan and a literal entry is connected only once. Identity
@@ -2130,23 +2280,31 @@ def _merge_upstream_paths(
 
     def add(candidate: str) -> None:
         try:
-            real = str(Path(candidate).resolve())
+            # De-duplicate on the real, expanded path so the same socket reached
+            # through a `%t/...` literal and a directory scan is connected once.
+            real = str(Path(_expand_socket_path(candidate)).resolve())
         except OSError:
             real = candidate
         if real in seen:
             return
         seen.add(real)
+        # Keep the un-expanded `candidate` as the returned identifier so it
+        # still matches `key.socket` and `resolved_agent_sockets` verbatim; the
+        # consumer expands it again at connect time.
         paths.append(candidate)
 
     if session_socket is not None:
         add(session_socket)
 
     for entry in entries:
-        p = Path(entry)
+        # `%t/...` (XDG_RUNTIME_DIR / DARWIN_USER_TEMP_DIR) is a runtime
+        # placeholder: expand it before touching the filesystem, but keep
+        # returning the configured entry as the socket identifier.
+        p = Path(_expand_socket_path(entry))
         try:
             if p.is_dir():
-                if session_socket is not None:
-                    continue  # exact session socket already added
+                if session_socket is not None or not scan_dirs:
+                    continue  # exact session socket already added, or scan off
                 for child in sorted(p.iterdir()):
                     try:
                         if S_ISSOCK(child.stat().st_mode):
@@ -2156,161 +2314,10 @@ def _merge_upstream_paths(
             elif p.exists():
                 add(entry)
             else:
-                log.debug(f"merge: upstream {entry!r} is absent; skipping")
+                log.debug(f"agent_sockets: upstream {entry!r} is absent; skipping")
         except OSError as e:
-            log.warning(f"merge: cannot inspect upstream {entry!r}: {e}")
+            log.warning(f"agent_sockets: cannot inspect upstream {entry!r}: {e}")
     return paths
-
-
-class MergeHandler(AgentIO, BaseRequestHandler):
-    """Allow-all handler for --merge mode: no VM resolution, no rules, no
-    confirmation prompts -- just aggregates identities from every upstream
-    agent socket and blindly forwards everything else to whichever upstream
-    answers first with something other than FAILURE.
-
-    Upstreams are (re)resolved per connection via `_merge_upstream_paths`. On
-    Linux the connecting process's own `SSH_AUTH_PROXY_SOCK` is used when it can
-    be read (`_peer_env_socket`); everywhere else (macOS always), directory
-    entries are scanned so the live set of forwarded sockets is merged without a
-    restart.
-    """
-
-    def setup(self) -> None:
-        session_socket = _peer_env_socket(self.request)
-        if session_socket:
-            log.debug(f"merge: using this session's forwarded socket {session_socket}")
-        self.upstream_sockets: list[str] = _merge_upstream_paths(  # type: ignore
-            self.server.app_sockets, session_socket=session_socket
-        )
-
-    def handle(self) -> None:
-        client = self.request
-        client.settimeout(SOCKET_TIMEOUT)
-        log.info("merge: new client connection")
-
-        real_agents: dict[str, socket] = {}
-        for path in self.upstream_sockets:
-            try:
-                sock = Socket(AF_UNIX, SOCK_STREAM)
-                # Short timeout only for connect(): a hung/dead upstream is
-                # dropped quickly there. Data reads default to the long
-                # timeout -- _handle_identities narrows it per call, while
-                # sign/forward requests must be allowed to block on user
-                # interaction (guard applies to both host- and guest-side
-                # merge proxies, which share this handler).
-                sock.settimeout(MERGE_UPSTREAM_TIMEOUT)
-                sock.connect(path)
-                sock.settimeout(SOCKET_TIMEOUT)
-                real_agents[path] = sock
-                log.debug(f"merge: connected to upstream agent at {path}")
-            except Exception as e:
-                log.error(f"merge: could not connect to upstream agent at {path}: {e}")
-
-        try:
-            while True:
-                msg = self._recv_msg(client)
-                if not msg:
-                    break
-
-                if msg[0] == AgentMsg.REQUEST_IDENTITIES:
-                    self._handle_identities(client, msg, real_agents)
-                else:
-                    self._handle_forward(client, msg, real_agents)
-        except Exception:
-            log.exception("merge: error in client handler loop")
-        finally:
-            for s in real_agents.values():
-                s.close()
-            client.close()
-            log.debug("merge: client connection closed")
-
-    @staticmethod
-    def _drop(real_agents: dict[str, socket], path: str) -> None:
-        """Retire an upstream whose reply was lost (timeout or EOF). A partial
-        read may have left the stream desynced, so it must not be reused."""
-        sock = real_agents.pop(path, None)
-        if sock is not None:
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-    def _handle_identities(
-        self, client: socket, raw_msg: bytes, real_agents: dict[str, socket]
-    ) -> None:
-        aggregated_identities: list[tuple[bytes, bytes]] = []
-        seen: set[bytes] = set()
-        for path in list(real_agents):
-            sock = real_agents[path]
-            try:
-                # Identity enumeration is the one request we bound tightly: a
-                # hung upstream must not make `ssh-add -l` block for the full
-                # SOCKET_TIMEOUT.
-                sock.settimeout(MERGE_UPSTREAM_TIMEOUT)
-                self._send_msg(sock, raw_msg)
-                resp = self._recv_msg(sock)
-                sock.settimeout(SOCKET_TIMEOUT)
-            except OSError:
-                self._drop(real_agents, path)
-                continue
-            if resp is None:
-                # Hung or closed upstream: skip and retire it.
-                self._drop(real_agents, path)
-                continue
-            if resp[0] != AgentMsg.IDENTITIES_ANSWER:
-                continue
-
-            buf = SSHBuffer(resp)
-            buf.read_byte()
-            count = buf.read_int()
-            log.debug(f"merge: upstream {path} returned {count} identities")
-
-            for _ in range(count):
-                key_blob = buf.read_string()
-                comment = buf.read_string()
-                if key_blob not in seen:
-                    seen.add(key_blob)
-                    aggregated_identities.append((key_blob, comment))
-
-        payload = pack(">BI", AgentMsg.IDENTITIES_ANSWER, len(aggregated_identities))
-        for blob, comment in aggregated_identities:
-            payload += pack(">I", len(blob)) + blob
-            payload += pack(">I", len(comment)) + comment
-
-        log.debug(f"merge: returning {len(aggregated_identities)} merged identities")
-        self._send_msg(client, payload)
-
-    def _handle_forward(
-        self, client: socket, raw_msg: bytes, real_agents: dict[str, socket]
-    ) -> None:
-        # Allow-all: no policy to enforce, so just try each upstream agent in
-        # turn and relay the first response that isn't a FAILURE. This
-        # correctly handles sign requests (only the agent holding the private
-        # key will answer with SIGN_RESPONSE) and any other request type.
-        #
-        # The per-socket timeout here is the long SOCKET_TIMEOUT (set when the
-        # upstream connected), NOT MERGE_UPSTREAM_TIMEOUT: a sign request can
-        # legitimately take a long time while the user answers an authorization
-        # dialog or touches their YubiKey. Applying the 5s identity timeout here
-        # made those prompts appear to "time out" and surfaced as "agent
-        # refused operation".
-        for path in list(real_agents):
-            sock = real_agents[path]
-            try:
-                self._send_msg(sock, raw_msg)
-            except OSError:
-                self._drop(real_agents, path)
-                continue
-            resp = self._recv_msg(sock)
-            if resp is None:
-                # No reply within SOCKET_TIMEOUT (or EOF): the upstream is
-                # genuinely hung. Retire it and try the next one.
-                self._drop(real_agents, path)
-                continue
-            if len(resp) == 0 or resp[0] != AgentMsg.FAILURE:
-                self._send_msg(client, resp)
-                return
-        self._send_msg(client, bytes([AgentMsg.FAILURE]))
 
 
 class ThreadedVsockServer(ThreadingMixIn, TCPServer):
@@ -2497,49 +2504,6 @@ class ClientHandler(AgentIO, BaseRequestHandler):
                 pass
 
 
-def run_merge(sockets: list[str], listen_path: str) -> None:
-    """Merge mode: no VSOCK, no VM/policy logic -- just fan multiple upstream
-    agent sockets into a single unix socket that allows everything.
-
-    Each upstream entry is a socket path or a **directory**; directories are
-    (re)scanned for sockets on every client connection (see
-    `_merge_upstream_paths`), so a per-session forwarded socket is merged as
-    soon as the session exists. On Linux the connecting process's own
-    `SSH_AUTH_PROXY_SOCK` is preferred when readable (`_peer_env_socket`); macOS
-    relies on the directory scan.
-    """
-    # Resolve platform-specific placeholders first.
-    sockets = [_expand_socket_path(s) for s in sockets]
-    listen_path = _expand_socket_path(listen_path)
-
-    listen = Path(listen_path)
-    listen.parent.mkdir(parents=True, exist_ok=True)
-    if listen.exists():
-        listen.unlink()
-
-    # Restrict the socket's permissions from the moment it's created, so
-    # there's no window where it's reachable by anything other than us.
-    old_umask = umask(0o177)
-    try:
-        server = ThreadedUnixServer(str(listen), MergeHandler)
-    finally:
-        umask(old_umask)
-
-    try:
-        with server:
-            server.app_sockets = sockets  # type: ignore
-            log.info(
-                f"SSH Agent merge proxy listening on {listen} "
-                f"(allow-all, merging {len(sockets)} upstream socket(s): {', '.join(sockets)})"
-            )
-            server.serve_forever()
-    except KeyboardInterrupt:
-        log.info("Shutting down...")
-        exit(0)
-    finally:
-        listen.unlink(missing_ok=True)
-
-
 def _listener_target(listener: ListenerConfig) -> str:
     """Human-readable bind target for a listener's log line."""
     if listener.transport == "unix":
@@ -2705,38 +2669,14 @@ def main() -> None:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--mode",
-        choices=["merge", "proxy", "client"],
+        choices=["proxy", "client"],
         default=None,
         help="Operation mode (default: proxy, or from config)",
-    )
-    parser.add_argument(
-        "--merge",
-        nargs="+",
-        metavar="SOCKET_OR_DIR",
-        help="(Deprecated) Merge mode: upstream sockets or directories",
-    )
-    parser.add_argument(
-        "--listen",
-        metavar="PATH",
-        help="(Deprecated) Unix socket path for merge mode",
     )
     args = parser.parse_args()
 
     log_level = DEBUG if args.debug else INFO
     basicConfig(level=log_level, format="%(asctime)s - %(levelname)s - %(message)s")
-
-    # Backward compatibility: --merge/--listen still work but are deprecated.
-    if args.merge:
-        log.warning(
-            "--merge is deprecated; set mode='merge' and merge_sockets=[...] in config"
-        )
-        if not args.listen:
-            parser.error("--merge requires --listen PATH")
-        run_merge(args.merge, args.listen)
-        return
-
-    if args.listen:
-        log.warning("--listen is deprecated; use listen_socket in config")
 
     config = Config()
     try:
@@ -2747,14 +2687,7 @@ def main() -> None:
 
     mode = args.mode or config.mode or "proxy"
 
-    if mode == "merge":
-        sockets = config.merge_sockets
-        listen_path = args.listen or config.listen_socket
-        if not sockets or not listen_path:
-            log.error("merge mode requires merge_sockets and listen_socket in config")
-            exit(1)
-        run_merge(sockets, listen_path)
-    elif mode == "client":
+    if mode == "client":
         run_client(config)
     else:
         run_proxy(config)

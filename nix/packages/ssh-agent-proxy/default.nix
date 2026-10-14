@@ -1,16 +1,16 @@
 # ssh-agent-proxy: a host-side agent proxy (VSOCK or TCP) that selectively
 # forwards the host's SSH identities to guests, plus the guest-side pieces:
-# a bridge to the host proxy, the local ssh-agent and an allow-all merge proxy.
+# a bridge to the host proxy and the local ssh-agent. Merging several agents is
+# a normal (allow-all, local unix) proxy-server configuration, not a mode.
 #
 # Flattened from nixcfg's `services/user/{ssh-agent-proxy,ssh-agent-host,
-# ssh-agent,ssh-agent-merge}.nix` and exposed as a standalone package plus a
+# ssh-agent}.nix` and exposed as a standalone package plus a
 # NixOS module (server as a system service) and a home-manager module (server,
-# bridge, agent and merge as user services). Units use `nix-service` (§3.7).
+# bridge and agent as user services). Units use `nix-service` (§3.7).
 #
 #   tartarus.ssh-agent-proxy.server   proxy server (host side)
 #   tartarus.ssh-agent-proxy.bridge   guest-side bridge to the host proxy
 #   tartarus.ssh-agent-proxy.agent    guest-local ssh-agent
-#   tartarus.ssh-agent-proxy.merge    guest-local allow-all merge proxy
 {inputs}: let
   mkPackage = {
     pkgs,
@@ -70,7 +70,7 @@
     tomlFormat = pkgs.formats.toml {};
 
     # A field that is `null` by default in the sparse (entry) variant of a
-    # listener and carries its real default in the `transportDefaults`
+    # listener and carries its real default in the `listenerDefaults`
     # variant. `pkgs.formats.toml` cannot serialize `null`, so sparse entries
     # are pruned before generation (see `pruneNulls`).
     nullableOpt = {
@@ -92,7 +92,7 @@
     # `transportEncryption = "mtls"`; the Python layer resolves `auto` from the
     # listener type (tcp → mtls, vsock/unix → none) and never downgrades.
     # `nullable = true` yields the sparse entry variant used inside
-    # `transports`; `nullable = false` the defaults variant.
+    # `listeners`; `nullable = false` the defaults variant.
     mkSecurityOptions = {
       lib,
       nullable ? false,
@@ -145,7 +145,7 @@
       };
 
     # Reusable `[mtls]` option set for one listener. Extracted so it can be
-    # instantiated in both `transportDefaults` and every `transports` entry.
+    # instantiated in both `listenerDefaults` and every `listeners` entry.
     mkMtlsOptions = {
       lib,
       nullable ? false,
@@ -182,8 +182,8 @@
     };
 
     # One listener's option set, instantiated twice: `withType = false` for
-    # the `transportDefaults` block (real defaults, no `type`) and
-    # `withType = true` for a `transports` entry (requires `type`; every other
+    # the `listenerDefaults` block (real defaults, no `type`) and
+    # `withType = true` for a `listeners` entry (requires `type`; every other
     # field is a sparse `nullOr` override). All address fields are accepted on
     # every listener; each is only meaningful for its own `type`.
     sshListenerOptions = {
@@ -248,12 +248,43 @@
           });
         security = mkSecurityOptions {inherit lib nullable;};
         mtls = mkMtlsOptions {inherit lib nullable requiredOid peerOid;};
+        scanAgentSocketDirs = mkOption ((o types.bool false)
+          // {
+            description = ''
+              Unix listeners only. Expand a **directory** entry in the global
+              `settings.agent_sockets` list by scanning it (non-recursively) for
+              sockets on every client connection, so per-session `ssh -R`
+              forwarded sockets are picked up as they appear. Off by default;
+              rejected on a `vsock`/`tcp` listener (there is no same-uid local
+              peer, and the union would span guests).
+            '';
+          });
+        resolveSessionSocket = mkOption ((o types.bool false)
+          // {
+            description = ''
+              Unix listeners only, Linux only. Prefer the connecting peer's own
+              per-session socket (`$SSH_AUTH_PROXY_SOCK`, read from
+              `/proc/<pid>/environ` after a same-uid `SO_PEERCRED` check) for
+              this connection. When resolved it takes precedence over
+              `scanAgentSocketDirs`. A no-op (logged) where it cannot apply.
+              Off by default.
+            '';
+          });
       }
       // lib.optionalAttrs withType {
         type = mkOption {
           type = types.enum ["vsock" "tcp" "unix"];
           description = "Transport this listener binds (required for every entry).";
         };
+        name = mkOption ((o types.str "")
+          // {
+            description = ''
+              Optional name for this listener, unique across the server.
+              `settings.rule.*.match.listeners` selects listeners by this name; an
+              unnamed listener matches only an empty listener selector (or one
+              made exclusively of `*` patterns).
+            '';
+          });
       };
 
     tcpVmType = types.listOf (types.submodule {
@@ -264,7 +295,7 @@
         };
         name = mkOption {
           type = types.str;
-          description = "VM name, matched against rule.match.vm_names.";
+          description = "VM name, matched against rule.match.machine.";
         };
       };
     });
@@ -276,7 +307,7 @@
         };
         name = mkOption {
           type = types.str;
-          description = "VM name, matched against rule.match.vm_names.";
+          description = "VM name, matched against rule.match.machine.";
         };
       };
     });
@@ -306,10 +337,21 @@
         };
         match = mkOption {
           type = types.submodule {
-            options.vm_names = mkOption {
-              type = types.listOf types.str;
-              default = [];
-              description = "VM name patterns (fnmatch) this rule applies to.";
+            options = {
+              machine = mkOption {
+                type = types.listOf types.str;
+                default = [];
+                description = "Machine name patterns (fnmatch) this rule applies to.";
+              };
+              listeners = mkOption {
+                type = types.listOf types.str;
+                default = [];
+                description = ''
+                  Listener name patterns (fnmatch) this rule applies to. Empty
+                  matches every listener; an unnamed listener matches only an
+                  empty selector or one made exclusively of `*` patterns.
+                '';
+              };
             };
           };
           default = {};
@@ -371,20 +413,25 @@
                 default = [];
                 description = "Static peer IP -> VM name mapping for TCP listeners.";
               };
-              default_agent_socket_path = mkOption {
-                type = types.nullOr types.str;
+              agent_sockets = mkOption {
+                type = types.nullOr (types.listOf types.str);
                 default = null;
-                description = "Default SSH agent socket. Null uses `$SSH_AUTH_SOCK` at runtime.";
+                description = ''
+                  Upstream agent sockets whose identities are forwarded to every
+                  VM. The first entry is the default socket for `key` entries
+                  without an explicit `socket`. Null uses `$SSH_AUTH_SOCK` at
+                  runtime.
+
+                  A directory entry is only expanded per connection when the
+                  owning `unix` listener sets `scanAgentSocketDirs` (and, unless
+                  `resolveSessionSocket` supplies the session's exact socket);
+                  otherwise a directory entry simply contributes nothing.
+                '';
               };
               known_hosts_files = mkOption {
                 type = types.listOf types.str;
                 default = [];
                 description = "known_hosts files for host-key lookup.";
-              };
-              forward_sockets = mkOption {
-                type = types.nullOr (types.listOf types.str);
-                default = null;
-                description = "Agent sockets whose identities are auto-forwarded to every VM.";
               };
               key = mkOption {
                 type = keyType;
@@ -402,8 +449,8 @@
           description = "Global (non-transport) contents of the ssh-agent-proxy TOML config file.";
         };
 
-        # Defaults deep-merged into every `transports` entry by the Python.
-        transportDefaults = mkOption {
+        # Defaults deep-merged into every `listeners` entry by the Python.
+        listenerDefaults = mkOption {
           type = types.submodule {
             options = sshListenerOptions {
               inherit lib;
@@ -414,11 +461,11 @@
             };
           };
           default = {};
-          description = "Default values for every field of every entry in `transports`.";
+          description = "Default values for every field of every entry in `listeners`.";
         };
 
         # The listeners, all bound by the single server process.
-        transports = mkOption {
+        listeners = mkOption {
           type = types.listOf (types.submodule {
             options = sshListenerOptions {
               inherit lib;
@@ -430,11 +477,11 @@
           });
           default = [];
           description = ''
-            One entry per transport this server binds, all in the single server
-            process. Multiple entries of the same `type` are allowed (e.g. two
-            `unix` listeners with different sockets). Empty means the server
-            binds nothing and the module rejects the configuration when
-            `enable = true`.
+            One entry per listener this server binds (a listener is a socket;
+            its `type` is its transport), all in the single server process.
+            Multiple entries of the same `type` are allowed (e.g. two `unix`
+            listeners with different sockets). Empty means the server binds
+            nothing and the module rejects the configuration when `enable = true`.
           '';
         };
 
@@ -445,6 +492,12 @@
             then "swiftdialog"
             else "zenity";
           description = "Program used to show the key-use confirmation prompt.";
+        };
+
+        setSshAuthSock = mkOption {
+          type = types.bool;
+          default = false;
+          description = "Point SSH_AUTH_SOCK at this server's local (unix) listener socket (overrides agent/bridge).";
         };
 
         debug = mkOption {
@@ -582,38 +635,11 @@
           description = "Filename of the agent socket (defaults to `ssh-agent`).";
         };
       };
-
-      merge = {
-        enable = mkEnableOption "the guest-local allow-all agent merge proxy";
-
-        sockets = mkOption {
-          type = types.listOf types.str;
-          default = [];
-          example = ["%t/openssh_agent" "%t/gnupg/S.gpg-agent.ssh"];
-          description = ''
-            Upstream agent sockets to merge, in priority order. A directory is
-            also accepted: it is scanned for sockets on every client connection,
-            so per-session forwarded sockets are picked up as they appear.
-          '';
-        };
-
-        listenSocket = mkOption {
-          type = types.str;
-          default = "";
-          description = "Unix socket the merge proxy creates and listens on.";
-        };
-
-        setSshAuthSock = mkOption {
-          type = types.bool;
-          default = false;
-          description = "Point SSH_AUTH_SOCK at the merged socket (overrides agent/bridge).";
-        };
-      };
     };
   };
 
   # pkgs.formats.toml cannot serialize `null` anywhere in the tree, and both
-  # sparse `transports` entries and submodule defaults carry nulls once
+  # sparse `listeners` entries and submodule defaults carry nulls once
   # realized, so strip them recursively through attrsets and lists.
   lib0 = inputs.nixpkgs.lib;
   pruneNulls = v:
@@ -623,7 +649,7 @@
     then map pruneNulls v
     else v;
 
-  # The effective value of one listener: `transportDefaults` with the entry's
+  # The effective value of one listener: `listenerDefaults` with the entry's
   # explicitly-set (non-null) fields merged on top, exactly like the Python's
   # `_deep_merge(defaults, entry)`.
   effectiveListener = {
@@ -650,7 +676,7 @@
     else "none";
 
   # The generated server TOML (`mode = "proxy"`): global scalars plus the
-  # global `settings`, the `[transport_defaults]` block and one `[[transports]]`
+  # global `settings`, the `[listener_defaults]` block and one `[[listeners]]`
   # table per listener. `connect_timeout`/`handshake_timeout`/
   # `decision_timeout` live at the listener level, where `Config.load` reads
   # them (the previous [`security`] placement was dead config).
@@ -679,7 +705,7 @@
       peer_required_oid = mtls.peerOid;
     };
 
-    # `transportDefaults` is instantiated with `nullable = false`, so its
+    # `listenerDefaults` is instantiated with `nullable = false`, so its
     # fields carry real defaults and render in full.
     renderDefaults = defaults:
       {
@@ -692,6 +718,8 @@
         connect_timeout = defaults.connectTimeout;
         handshake_timeout = defaults.handshakeTimeout;
         decision_timeout = defaults.decisionTimeout;
+        scan_agent_socket_dirs = defaults.scanAgentSocketDirs;
+        resolve_session_socket = defaults.resolveSessionSocket;
         security = {
           transport_encryption = defaults.security.transportEncryption;
           client_auth = defaults.security.clientAuth;
@@ -701,14 +729,14 @@
       }
       // optionalAttrs (defaults.resolution != null) {resolution = defaults.resolution;};
 
-    # A `transports` entry is a sparse override: only the fields it actually
+    # A `listeners` entry is a sparse override: only the fields it actually
     # set render. `security` is always resolved (and emitted) so no entry has
     # to rely on the defaults' `client_auth`/`server_auth` under plaintext,
     # which the Python rejects; `mtls` is emitted only for an mTLS listener.
     renderEntry = entry: let
       merged = effectiveListener {
         inherit lib;
-        defaults = server.transportDefaults;
+        defaults = server.listenerDefaults;
         inherit entry;
       };
       transportEncryption = resolveTransportEncryption {
@@ -718,6 +746,7 @@
       };
       fields = {
         type = entry.type;
+        name = entry.name;
         port = entry.port;
         cid = entry.cid;
         host = entry.host;
@@ -728,6 +757,8 @@
         handshake_timeout = entry.handshakeTimeout;
         decision_timeout = entry.decisionTimeout;
         resolution = entry.resolution;
+        scan_agent_socket_dirs = entry.scanAgentSocketDirs;
+        resolve_session_socket = entry.resolveSessionSocket;
       };
     in
       pruneNulls (
@@ -743,18 +774,22 @@
     // optionalAttrs server.debug {debug = true;}
     // pruneNulls server.settings
     // {
-      transport_defaults = renderDefaults server.transportDefaults;
-      transports = map renderEntry server.transports;
+      listener_defaults = renderDefaults server.listenerDefaults;
+      listeners = map renderEntry server.listeners;
     };
 
   # Eval-time guards, evaluated per listener (each sees the same effective
   # values the Python will after its own deep-merge).
   serverAssertions = {lib}: server: let
     inherit (lib) optional;
+    namedListeners = lib.filter (n: n != null) (map (e: e.name) server.listeners);
+    duplicateNames = lib.unique (
+      lib.filter (n: lib.count (m: m == n) namedListeners > 1) namedListeners
+    );
     perEntry = entry: let
       merged = effectiveListener {
         inherit lib;
-        defaults = server.transportDefaults;
+        defaults = server.listenerDefaults;
         inherit entry;
       };
       requested = merged.security.transportEncryption;
@@ -775,19 +810,33 @@
           !(merged.mtls.enable
             && requested != "auto"
             && requested != "mtls");
-        message = "tartarus.ssh-agent-proxy.server.transports: mtls.enable = true conflicts with security.transportEncryption = \"${requested}\" (entry type = \"${entry.type}\"); refusing to downgrade.";
+        message = "tartarus.ssh-agent-proxy.server.listeners: mtls.enable = true conflicts with security.transportEncryption = \"${requested}\" (entry type = \"${entry.type}\"); refusing to downgrade.";
       }
       {
         assertion =
           !(entry.type == "unix" && (resolution == "tartarus" || resolution == "mofos"));
-        message = "tartarus.ssh-agent-proxy.server.transports: the unix listener only supports resolution = \"none\" or \"certificate\" (entry type = \"unix\").";
+        message = "tartarus.ssh-agent-proxy.server.listeners: the unix listener only supports resolution = \"none\" or \"certificate\" (entry type = \"unix\").";
+      }
+      {
+        assertion =
+          !(entry.type != "unix"
+            && ((merged.scanAgentSocketDirs or false) || (merged.resolveSessionSocket or false)));
+        message = "tartarus.ssh-agent-proxy.server.listeners: scanAgentSocketDirs/resolveSessionSocket are only valid on a unix listener (entry type = \"${entry.type}\").";
       }
     ];
   in
-    lib.concatMap perEntry server.transports
-    ++ optional (server.enable && server.transports == []) {
+    lib.concatMap perEntry server.listeners
+    ++ optional (server.enable && server.listeners == []) {
       assertion = false;
-      message = "tartarus.ssh-agent-proxy.server.enable = true requires at least one entry in server.transports.";
+      message = "tartarus.ssh-agent-proxy.server.enable = true requires at least one entry in server.listeners.";
+    }
+    ++ optional (server.setSshAuthSock && !(lib.any (e: e.type == "unix") server.listeners)) {
+      assertion = false;
+      message = "tartarus.ssh-agent-proxy.server.setSshAuthSock = true requires a listener with type = \"unix\".";
+    }
+    ++ optional (duplicateNames != []) {
+      assertion = false;
+      message = "tartarus.ssh-agent-proxy.server.listeners: duplicate listener name(s): ${lib.concatStringsSep ", " duplicateNames}.";
     };
 
   serverRequiredOid = "1.3.6.1.4.1.99999.2.1";
@@ -827,7 +876,7 @@ in {
         description = "SSH agent proxy via its configured listeners";
         command = "${package}/bin/ssh-agent-proxy --config ${configPath}${lib.optionalString server.debug " --debug"}";
         scope = "system";
-        environment = lib.optionalAttrs (server.settings.default_agent_socket_path == null) {
+        environment = lib.optionalAttrs (server.settings.agent_sockets == null) {
           SSH_AUTH_SOCK = "/run/ssh-agent-proxy/ssh-agent";
         };
       })
@@ -866,7 +915,6 @@ in {
     server = cfg.server;
     bridge = cfg.bridge;
     agent = cfg.agent;
-    merge = cfg.merge;
     package = mkPackage {inherit pkgs;};
     tomlFormat = pkgs.formats.toml {};
     isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
@@ -882,6 +930,15 @@ in {
       else "${home}/.config/ssh-agent-proxy/config.toml";
 
     serverConfigFile = tomlFormat.generate "ssh-agent-proxy.toml" (pruneNulls (mkServerToml {inherit lib;} server));
+
+    # The socket `setSshAuthSock` points at: the first unix listener's socket
+    # (its explicit `socket`, else the `listenerDefaults` default).
+    serverUnixSocket = let
+      unixEntry = lib.findFirst (e: e.type == "unix") null server.listeners;
+    in
+      if unixEntry != null && unixEntry.socket != null
+      then unixEntry.socket
+      else server.listenerDefaults.socket;
 
     bridgeTransportEncryption =
       if bridge.mtls.enable
@@ -957,30 +1014,6 @@ in {
       wait "$AGENT_PID"
     '';
 
-    # ---- merge ----
-    mergeSockets =
-      if merge.sockets != []
-      then merge.sockets
-      else if isDarwin
-      then [
-        "__APPLE_SSH_AUTH_SOCK__"
-        "${home}/.gnupg/S.gpg-agent.ssh"
-      ]
-      else [
-        "%t/${config.services.ssh-agent.socket}"
-        "%t/gnupg/S.gpg-agent.ssh"
-      ];
-    mergeListen =
-      if merge.listenSocket != ""
-      then merge.listenSocket
-      else if isDarwin
-      then "${home}/.ssh/.ssh-agent-merged.sock"
-      else "%t/ssh-agent-merged";
-    mergeEnv =
-      if isDarwin
-      then mergeListen
-      else replaceStrings ["%t"] ["$XDG_RUNTIME_DIR"] mergeListen;
-
     envFile = mkEnvFile {inherit lib;};
   in {
     imports = [optionsModule];
@@ -991,7 +1024,7 @@ in {
           name = "ssh-agent-proxy";
           description = "SSH agent proxy via its configured listeners";
           command = "${package}/bin/ssh-agent-proxy --config ${serverConfigPath}${optionalString server.debug " --debug"}";
-          environment = optionalAttrs (server.settings.default_agent_socket_path == null) {
+          environment = optionalAttrs (server.settings.agent_sockets == null) {
             SSH_AUTH_SOCK = "%t/ssh-agent";
           };
         })
@@ -999,6 +1032,9 @@ in {
           home.packages = [package];
           home.file.${serverConfigPath}.source = serverConfigFile;
         }
+        (lib.mkIf server.setSshAuthSock (envFile "60-tartarus-ssh-agent-server.conf" {
+          SSH_AUTH_SOCK = replaceStrings ["%t"] ["$XDG_RUNTIME_DIR"] serverUnixSocket;
+        }))
         {
           assertions = serverAssertions {inherit lib;} server;
         }
@@ -1036,15 +1072,6 @@ in {
           };
         })
         (envFile "40-tartarus-ssh-agent.conf" {SSH_AUTH_SOCK = socketPath;})
-      ]))
-
-      (mkIf merge.enable (mkMerge [
-        (mkService {
-          name = "ssh-agent-merge";
-          description = "SSH agent merge proxy (allow-all, no VSOCK)";
-          command = "${package}/bin/ssh-agent-proxy --merge ${lib.concatMapStringsSep " " lib.escapeShellArg mergeSockets} --listen ${lib.escapeShellArg mergeListen}";
-        })
-        (lib.mkIf merge.setSshAuthSock (envFile "60-tartarus-ssh-agent-merge.conf" {SSH_AUTH_SOCK = mergeEnv;}))
       ]))
     ];
   };

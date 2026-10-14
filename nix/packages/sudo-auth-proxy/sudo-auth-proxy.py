@@ -123,10 +123,9 @@ PENDING_TYPE = "auth_pending"
 # The three explicit security knobs (doc §7.2-§7.5; review log S13). Exactly one
 # value each; `transport_encryption = "mtls"` forces both auths to "transport"
 # and nothing is layered on top. `"none"` disables requester authentication
-# entirely and is only meaningful paired with `acl.mode = "none"` (see
-# `build_security`/`validate_security_config`): it exists so a fully
-# unauthenticated deployment is an explicit, warned, conscious choice instead of
-# an accident.
+# entirely (see `build_security`/`validate_security_config`): it exists so a
+# fully unauthenticated deployment is an explicit, warned, conscious choice
+# instead of an accident.
 #
 # mTLS is the ONLY authentication/signature mechanism (doc §7). The former
 # `client_auth = "ssh"` (SSH-key or ssh-agent signatures) and
@@ -139,38 +138,36 @@ TRANSPORT_ENCRYPTIONS = ("none", "mtls")
 CLIENT_AUTH_METHODS = ("transport", "none")
 SERVER_AUTH_METHODS = ("transport", "none")
 
-# Authorization (`[acl]`) modes (doc §8.1; redesign Phase 4). Exactly one mode:
-# `"list"` pins credential fingerprints (mTLS leaf SPKI); `"ca"` accepts any
-# credential that chains to a configured CA and carries the service EKU. There
-# is deliberately no `ca`+`list` combination and no wildcard: an empty trust
-# list denies all (doc §8.3). `"none"` authorizes every request because there is
-# no credential to authorize; it is rejected unless `client_auth = "none"` (XOR).
-ACL_MODES = ("list", "ca", "none")
-
-# The `[acl]` rule engine (`[[acl.rule]]`). Rules refine the *approval* decision
-# once the ACL has already authorized the credential: each rule matches the
-# requester's identity (the resolved friendly name, the ACL label, the verified
-# fingerprint or `none`), the target/invoking user and the PAM service with
-# glob patterns, and names the policy to apply. They are evaluated in file order
-# and the first match wins, exactly like `ssh-agent-proxy`'s rule list -- there
-# is no merging between rules. The policies are:
+# The approval rule engine (`[[rule]]`, doc §8). One ordered, document-level
+# list: each rule matches the requester's machine identity (the resolved
+# friendly name, the label, the verified fingerprint or the `none` sentinel),
+# the target/invoking user, the PAM service and the accepting listener's name --
+# every selector a glob, written as a bare string or a list of patterns -- and
+# names the policy to apply.
+#
+# **First match wins; there is no merging between rules.** This is
+# security-critical: a permissive rule that appears above a restrictive one
+# takes precedence, so rule order is a policy decision, not a formatting detail.
+# Policies are:
 #   `ask`   show the confirmation dialog (the default when no rule matches);
 #   `allow` reply allow without a dialog;
 #   `deny`  reply deny without a dialog.
-# `"*"` (or an absent selector) matches anything. Rules inspect only data the
-# server already trusts for display (`target_user`/`invoking_user`/`service` are
-# self-reported and never authorization inputs), so they can never *grant* a
-# credential the ACL rejected -- the ACL runs first and is the gate.
+#
+# An empty/absent selector matches anything. `target_user`/`invoking_user`/
+# `service` are self-reported by the guest: they refine the decision but a rule
+# can never authorize a credential the mTLS transport did not authenticate.
 RULE_POLICIES = ("allow", "ask", "deny")
-CONFIG_RULE_KEYS = frozenset(
-    {
-        "identity",
-        "target_user",
-        "invoking_user",
-        "service",
-        "policy",
-    }
+CONFIG_RULE_KEYS = frozenset({"match", "policy"})
+CONFIG_RULE_MATCH_KEYS = frozenset(
+    {"machine", "listeners", "service", "target_user", "invoking_user"}
 )
+
+# The client `[acl]` pins which **server** the client trusts to answer (a fake
+# or wrong-service server is refused even if CA-signed). This is the client-side
+# authorization: it decides *who may approve*. It is crypto material only (a
+# server leaf SPKI fingerprint, or an fnmatch pattern on the server
+# certificate's CN/SAN), never request metadata.
+CONFIG_ACL_KEYS = frozenset({"trusted_fingerprints", "trusted_names"})
 
 # The fixed identity returned by `authenticate_request` when requester
 # authentication is deliberately disabled (`client_auth = "none"`). It is a
@@ -557,28 +554,26 @@ def load_config(path: str) -> dict:
             return str(config_dir / pth)
         return str(pth)
 
-    # `[mtls]`/`[acl]` paths are resolved against the config file's own
-    # directory, so a hand-written config can use paths relative to itself. In
-    # the multi-listener schema the same tables appear inside every
-    # `[[transports]]` entry and inside `[transport_defaults]`, so the resolution
-    # runs there too -- before `listener_views` merges the two. `[security]`
-    # holds no paths any more: the removed ssh/x509/signature methods owned
-    # every key reference, and mTLS carries its own `[mtls]` section.
+    # `[mtls]` paths are resolved against the config file's own directory, so a
+    # hand-written config can use paths relative to itself. In the
+    # multi-listener schema the same table appears inside every `[[listeners]]`
+    # entry and inside `[listener_defaults]`, so the resolution runs there too --
+    # before `listener_views` merges the two. `[security]` holds no paths any
+    # more, and the client `[acl]` holds no paths either (fingerprints and
+    # names only): the removed ssh/x509/signature methods owned every key
+    # reference, and mTLS carries its own `[mtls]` section.
     def resolve_tables(container: dict) -> None:
         mtls = container.get("mtls")
         if isinstance(mtls, dict):
             for key in ("ca_file", "cert_file", "key_file"):
                 if mtls.get(key):
                     mtls[key] = resolve(mtls[key])
-        acl = container.get("acl")
-        if isinstance(acl, dict) and acl.get("ca_file"):
-            acl["ca_file"] = resolve(acl["ca_file"])
 
     resolve_tables(config)
-    defaults = config.get("transport_defaults")
+    defaults = config.get("listener_defaults")
     if isinstance(defaults, dict):
         resolve_tables(defaults)
-    entries = config.get("transports")
+    entries = config.get("listeners")
     if isinstance(entries, list):
         for entry in entries:
             if isinstance(entry, dict):
@@ -590,10 +585,9 @@ def load_config(path: str) -> dict:
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge `override` onto `base`, returning a new dict.
 
-    Lists and scalars are replaced wholesale (a listener's `acl.rule` is a
-    single list, never concatenated with the defaults'), while nested tables
-    (`security`/`mtls`/`acl`) merge field by field so an entry can override just
-    the one knob it cares about.
+    Lists and scalars are replaced wholesale (a listener's `security`/`mtls`
+    sub-table is merged field by field so an entry can override just the one
+    knob it cares about, but its scalars never concatenate with the defaults').
     """
     merged = dict(base)
     for key, value in override.items():
@@ -607,17 +601,17 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def listener_views(config: dict) -> list[dict]:
     """Return the flat, legacy-shaped config for each server listener.
 
-    A document with a non-empty `transports` list expands to one view per entry,
-    each the entry deep-merged over `[transport_defaults]`, with `type` renamed
+    A document with a non-empty `listeners` list expands to one view per entry,
+    each the entry deep-merged over `[listener_defaults]`, with `type` renamed
     to the `transport` key every reader already uses, the global keys carried
-    down and `_listener_index` stamped on it. A flat document (no `transports`)
+    down and `_listener_index` stamped on it. A flat document (no `listeners`)
     is one implicit listener -- the document itself, unchanged -- so every
     existing hand-written and shipped config keeps working with zero edits.
     """
-    entries = config.get("transports")
+    entries = config.get("listeners")
     if not isinstance(entries, list) or not entries:
         return [config]
-    defaults = config.get("transport_defaults") or {}
+    defaults = config.get("listener_defaults") or {}
     views: list[dict] = []
     for index, entry in enumerate(entries):
         view = _deep_merge(defaults, entry)
@@ -663,7 +657,12 @@ CONFIG_TOP_LEVEL_KEYS = frozenset(
         "socket",
         "socket_dir_mode",
         "socket_mode",
-        # timeouts and server-side pre-auth resource bounds
+        # optional listener label, matched by a `[[rule]]` `match.listeners`
+        "name",
+        # server: document-level approval rules and display labels
+        "rule",
+        "labels",
+        # server-side pre-auth resource bounds
         "connect_timeout",
         "decision_timeout",
         "recv_timeout",
@@ -677,7 +676,7 @@ CONFIG_TOP_LEVEL_KEYS = frozenset(
         "approver",
         "client_version",
         "guest_hint",
-        # sub-tables
+        # sub-tables (`acl` is the client-side server pin)
         "security",
         "acl",
         "mtls",
@@ -698,19 +697,6 @@ CONFIG_SECURITY_KEYS = frozenset(
     }
 )
 
-# `labels` is a fingerprint -> display-label map; it is the one free-form table,
-# so its keys are fingerprints and are deliberately not schema keys themselves.
-CONFIG_ACL_KEYS = frozenset(
-    {
-        "mode",
-        "trusted_fingerprints",
-        "ca_file",
-        "required_oid",
-        "labels",
-        "rule",
-    }
-)
-
 CONFIG_MTLS_KEYS = frozenset(
     {
         "enable",
@@ -728,13 +714,16 @@ CONFIG_TABLE_KEYS = {
     "mtls": CONFIG_MTLS_KEYS,
 }
 
-# The keys a `[[transports]]` entry (or the `[transport_defaults]` block) may
+# The keys a `[[listeners]]` entry (or the `[listener_defaults]` block) may
 # carry: the flat server key set minus the non-transport globals (`mode`,
-# `dialog_program`, `debug`, the client metadata), which stay at the document
-# top level, plus `type` -- the wire key `listener_views` renames to `transport`.
+# `dialog_program`, `debug`, `rule`, `labels`, the client metadata), which stay
+# at the document top level, plus `type` -- the wire key `listener_views` renames
+# to `transport` -- and `name`, the optional listener label `match.listeners`
+# matches. There is no per-listener `[acl]`.
 CONFIG_LISTENER_KEYS = frozenset(
     {
         "type",
+        "name",
         "port",
         "cid",
         "host",
@@ -748,14 +737,14 @@ CONFIG_LISTENER_KEYS = frozenset(
         "server_read_timeout",
         "resolution",
         "security",
-        "acl",
         "mtls",
     }
 )
 
-# The top level of a multi-listener document: the global keys plus the two new
-# tables. A flat transport/security/mtls/acl key alongside `transports` is
-# ambiguous and refused (`validate_document_schema`).
+# The top level of a multi-listener document: the global keys plus the
+# document-level tables. A flat transport/security/mtls key alongside `listeners`
+# is ambiguous and refused (`validate_document_schema`). The rules (`rule`) and
+# `labels` are document-level, never per listener.
 CONFIG_DOCUMENT_KEYS = frozenset(
     {
         "mode",
@@ -764,13 +753,15 @@ CONFIG_DOCUMENT_KEYS = frozenset(
         "approver",
         "client_version",
         "guest_hint",
-        "transport_defaults",
-        "transports",
+        "rule",
+        "labels",
+        "listener_defaults",
+        "listeners",
     }
 )
 
 # Keys `listener_views` copies from the document onto every expanded listener;
-# `Handler` and the transports read them as globals, not per listener.
+# `Handler` and the listener read them as globals, not per listener.
 GLOBAL_KEYS = (
     "mode",
     "dialog_program",
@@ -778,6 +769,8 @@ GLOBAL_KEYS = (
     "approver",
     "client_version",
     "guest_hint",
+    "rule",
+    "labels",
 )
 
 # Below this length a fuzzy match has more false positives than value (`post`
@@ -840,22 +833,23 @@ def _unknown_keys_sentence(
 def validate_config_schema(config: dict, *, source: str | None = None) -> None:
     """Refuse any key the implementation does not read (doc §7.9, §15.1).
 
-    Fail-closed and exact: the top level and the `[security]`, `[acl]` and
-    `[mtls]` tables are each checked against their allowed key set, so both a
-    typo and a misplaced key (a `[security]` key written above the `[security]`
-    header, say) stop the process with a message naming the key and the table it
-    belongs to. Unknown keys are **not** ignored: that policy is what turned a
-    flattened `[security]` block into a misleading "requires an explicit
-    client_auth = 'none'" error instead of a diagnosable one.
+    Fail-closed and exact: the top level and the `[security]`, `[acl]` (the
+    client server-pin) and `[mtls]` tables are each checked against their
+    allowed key set, so both a typo and a misplaced key (a `[security]` key
+    written above the `[security]` header, say) stop the process with a message
+    naming the key and the table it belongs to. Unknown keys are **not**
+    ignored: that policy is what turned a flattened `[security]` block into a
+    misleading "requires an explicit client_auth = 'none'" error instead of a
+    diagnosable one.
 
-    `acl.labels` is the single free-form table (fingerprint -> label); only its
-    own key, never its contents, is part of the schema. Values are still typed
-    where they are used (`_positive_int`, `_parse_mode`, the knob validators), so
-    this checks *names*; `source` is the config path, when the caller knows it, so
-    the message can name the file to edit. Every offending key is reported, and
-    keys refused for the same reason share one sentence: a flattened `[security]`
-    block is five misplaced keys, and five copies of the same paragraph help
-    nobody.
+    `[labels]` is the single free-form table (fingerprint -> display label); only
+    its own key, never its contents, is part of the schema. Values are still
+    typed where they are used (`_positive_int`, `_parse_mode`, the knob
+    validators), so this checks *names*; `source` is the config path, when the
+    caller knows it, so the message can name the file to edit. Every offending
+    key is reported, and keys refused for the same reason share one sentence: a
+    flattened `[security]` block is five misplaced keys, and five copies of the
+    same paragraph help nobody.
     """
     # (owner, where) -> keys, so the five keys of one flattened table collapse
     # into a single sentence; `where` is kept per group because the same owner can
@@ -887,6 +881,14 @@ def validate_config_schema(config: dict, *, source: str | None = None) -> None:
         inspect(table, f"inside [{name}]", allowed)
 
     sentences = list(broken_tables)
+    if config.get("mode") == "server" and config.get("acl") is not None:
+        # The `[acl]` table is the *client's* server pin; the server never reads
+        # it (its authorization is the top-level `[[rule]]` list). Refusing it
+        # beats silently ignoring a pin the operator believes is enforced.
+        sentences.append(
+            "'[acl]' is the client's server pin and is not read by a server; "
+            "server authorization is the top-level '[[rule]]' list"
+        )
     sentences.extend(
         f"{_join_names(keys)} must be written{owner}, not {where_phrase}"
         for (owner, where_phrase), keys in misplaced.items()
@@ -915,12 +917,12 @@ def validate_listener_table(
 ) -> None:
     """Refuse any key a listener table cannot carry (doc §3).
 
-    Used for each `[[transports]]` entry (`require_type = True`, it must name
-    its `type`) and for the `[transport_defaults]` block (`require_type =
+    Used for each `[[listeners]]` entry (`require_type = True`, it must name
+    its `type`) and for the `[listener_defaults]` block (`require_type =
     False`). It reuses the flat validator's naming and `did-you-mean` helpers,
     so a typo inside a listener is reported exactly like a typo at the top level,
-    and the nested `[security]`/`[mtls]`/`[acl]` tables are checked against the
-    same key sets as their flat counterparts.
+    and the nested `[security]`/`[mtls]` tables are checked against the same key
+    sets as their flat counterparts.
     """
     if not isinstance(entry, dict):
         raise SecurityConfigError(f"'{where}' must be a table")
@@ -955,15 +957,23 @@ def validate_listener_table(
 def validate_document_schema(config: dict, *, source: str | None = None) -> None:
     """Validate a whole document, multi-listener or legacy flat (doc §4.6).
 
-    A document that carries `transports` is the new schema: its top level may
+    A document that carries `listeners` is the new schema: its top level may
     only hold the global keys plus the two new tables (a flat
-    transport/security/mtls/acl key alongside `transports` is ambiguous and
-    refused), `transports` must be a non-empty array and `transport_defaults`,
+    transport/security/mtls/acl key alongside `listeners` is ambiguous and
+    refused), `listeners` must be a non-empty array and `listener_defaults`,
     when present, a table. Every entry is then checked by
-    `validate_listener_table`. A document without `transports` is the legacy
-    flat form and is validated by `validate_config_schema`, unchanged.
+    `validate_listener_table`, and listener `name`s must be unique. A document
+    without `listeners` is the legacy flat form and is validated by
+    `validate_config_schema`, unchanged. The old `transports`/
+    `transport_defaults` names are refused loudly.
     """
-    if "transports" not in config:
+    if "transports" in config or "transport_defaults" in config:
+        raise SecurityConfigError(
+            "the 'transports'/'transport_defaults' keys were renamed to "
+            "'listeners'/'listener_defaults' (one [[listeners]] entry is one "
+            "listener); update the configuration"
+        )
+    if "listeners" not in config:
         validate_config_schema(config, source=source)
         return
 
@@ -972,103 +982,114 @@ def validate_document_schema(config: dict, *, source: str | None = None) -> None
         raise SecurityConfigError(
             _unknown_keys_sentence("at the top level", unknown, CONFIG_DOCUMENT_KEYS)
         )
-    if not isinstance(config["transports"], list) or not config["transports"]:
-        raise SecurityConfigError("'transports' must be a non-empty array of tables")
-    defaults = config.get("transport_defaults")
-    if "transport_defaults" in config and not isinstance(defaults, dict):
-        raise SecurityConfigError("'[transport_defaults]' must be a table")
-    for index, entry in enumerate(config["transports"]):
-        validate_listener_table(entry, where=f"transports[{index}]")
+    if not isinstance(config["listeners"], list) or not config["listeners"]:
+        raise SecurityConfigError("'listeners' must be a non-empty array of tables")
+    defaults = config.get("listener_defaults")
+    if "listener_defaults" in config and not isinstance(defaults, dict):
+        raise SecurityConfigError("'[listener_defaults]' must be a table")
+    seen_names: set[str] = set()
+    for index, entry in enumerate(config["listeners"]):
+        validate_listener_table(entry, where=f"listeners[{index}]")
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if name is not None:
+            if not isinstance(name, str) or not name:
+                raise SecurityConfigError(
+                    f"listeners[{index}].name must be a non-empty string"
+                )
+            if name in seen_names:
+                raise SecurityConfigError(f"duplicate listener name: {name!r}")
+            seen_names.add(name)
     if isinstance(defaults, dict):
+        if "name" in defaults:
+            raise SecurityConfigError(
+                "'name' is per listener; set it on each [[listeners]] entry, "
+                "not in [listener_defaults]"
+            )
         validate_listener_table(
-            defaults, where="transport_defaults", require_type=False
+            defaults, where="listener_defaults", require_type=False
         )
 
 
 # --- security model: validation, keyrings, auth blocks (doc §7) -----------
 
 
+def _as_pattern_list(value: object, *, field: str) -> tuple:
+    """Normalize a rule selector to a tuple of glob patterns.
+
+    A bare string is accepted as a one-element tuple, so `match.machine = "dev"`
+    and `match.machine = ["dev", "prod"]` are both valid; `None`/absent is an
+    empty (match-any) selector.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if isinstance(value, (list, tuple)) and all(isinstance(p, str) for p in value):
+        return tuple(value)
+    raise SecurityConfigError(
+        f"rule match.{field} must be a string or a list of strings, got {value!r}"
+    )
+
+
+def _matches_any(patterns, value: str) -> bool:
+    """True when `value` matches any pattern (an empty selector matches)."""
+    if not patterns:
+        return True
+    return any(fnmatchcase(value, pattern) for pattern in patterns)
+
+
+def _matches_any_of(patterns, values) -> bool:
+    """True when any of `values` matches any pattern (empty selector matches)."""
+    if not patterns:
+        return True
+    return any(
+        fnmatchcase(value, pattern) for pattern in patterns for value in values
+    )
+
+
 @dataclass(frozen=True)
 class Rule:
-    """One `[[acl.rule]]` approval rule (the `[acl]` rule engine).
+    """One `[[rule]]` approval rule (the document-level rule engine, doc §8).
 
-    A rule refines the *approval* decision after the ACL has authorized the
-    credential. Its selectors are glob patterns (`fnmatch`); `"*"` or an empty
-    selector matches anything. `identity` is matched against every identity
-    candidate the server has for the connection (the resolved friendly name, the
-    ACL label, the verified fingerprint, or the `none` sentinel), and
+    Every selector is a tuple of glob (`fnmatch`) patterns; an empty tuple
+    matches anything. `machine` is matched against every identity candidate the
+    server has for the connection (the resolved friendly name, the label, the
+    verified fingerprint, or the `none` sentinel),
     `target_user`/`invoking_user`/`service` against the (self-reported) request
-    metadata. Rules never *grant* anything the ACL denied: the ACL runs first
-    and is the authorization gate. Evaluated in file order, first match wins.
+    metadata, and `listeners` against the **name** the accepting listener was
+    given in its `[[listeners]]` entry (a listener is a socket; its `type` is
+    its transport). An unnamed listener has no name, so only an empty/`*`-only
+    `listeners` selector applies to it.
+
+    **Rules are evaluated in file order and the first match wins -- there is no
+    merging between rules.** A permissive rule written above a restrictive one
+    therefore wins; rule *order* is a security decision, not a formatting one.
     """
 
-    identity: str = "*"
-    target_user: str = "*"
-    invoking_user: str = "*"
-    service: str = "*"
+    machine: tuple = ()
+    listeners: tuple = ()
+    service: tuple = ()
+    target_user: tuple = ()
+    invoking_user: tuple = ()
     policy: str = "ask"
 
     def matches(
         self,
         *,
-        identities: "frozenset[str] | tuple[str, ...]",
+        identities,
         target_user: str,
         invoking_user: str,
         service: str,
+        listener: str = "",
     ) -> bool:
         """True when every selector matches the supplied connection context."""
-        if not _any_pattern_matches(self.identity, identities):
-            return False
         return (
-            _pattern_matches(self.target_user, target_user)
-            and _pattern_matches(self.invoking_user, invoking_user)
-            and _pattern_matches(self.service, service)
+            _matches_any_of(self.machine, identities)
+            and _matches_any(self.target_user, target_user)
+            and _matches_any(self.invoking_user, invoking_user)
+            and _matches_any(self.service, service)
+            and _matches_any(self.listeners, listener)
         )
-
-
-def _pattern_matches(pattern: str, value: str) -> bool:
-    """Glob-match one selector; `"*"` or an empty pattern matches anything."""
-    if not pattern or pattern == "*":
-        return True
-    return bool(fnmatchcase(value, pattern))
-
-
-def _any_pattern_matches(pattern: str, values) -> bool:
-    """Glob-match a selector against any of `values` (empty matches anything)."""
-    if not pattern or pattern == "*":
-        return True
-    return any(_pattern_matches(pattern, value) for value in values)
-
-
-@dataclass
-class AclConfig:
-    """The validated `[acl]` authorization policy for one server (doc §8).
-
-    This is the *authorization* layer, distinct from the cryptographic
-    `[security]` authentication: it decides whether an already-verified
-    credential may use the mechanism at all. It matches **only** cryptographic
-    material (mTLS leaf SPKI fingerprints and CA chains); metadata such as
-    `PAM_USER`, `PAM_TTY`, `rhost` or `guest_hint` is never consulted for
-    authorization (review log S11). The `rules` list is a separate *approval*
-    refinement evaluated after authorization (see `Rule`).
-
-    - `mode = "list"`: a credential is eligible only when its mTLS leaf SPKI
-      fingerprint is in `trusted_fingerprints`. An empty set denies everyone;
-      there is no wildcard.
-    - `mode = "ca"`: any mTLS credential that chains to `ca_file` and carries
-      `required_oid` is eligible; `trusted_fingerprints` optionally additionally
-      pins the leaf SPKI.
-
-    `labels` maps a fingerprint to a display/log label only. It is never an
-    authorization input and is never accepted from the requester.
-    """
-
-    mode: str = "list"
-    trusted_fingerprints: frozenset = field(default_factory=frozenset)
-    ca_file: str | None = None
-    required_oid: str | None = None
-    labels: dict = field(default_factory=dict)
-    rules: tuple = field(default_factory=tuple)
 
 
 @dataclass
@@ -1079,6 +1100,10 @@ class SecurityConfig:
     explicit knobs (doc §7). Nothing else needs loading: authentication is the
     mTLS channel (or the explicit absence of it), so there is no signing key,
     keyring or certificate material to read here any more.
+
+    On the **client** role, `trusted_fingerprints`/`trusted_names` come from the
+    client `[acl]`: the crypto pin on which *server* the client will trust to
+    answer (see `load_client_acl`). They are empty when no pin is configured.
     """
 
     transport: str
@@ -1087,8 +1112,12 @@ class SecurityConfig:
     server_auth: str
     response_ttl: int = DEFAULT_RESPONSE_TTL
     clock_skew: int = DEFAULT_CLOCK_SKEW
-    # server role
-    acl: AclConfig | None = None
+    # server role: the document-level `[[rule]]` policy and `[labels]` display map
+    rules: tuple = ()
+    labels: dict = field(default_factory=dict)
+    # client role: which server certificate(s) the client trusts
+    trusted_fingerprints: frozenset = field(default_factory=frozenset)
+    trusted_names: tuple = ()
 
 
 def validate_security_config(config: dict) -> dict:
@@ -1105,8 +1134,7 @@ def validate_security_config(config: dict) -> dict:
     - `client_auth = "transport"` / `server_auth = "transport"` require mTLS.
     - With `transport_encryption = "none"` there is no mechanism to fall back
       on, so a missing knob is an **error**, not a silent `"none"`: turning
-      authentication off must be written down explicitly on both knobs. The
-      pairing with `acl.mode = "none"` is enforced by `build_security`.
+      authentication off must be written down explicitly on both knobs.
     - `tcp` + `"none"` is permitted but warned as insecure.
 
     Nothing here ever *downgrades*: the resolved values are final for the
@@ -1268,150 +1296,122 @@ def _fingerprint_set(entries: object, kind: str) -> frozenset:
 
 
 def _parse_rules(entries: object) -> tuple:
-    """Validate the `[[acl.rule]]` list into `Rule` objects (first match wins).
+    """Validate the top-level `[[rule]]` list into `Rule` objects.
 
-    Each entry is a table; only `identity`/`target_user`/`invoking_user`/
-    `service`/`policy` are read, and an unknown key is a startup error (the same
-    fail-closed policy as the rest of the schema). `policy` is exactly one of
-    `allow`/`ask`/`deny`. Order is preserved: the first matching rule wins, and
-    no rule matching means `ask` (`evaluate_rules`).
+    Each entry is a table with an optional `[rule.match]` sub-table and an
+    optional `policy`. A `match` key must be one of the five selectors
+    (`machine`/`listeners`/`service`/`target_user`/`invoking_user`); each is a
+    glob string or a list of glob strings. An unknown key, or an unknown
+    `policy`, is a startup error (the same fail-closed policy as the rest of the
+    schema). Order is preserved: the first matching rule wins, and no rule
+    matching means `ask` (`evaluate_rules`).
     """
     if entries is None:
         return ()
     if not isinstance(entries, list):
-        raise SecurityConfigError("[acl] rule must be an array of tables")
+        raise SecurityConfigError("'rule' must be an array of tables")
     rules = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
-            raise SecurityConfigError(f"acl.rule[{index}] must be a table")
+            raise SecurityConfigError(f"rule[{index}] must be a table")
         unknown = sorted(set(entry) - CONFIG_RULE_KEYS)
         if unknown:
             raise SecurityConfigError(
-                f"acl.rule[{index}] has unknown key(s): "
+                f"rule[{index}] has unknown key(s): "
                 + ", ".join(repr(key) for key in unknown)
             )
         policy = entry.get("policy", "ask")
         if policy not in RULE_POLICIES:
             raise SecurityConfigError(
-                f"acl.rule[{index}] policy must be one of "
+                f"rule[{index}] policy must be one of "
                 f"{', '.join(RULE_POLICIES)}, got {policy!r}"
             )
-        selectors = {}
-        for key in ("identity", "target_user", "invoking_user", "service"):
-            value = entry.get(key, "*")
-            if not isinstance(value, str):
-                raise SecurityConfigError(
-                    f"acl.rule[{index}] {key} must be a string pattern"
-                )
-            selectors[key] = value or "*"
-        rules.append(Rule(policy=policy, **selectors))
+        match = entry.get("match", {})
+        if not isinstance(match, dict):
+            raise SecurityConfigError(f"rule[{index}].match must be a table")
+        unknown = sorted(set(match) - CONFIG_RULE_MATCH_KEYS)
+        if unknown:
+            raise SecurityConfigError(
+                f"rule[{index}].match has unknown key(s): "
+                + ", ".join(repr(key) for key in unknown)
+            )
+        rules.append(
+            Rule(
+                policy=policy,
+                machine=_as_pattern_list(match.get("machine"), field="machine"),
+                listeners=_as_pattern_list(
+                    match.get("listeners"), field="listeners"
+                ),
+                service=_as_pattern_list(match.get("service"), field="service"),
+                target_user=_as_pattern_list(
+                    match.get("target_user"), field="target_user"
+                ),
+                invoking_user=_as_pattern_list(
+                    match.get("invoking_user"), field="invoking_user"
+                ),
+            )
+        )
     return tuple(rules)
 
 
-def load_acl_config(config: dict) -> AclConfig:
-    """Validate the server `[acl]` table into an `AclConfig` (doc §8).
+def load_client_acl(config: dict) -> tuple:
+    """Validate the client `[acl]` into `(trusted_fingerprints, trusted_names)`.
 
-    Fail-closed defaults: no `[acl]` table at all is a valid deny-all `"list"`
-    policy, so a server never starts open by accident. `mode` is exactly one of
-    `"list"`/`"ca"`/`"none"`; mixing the modes (a `"ca"` mode with
-    `trusted_fingerprints`+`ca_file` omitted, a `"list"` mode with
-    `ca_file`/`required_oid`, or a `"none"` mode with any trust material) is
-    rejected rather than guessed. `"none"` is only reachable because
-    `client_auth = "none"` needs an explicit ACL that deliberately authorizes
-    unauthenticated requests (`build_security` enforces the pairing). In `"ca"`
-    mode the CA must be readable at load time. The optional `[[acl.rule]]` list
-    is the *approval* refinement (`_parse_rules`); it is accepted under every
-    mode, including `"none"`, because it never authorizes a credential.
+    The client `[acl]` pins which **server** the client will trust to answer: a
+    server leaf SPKI fingerprint (`trusted_fingerprints`) and/or an fnmatch
+    pattern on the server certificate's CN/SAN (`trusted_names`). It is the
+    client-side authorization ("who may approve"), and it is crypto material
+    only -- request metadata is never consulted, and it is never read from the
+    wire. An empty/absent `[acl]` means "no extra pin": the client still
+    verifies the server chain against `[mtls].ca_file` and its EKU, but accepts
+    any CA-signed server. A present `[acl]` must pin at least one identity.
     """
     raw = config.get("acl")
     if raw is None:
-        raw = {}
+        return frozenset(), ()
     if not isinstance(raw, dict):
         raise SecurityConfigError("'[acl]' must be a table")
-
-    mode = raw.get("mode", "list")
-    if not isinstance(mode, str) or mode not in ACL_MODES:
+    unknown = sorted(set(raw) - CONFIG_ACL_KEYS)
+    if unknown:
         raise SecurityConfigError(
-            f"unknown acl.mode {mode!r} (expected one of {', '.join(ACL_MODES)})"
+            "[acl] has unknown key(s): " + ", ".join(repr(key) for key in unknown)
         )
-
     trusted_fingerprints = _fingerprint_set(
         raw.get("trusted_fingerprints"), "trusted_fingerprints"
     )
-    ca_file = raw.get("ca_file")
-    required_oid = raw.get("required_oid")
-    rules = _parse_rules(raw.get("rule"))
-
-    if mode == "none":
-        # There is no credential to authorize, so any trust material is a
-        # contradiction (and almost certainly a copy-paste mistake): reject it
-        # rather than silently ignore a pin the operator believes is enforced.
-        forbidden = [
-            name
-            for name, present in (
-                ("trusted_fingerprints", bool(trusted_fingerprints)),
-                ("ca_file", bool(ca_file)),
-                ("required_oid", bool(required_oid)),
-            )
-            if present
-        ]
-        if forbidden:
-            raise SecurityConfigError(
-                "acl.mode = 'none' must not set "
-                + ", ".join(forbidden)
-                + " (there is no credential to authorize)"
-            )
-        return AclConfig(mode="none", rules=rules)
-
-    raw_labels = raw.get("labels") or {}
-    if not isinstance(raw_labels, dict) or any(
-        not isinstance(value, str) for value in raw_labels.values()
-    ):
-        raise SecurityConfigError("acl.labels must be a table of string labels")
-    labels = {
-        _normalize_fingerprint(key, "labels"): value
-        for key, value in raw_labels.items()
-    }
-
-    if mode == "ca":
-        if not isinstance(ca_file, str) or not ca_file:
-            raise SecurityConfigError("acl.mode = 'ca' requires acl.ca_file")
-        if not isinstance(required_oid, str) or not required_oid:
-            raise SecurityConfigError("acl.mode = 'ca' requires acl.required_oid")
-        # Fail fast if the CA cannot be read; authorization reloads it per use.
-        _load_trusted_ca_certs(ca_file)
+    names = raw.get("trusted_names")
+    if names is None:
+        trusted_names: tuple = ()
+    elif isinstance(names, str):
+        trusted_names = (names,) if names else ()
+    elif isinstance(names, list) and all(isinstance(n, str) for n in names):
+        trusted_names = tuple(names)
     else:
-        if ca_file or required_oid:
-            raise SecurityConfigError(
-                "acl.mode = 'list' must not set ca_file/required_oid "
-                "(use acl.mode = 'ca')"
-            )
-
-    return AclConfig(
-        mode=mode,
-        trusted_fingerprints=trusted_fingerprints,
-        ca_file=ca_file,
-        required_oid=required_oid,
-        labels=labels,
-        rules=rules,
-    )
+        raise SecurityConfigError(
+            "[acl] trusted_names must be a string or a list of strings"
+        )
+    if not trusted_fingerprints and not trusted_names:
+        raise SecurityConfigError(
+            "[acl] must set trusted_fingerprints and/or trusted_names "
+            "(an empty pin would trust any CA-signed server)"
+        )
+    return trusted_fingerprints, trusted_names
 
 
-def acl_allows_any(acl: AclConfig | None) -> bool:
-    """True when an ACL could authorize at least one credential.
+def load_labels(config: dict) -> dict:
+    """Validate the top-level `[labels]` fingerprint -> display-label map.
 
-    Used only to warn at startup that a deny-all policy is in effect; it never
-    grants anything and is deliberately conservative.
+    Labels are display/log only; they are never an authorization input and are
+    never accepted from a peer.
     """
-    if acl is None:
-        return False
-    if acl.mode == "none":
-        # An unauthenticated ACL authorizes every request: there is no
-        # credential to match, so it never reaches the deny-all default.
-        return True
-    if acl.mode == "ca":
-        return bool(acl.ca_file and acl.required_oid)
-    return bool(acl.trusted_fingerprints)
+    raw = config.get("labels") or {}
+    if not isinstance(raw, dict) or any(
+        not isinstance(value, str) for value in raw.values()
+    ):
+        raise SecurityConfigError("[labels] must be a table of string labels")
+    return {
+        _normalize_fingerprint(key, "labels"): value for key, value in raw.items()
+    }
 
 
 def identity_candidates(
@@ -1420,13 +1420,14 @@ def identity_candidates(
     label: str = "",
     peer: str = "",
 ) -> tuple:
-    """The strings an `[[acl.rule]]` `identity` selector may match.
+    """The strings a `[[rule]]` `match.machine` selector may match.
 
     The server has several names for the same connection: the resolved friendly
-    name (`peer`, from `resolution`), the operator's ACL `label`, the verified
-    credential (`requester`, an mTLS SPKI fingerprint or the `none` sentinel).
-    A rule may target any of them, so all non-empty candidates are returned. The
-    order is display-name first so an exact name matches before a fingerprint.
+    name (`peer`, from `resolution`), the operator's `[labels]` entry, the
+    verified credential (`requester`, an mTLS SPKI fingerprint or the `none`
+    sentinel). A rule may target any of them, so all non-empty candidates are
+    returned. The order is display-name first so an exact name matches before a
+    fingerprint.
     """
     seen: list = []
     for value in (label, peer, requester):
@@ -1442,13 +1443,19 @@ def evaluate_rules(
     target_user: str,
     invoking_user: str,
     service: str,
+    listener: str = "",
 ) -> str:
-    """Return the policy of the first matching `[[acl.rule]]`, else `"ask"`.
+    """Return the policy of the first matching `[[rule]]`, else `"ask"`.
 
-    Rules are the *approval* layer: they run only after `authorize_request` has
-    accepted the credential, so they can never grant access the ACL denied. The
-    default with no rules (or no match) is `"ask"` -- the historical behaviour of
-    always prompting.
+    Rules are the single policy layer: they decide allow/ask/deny for an
+    already-authenticated request (the mTLS transport proves the credential; a
+    `client_auth = "none"` listener has none, so `machine` matches only an
+    empty/`*`-only selector). The default with no rules (or no match) is `"ask"`
+    -- always prompt the human. `listener` is the accepting listener's name
+    (empty for an unnamed listener), matched by a rule's `listeners` selector.
+
+    **Order is significant: the first matching rule wins and no merging is
+    performed between rules.**
     """
     for rule in rules or ():
         if rule.matches(
@@ -1456,84 +1463,10 @@ def evaluate_rules(
             target_user=target_user,
             invoking_user=invoking_user,
             service=service,
+            listener=listener,
         ):
             return rule.policy
     return "ask"
-
-
-def authorize_request(
-    request: dict,
-    security: "SecurityConfig",
-    verified_identity: str,
-    *,
-    peer_cert_der: bytes | None = None,
-) -> str:
-    """Apply the `[acl]` to an already-authenticated request (doc §8).
-
-    Called **after** `authenticate_request` and **before** the dialog. It reads
-    only the verified credential: the mTLS leaf SPKI, or the CA chain the
-    transport already proved. Metadata fields (`target_user`, `invoking_user`,
-    `rhost`, `tty`, `guest_hint`, ...) are never inspected, so no self-reported
-    value can influence the decision (review log S11). Returns the display label
-    when one is configured, else the verified fingerprint; raises `AuthError`
-    (fail closed) otherwise.
-
-    `acl.mode = "none"` is the one mode that inspects no credential at all: it
-    authorizes every request because `client_auth = "none"` leaves nothing to
-    verify. It is accepted only when the configured `client_auth` is also
-    `"none"`, so an unauthenticated ACL can never be paired with a credential
-    the rest of the server would authenticate.
-    """
-    acl = security.acl
-    if acl is None:
-        raise AuthError("no [acl] authorization policy is configured")
-
-    if security.client_auth == "none":
-        # Unauthenticated mode: there is no credential to inspect. The pairing
-        # with `acl.mode = "none"` is enforced by `build_security`; a caller
-        # that assembles the config by hand still fails closed here.
-        if acl.mode != "none":
-            raise AuthError(
-                "client_auth = 'none' requires acl.mode = 'none' "
-                "(an unauthenticated request has no credential to authorize)"
-            )
-        return acl.labels.get(verified_identity, verified_identity)
-    if acl.mode == "none":
-        # The mirror image: an unauthenticated ACL may never be attached to a
-        # credential the rest of the server would authenticate.
-        raise AuthError(
-            "acl.mode = 'none' requires client_auth = 'none' "
-            "(an unauthenticated ACL cannot authorize a credential)"
-        )
-
-    if acl.mode == "list":
-        # The mTLS leaf SPKI is the only credential left; an empty set denies
-        # everyone.
-        if verified_identity not in acl.trusted_fingerprints:
-            raise AuthError(
-                f"credential {verified_identity} is not in the authorization list"
-            )
-    else:  # acl.mode == "ca"
-        ca_file = acl.ca_file
-        required_oid = acl.required_oid
-        if not ca_file or not required_oid:
-            # Unreachable through `load_acl_config`, which requires both; a
-            # caller that assembles the policy by hand fails closed here
-            # instead of raising somewhere deeper.
-            raise AuthError("acl.mode = 'ca' requires acl.ca_file and acl.required_oid")
-        if not peer_cert_der:
-            raise AuthError(
-                "mTLS peer certificate is required to authorize a transport credential"
-            )
-        ca_certs = _load_trusted_ca_certs(ca_file)
-        leaf = verify_x509_chain([_load_der_cert(peer_cert_der)], ca_certs, required_oid)
-        if acl.trusted_fingerprints:
-            # Optional additional pin on top of the CA chain.
-            spki = spki_fingerprint(leaf.public_key())
-            if spki not in acl.trusted_fingerprints:
-                raise AuthError("certificate SPKI is not in the authorization list")
-
-    return acl.labels.get(verified_identity, verified_identity)
 
 
 def build_security(config: dict, role: str) -> SecurityConfig:
@@ -1541,11 +1474,11 @@ def build_security(config: dict, role: str) -> SecurityConfig:
 
     Loaded lazily per process and cached on the config dict. mTLS is the only
     authentication mechanism (doc §7), so there is no key material to load here
-    any more: the TLS layer reads `[mtls]` itself, and the one thing that still
-    needs validating is the server's `[acl]` authorization policy and its XOR
-    pairing with `client_auth = "none"`. A configuration error is fatal, never a
-    "run unauthenticated" path: the caller turns `SecurityConfigError` into a
-    non-zero exit.
+    any more: the TLS layer reads `[mtls]` itself. On the **client** role the
+    optional `[acl]` pins the trusted server identity (`load_client_acl`); on
+    the **server** role the top-level `[[rule]]` list is the policy layer. A
+    configuration error is fatal, never a "run unauthenticated" path: the caller
+    turns `SecurityConfigError` into a non-zero exit.
     """
     cached = config.get("_security")
     if isinstance(cached, SecurityConfig):
@@ -1569,25 +1502,18 @@ def build_security(config: dict, role: str) -> SecurityConfig:
     )
 
     if role == "server":
-        # Authorization policy (doc §8). Loaded for every server and defaulting
-        # to deny-all `"list"`; the mTLS handshake proves the credential, the
-        # ACL decides who may use the mechanism.
-        security.acl = load_acl_config(config)
-        # Disabling requester authentication must be an explicit, conscious
-        # choice on *both* knobs: `client_auth = "none"` is meaningless (and
-        # dangerous) without an ACL that deliberately authorizes it, and an
-        # unauthenticated ACL must never be attached to an authenticated
-        # credential. Require exactly one of the two, i.e. their XOR.
-        if security.client_auth == "none" and security.acl.mode != "none":
-            raise SecurityConfigError(
-                "client_auth = 'none' requires acl.mode = 'none' "
-                "(unauthenticated requests need an explicit unauthenticated ACL)"
-            )
-        if security.acl.mode == "none" and security.client_auth != "none":
-            raise SecurityConfigError(
-                "acl.mode = 'none' requires client_auth = 'none' "
-                "(an unauthenticated ACL cannot authorize a credential)"
-            )
+        # Document-level policy: the ordered `[[rule]]` list (first match wins)
+        # and the `[labels]` fingerprint -> display-label map. The mTLS
+        # transport authenticates the requester; the rules decide allow/ask/deny.
+        security.rules = _parse_rules(config.get("rule"))
+        security.labels = load_labels(config)
+    elif role == "client":
+        # Client-side authorization: which server may answer (fake-server
+        # defence). Optional; an absent [acl] keeps the CA + EKU check only.
+        (
+            security.trusted_fingerprints,
+            security.trusted_names,
+        ) = load_client_acl(config)
 
     config["_security"] = security
     return security
@@ -1618,21 +1544,19 @@ def authenticate_request(
     """Verify the requester credential on `request`; return the verified identity.
 
     This is *authentication only*: proving the requester holds the certificate
-    the mTLS handshake accepted. Whether that identity may use the mechanism is
-    decided separately by `authorize_request` against the `[acl]` (doc §8); an
-    accepted handshake on an unlisted certificate is therefore necessary but
-    never sufficient.
+    the mTLS handshake accepted. The returned identity feeds the `[[rule]]`
+    `match.machine` selector; the rules (not a separate ACL) decide allow/ask/
+    deny (doc §8).
 
     Fails closed (`AuthError`) on a missing block, a method that does not match
     the configured `client_auth`, or `client_auth = "transport"` without mTLS.
     There is no branch that returns success without verifying (doc §7.3).
 
     For `transport` the mTLS handshake already verified the chain; the leaf SPKI
-    fingerprint is returned so `mode = "list"` can pin it (review log NF6). For
-    `none` there is no credential to check: the method can only match when
-    `security.client_auth == "none"` (enforced just below), and the fixed
-    `NONE_IDENTITY` sentinel is returned. The ACL still runs and must be the
-    matching `"none"` mode.
+    fingerprint is returned so a `match.machine` rule can pin it (review log
+    NF6). For `none` there is no credential to check: the method can only match
+    when `security.client_auth == "none"` (enforced just below), and the fixed
+    `NONE_IDENTITY` sentinel is returned.
     """
     block = request.get("client_auth")
     if not isinstance(block, dict):
@@ -1644,8 +1568,7 @@ def authenticate_request(
         )
     if method == "none":
         # Only reachable when the configured method is "none"; there is nothing
-        # to verify. The pairing with `acl.mode = "none"` is enforced by
-        # `build_security` (and again by `authorize_request`).
+        # to verify.
         return NONE_IDENTITY
     if security.transport_encryption != "mtls":
         raise AuthError("client_auth = 'transport' requires transport_encryption = 'mtls'")
@@ -2100,6 +2023,57 @@ def _verify_peer_oid(sock, config: dict, label: str) -> None:
     der = sock.getpeercert(binary_form=True)
     if der:
         verify_cert_der(der, peer_oid, label)
+
+
+def _server_cert_names(sock) -> tuple:
+    """The CN and DNS SANs of the peer (server) certificate, for pinning."""
+    cert = sock.getpeercert()
+    if not cert:
+        return ()
+    names: list = []
+    subject = dict(pair for rdn in cert.get("subject", []) for pair in rdn)
+    cn = subject.get("commonName")
+    if cn:
+        names.append(cn)
+    for san_type, san_value in cert.get("subjectAltName", []):
+        if san_type == "DNS":
+            names.append(san_value)
+    return tuple(names)
+
+
+def verify_server_acl(sock, config: dict) -> None:
+    """Enforce the client `[acl]` server pin on a TLS-wrapped socket.
+
+    This is the client-side crypto authorization ("who may approve"). The server
+    must present a certificate whose leaf SPKI is in `trusted_fingerprints`, or
+    whose CN/SAN matches a `trusted_names` pattern. The CA chain and EKU are
+    already checked by the handshake (`create_ssl_context`/`_verify_peer_oid`);
+    this adds the *identity* pin that refuses a fake or wrong-service server even
+    when it holds a CA-signed certificate. An absent `[acl]` is a no-op (the CA
+    + EKU check stands alone). Runs after the handshake, on the wrapped socket.
+    """
+    security = build_security(config, "client")
+    if not security.trusted_fingerprints and not security.trusted_names:
+        return
+    der = sock.getpeercert(binary_form=True)
+    if not der:
+        raise AuthError(
+            "server_auth = 'transport' did not yield a peer certificate to pin"
+        )
+    spki = spki_fingerprint(_load_der_cert(der).public_key())
+    if spki in security.trusted_fingerprints:
+        return
+    names = _server_cert_names(sock)
+    if security.trusted_names and any(
+        fnmatchcase(name, pattern)
+        for name in names
+        for pattern in security.trusted_names
+    ):
+        return
+    raise AuthError(
+        f"server certificate {spki} is not in the client [acl] "
+        "(neither its fingerprint nor its CN/SAN is pinned)"
+    )
 
 
 # --- Phase 7: dialog context and sanitisation (doc §11) --------------------
@@ -3071,6 +3045,9 @@ class Transport:
                 # half-open/hung peer fails fast instead of hanging.
                 sock = ssl_ctx.wrap_socket(sock, server_hostname=self.tls_server_name())
                 _verify_peer_oid(sock, self.config, "Server")
+                # Client-side server pin (`[acl]`): refuse a fake or
+                # wrong-service server even if it holds a CA-signed certificate.
+                verify_server_acl(sock, self.config)
         except BaseException:
             sock.close()
             raise
@@ -3575,41 +3552,23 @@ class Handler(StreamRequestHandler):
             except ProtocolError as e:
                 print(f"sudo-auth-proxy server: malformed request from {peer}: {e}", file=sys.stderr)
                 break
-            # Authentication first (prove the credential), then authorization
-            # (the `[acl]` decides whether that *verified* credential may
-            # proceed). The ACL runs before any dialog and matches only the
-            # credential, never the request metadata (doc §8; review log S11).
+            # Authentication first (prove the credential), then the
+            # document-level `[[rule]]` policy. There is no separate crypto ACL:
+            # the mTLS transport authenticates the requester, and the ordered
+            # rule list decides allow/ask/deny. Rules are matched against the
+            # verified identity plus the (self-reported) request metadata.
             try:
                 requester = authenticate_request(request, security, peer_cert_der=peer_cert_der)
             except AuthError as e:
                 print(f"sudo-auth-proxy server: rejected request from {peer}: {e}", file=sys.stderr)
                 break
-            try:
-                label = authorize_request(
-                    request, security, requester, peer_cert_der=peer_cert_der
-                )
-            except AuthError as e:
-                # Fail closed but not silently: an authenticated requester the
-                # ACL rejects gets an explicit deny (signed when configured).
-                print(f"sudo-auth-proxy server: denied request from {peer}: {e}", file=sys.stderr)
-                response = build_response(
-                    request["nonce"],
-                    "deny",
-                    request=request,
-                    security=security,
-                    approver=config.get("approver") or os.environ.get("USER", ""),
-                )
-                with contextlib.suppress(ProtocolError, OSError):
-                    write_message(self.wfile, response)
-                break
-            # Approval refinement (`[[acl.rule]]`). The ACL above authorized the
-            # credential; these rules only decide whether to auto-allow,
-            # auto-deny or prompt, matching the resolved identity plus the
-            # (self-reported) request metadata. An auto-decision answers
-            # immediately, exactly like an ACL denial, so the client's
-            # first-frame bound still applies and no dialog is raised.
+            label = security.labels.get(requester, "")
+            # `[[rule]]`, evaluated in file order -- the FIRST match wins and
+            # there is no merging between rules (security-critical: a permissive
+            # rule above a restrictive one takes precedence). No match means
+            # `ask`: raise the confirmation dialog.
             policy = evaluate_rules(
-                security.acl.rules if security.acl else (),
+                security.rules,
                 identities=identity_candidates(
                     requester=requester, label=label, peer=peer
                 ),
@@ -3620,6 +3579,7 @@ class Handler(StreamRequestHandler):
                 ),
                 invoking_user=request.get("invoking_user", ""),
                 service=request.get("service", ""),
+                listener=config.get("name") or "",
             )
             if policy in ("allow", "deny"):
                 print(
@@ -3637,8 +3597,8 @@ class Handler(StreamRequestHandler):
                 with contextlib.suppress(ProtocolError, OSError):
                     write_message(self.wfile, response)
                 break
-            # The request is authenticated AND authorized, and no rule decided
-            # it: acknowledge it immediately, *before* blocking on the human, so
+            # The request is authenticated and no rule auto-decided it:
+            # acknowledge it immediately, *before* blocking on the human, so
             # the client's short first-frame bound stays short and the human wait
             # is bounded by `decision_timeout` (doc §6.2a; audit A2). The frame
             # carries no decision and is not signed; it is validated only by
@@ -3778,16 +3738,18 @@ def _close_listener(server: BaseServer, transport: Transport) -> None:
 def run_server(config: dict) -> None:
     """Bind every configured listener, then serve them in one process (doc §4.2).
 
-    `listener_views` expands a `transports` document into one flat view per
+    `listener_views` expands a `listeners` document into one flat view per
     listener; a flat legacy document is a single implicit view. Every listener
     is bound **before** any serves, so a bind failure closes the listeners
     already bound and re-raises before a single request is handled
     (fail-whole-server). Each view gets its own `SecurityConfig` and transport,
-    so two listeners may resolve different `transport_encryption`/`mtls`/`acl`;
-    `Handler.handle` reads both back from `self.server`.
+    so two listeners may resolve different `transport_encryption`/`mtls`; the
+    document-level `[[rule]]` policy is shared by every listener (a rule scopes
+    itself to a listener with `match.listeners`). `Handler.handle` reads both
+    back from `self.server`.
     """
     set_debug(config)
-    if isinstance(config.get("transports"), list):
+    if isinstance(config.get("listeners"), list):
         validate_document_schema(config)
     views = listener_views(config)
     bound: list[tuple[BaseServer, Transport, SecurityConfig]] = []
@@ -3795,12 +3757,6 @@ def run_server(config: dict) -> None:
         for view in views:
             validate_config_schema(view)
             security = build_security(view, "server")
-            if not acl_allows_any(security.acl):
-                print(
-                    "sudo-auth-proxy server: WARNING: the [acl] allows nobody "
-                    "(empty trust list); every request will be denied",
-                    file=sys.stderr,
-                )
             transport = make_transport(view)
             server = transport.listen(Handler)
             # `listen` builds a dynamic `SudoAuthProxyServer` class, so `setattr`
@@ -4120,7 +4076,7 @@ def main() -> None:
     _debug(f"config loaded: mode={config.get('mode')!r}")
     # The whole file is validated against the exact schema first, so a typo or a
     # key on the wrong side of a TOML table header is named here rather than
-    # surfacing as a missing-knob error further down (doc §7.9). `transports`
+    # surfacing as a missing-knob error further down (doc §7.9). `listeners`
     # documents are validated by the multi-listener schema, a flat document by
     # the legacy one. This runs before the `mode` check so `Mode = "server"`
     # reports the misspelled key instead of "missing required 'mode'".

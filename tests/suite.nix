@@ -1249,7 +1249,7 @@
 
   # ---- T6: host-side multi-listener derivation --------------------------
   # The host wiring collapses the requesting guests' transport markers into a
-  # `server.transports` list (one listener per distinct kind), replacing the
+  # `server.listeners` list (one listener per distinct kind), replacing the
   # removed single-transport `lib.warn`/`throw`. Each fixture below forces one
   # interesting mix; the checks read the generated list off the host's HM user
   # config (the login username in this suite is `user`).
@@ -1348,18 +1348,18 @@
   # second identical host evaluation.
   hostStandInTcpOnly = hostNestedService;
 
-  # Read a host HM service's generated server `transports` list, or `[]` when
+  # Read a host HM service's generated server `listeners` list, or `[]` when
   # forcing it throws (guards against a regression of the removed
   # mixed-transport `throw`). `deepSeq` forces every entry's `type`.
-  hostServerTransports = host: svc: let
-    value = host.config.home-manager.users.user.tartarus.${svc}.server.transports;
+  hostServerListeners = host: svc: let
+    value = host.config.home-manager.users.user.tartarus.${svc}.server.listeners;
     r = builtins.tryEval (builtins.deepSeq value value);
   in
     if r.success
     then r.value
     else [];
 
-  hostServerKinds = host: svc: map (t: t.type) (hostServerTransports host svc);
+  hostServerKinds = host: svc: map (t: t.type) (hostServerListeners host svc);
   hasKind = kinds: kind: lib.elem kind kinds;
 
   # Nullable / "host" sentinel ceilings must type-check.
@@ -1550,6 +1550,28 @@
   nestedProxyClientDarwinGuests = mkGuestsFromHostOn "aarch64-darwin" hostNestedProxyClientDarwin;
   proxyHostOf = guests: namespace:
     guests.nixosConfigurations.${namespace}.config.environment.variables.TARTARUS_PROXY_HOST;
+
+  # The guest-side ssh-agent-proxy wiring: a local allow-all proxy server that
+  # merges the guest-local agent with the host-forwarded bridge. Forcing the
+  # generated server TOML and its `SSH_AUTH_SOCK` env file exercises the whole
+  # guest configuration.
+  sshAgentGuestVmHome =
+    (mkGuestsFromHost hostSshMixedTransports)
+    .nixosConfigurations."vm-vsockVm".config.home-manager.users.user;
+  sshAgentGuestServerOk = let
+    r = builtins.tryEval (
+      builtins.seq
+      sshAgentGuestVmHome.home.file."/home/user/.config/ssh-agent-proxy/server.toml".source.drvPath
+      true
+    );
+  in
+    r.success && r.value;
+  sshAgentGuestAuthSockOk = let
+    r = builtins.tryEval (
+      sshAgentGuestVmHome.home.file.".config/environment.d/60-tartarus-ssh-agent-server.conf".text
+    );
+  in
+    r.success && r.value != "";
 
   # Host-side native container provisioning: the host declares the container as
   # a NixOS `containers.<name>` (what writes the /etc/nixos-containers/<name>.conf
@@ -2800,14 +2822,14 @@ in {
 
     # ---- T6: host-side multi-listener derivation -----------------------
     # The enabled guests' transport markers must collapse into a
-    # `server.transports` list (one listener per distinct kind) instead of the
+    # `server.listeners` list (one listener per distinct kind) instead of the
     # removed single-transport warn/throw.
     "hostSudoMixedTransports" =
       T
       (let
-        transports = hostServerTransports hostSudoMixedTransports "sudo-auth-proxy";
-        kinds = map (t: t.type) transports;
-        tcp = lib.findFirst (t: t.type == "tcp") null transports;
+        listeners = hostServerListeners hostSudoMixedTransports "sudo-auth-proxy";
+        kinds = map (t: t.type) listeners;
+        tcp = lib.findFirst (t: t.type == "tcp") null listeners;
       in
         hasKind kinds "vsock"
         && hasKind kinds "tcp"
@@ -2817,9 +2839,9 @@ in {
     "hostSshMixedTransports" =
       T
       (let
-        transports = hostServerTransports hostSshMixedTransports "ssh-agent-proxy";
-        kinds = map (t: t.type) transports;
-        tcp = lib.findFirst (t: t.type == "tcp") null transports;
+        listeners = hostServerListeners hostSshMixedTransports "ssh-agent-proxy";
+        kinds = map (t: t.type) listeners;
+        tcp = lib.findFirst (t: t.type == "tcp") null listeners;
       in
         hasKind kinds "vsock"
         && hasKind kinds "tcp"
@@ -3061,7 +3083,7 @@ in {
           enable = true;
           server = {
             enable = true;
-            transports = [
+            listeners = [
               {
                 type = "unix";
                 socket = "/tmp/ssh-agent-proxy.sock";
@@ -3083,15 +3105,15 @@ in {
         };
       }))
       "ssh-agent-proxy unix transport does not evaluate standalone";
-    # A `transports` list with two entries must evaluate standalone.
-    "standalone/nixos-ssh-agent-proxy-transports" =
+    # A `listeners` list with two entries must evaluate standalone.
+    "standalone/nixos-ssh-agent-proxy-listeners" =
       T
       (nixosDrvOk (mkStandaloneNixos self.nixosModules."ssh-agent-proxy" {
         tartarus.ssh-agent-proxy = {
           enable = true;
           server = {
             enable = true;
-            transports = [
+            listeners = [
               {
                 type = "unix";
                 socket = "/tmp/ssh-agent-proxy.sock";
@@ -3118,7 +3140,7 @@ in {
           };
         };
       }))
-      "ssh-agent-proxy transports list does not evaluate standalone";
+      "ssh-agent-proxy listeners list does not evaluate standalone";
     # mtls.enable is an alias for transport_encryption = "mtls": an explicit
     # `none` alongside it must be refused by the per-listener assertion.
     "standalone/nixos-ssh-agent-proxy-mtls-conflict" =
@@ -3128,7 +3150,7 @@ in {
           enable = true;
           server = {
             enable = true;
-            transports = [
+            listeners = [
               {
                 type = "vsock";
                 mtls.enable = true;
@@ -3148,7 +3170,7 @@ in {
           enable = true;
           server = {
             enable = true;
-            transports = [
+            listeners = [
               {
                 type = "unix";
                 resolution = "tartarus";
@@ -3175,20 +3197,100 @@ in {
       T
       (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {tartarus.ssh-agent-proxy.enable = true;}))
       "ssh-agent-proxy home-manager module does not evaluate standalone";
+    # `settings.agent_sockets` (the merged agent socket list: all entries are
+    # forwarded, the first is the `key` default) must type-check and evaluate.
+    "standalone/hm-ssh-agent-proxy-agent-sockets" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
+        tartarus.ssh-agent-proxy = {
+          enable = true;
+          server = {
+            enable = true;
+            settings.agent_sockets = ["/tmp/agent-a" "/tmp/agent-b"];
+            listeners = [
+              {
+                type = "vsock";
+                resolution = "tartarus";
+              }
+            ];
+          };
+        };
+      }))
+      "ssh-agent-proxy agent_sockets does not evaluate standalone";
+    # `server.setSshAuthSock` requires a `unix` listener and emits an
+    # `environment.d` file pointing SSH_AUTH_SOCK at it; the per-listener
+    # `scanAgentSocketDirs`/`resolveSessionSocket` flags are `unix`-only.
+    "standalone/hm-ssh-agent-proxy-set-ssh-auth-sock" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
+        tartarus.ssh-agent-proxy = {
+          enable = true;
+          server = {
+            enable = true;
+            setSshAuthSock = true;
+            settings.agent_sockets = ["/tmp/agent-a"];
+            listeners = [
+              {
+                type = "unix";
+                socket = "/tmp/ssh-agent-merged";
+                resolution = "none";
+                security = {
+                  transportEncryption = "none";
+                  clientAuth = "none";
+                  serverAuth = "none";
+                };
+                scanAgentSocketDirs = true;
+                resolveSessionSocket = true;
+              }
+            ];
+          };
+        };
+      }))
+      "ssh-agent-proxy setSshAuthSock / unix scan flags do not evaluate standalone";
+    # Rejecting the unix-only scan flags on a callback listener.
+    "standalone/hm-ssh-agent-proxy-scan-flags-vsock" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
+        tartarus.ssh-agent-proxy = {
+          enable = true;
+          server = {
+            enable = true;
+            settings.agent_sockets = ["/tmp/agent-a"];
+            listeners = [{type = "vsock"; scanAgentSocketDirs = true;}];
+          };
+        };
+      })))
+      "ssh-agent-proxy accepted scanAgentSocketDirs on a vsock listener";
+    # The removed `merge` role must no longer be an option.
+    "standalone/hm-ssh-agent-proxy-merge-removed" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
+        tartarus.ssh-agent-proxy = {
+          enable = true;
+          merge.enable = true;
+        };
+      })))
+      "the removed ssh-agent-proxy `merge` option still evaluates";
+    # The guest-side local proxy server (merges the local agent with the
+    # host-forwarded bridge) must evaluate end to end.
+    "guest/ssh-agent-proxy-local-server" =
+      T sshAgentGuestServerOk "guest ssh-agent-proxy server config does not evaluate";
+    "guest/ssh-agent-proxy-ssh-auth-sock" =
+      T sshAgentGuestAuthSockOk "guest ssh-agent-proxy server does not set SSH_AUTH_SOCK";
     "standalone/hm-sudo-auth-proxy" =
       T
       (hmDrvOk (mkStandaloneHm self.homeManagerModules."sudo-auth-proxy" {tartarus.sudo-auth-proxy.enable = true;}))
       "sudo-auth-proxy home-manager module does not evaluate standalone";
-    # A multi-listener `server.transports` list must evaluate. The `unix`
+    # A multi-listener `server.listeners` list must evaluate. The `unix`
     # listener disables crypto/auth explicitly (the eval-time assertion requires
     # `client_auth = server_auth = "none"` whenever `transport_encryption` is
     # `none`); the `tcp` listener resolves to mTLS via `auto`.
-    "standalone/hm-sudo-auth-proxy-transports" =
+    "standalone/hm-sudo-auth-proxy-listeners" =
       T
       (hmDrvOk (mkStandaloneHm self.homeManagerModules."sudo-auth-proxy" {
         tartarus.sudo-auth-proxy.server = {
           enable = true;
-          transports = [
+          listeners = [
             {
               type = "unix";
               socket = "/tmp/sudo-auth-proxy.sock";
@@ -3206,13 +3308,13 @@ in {
           ];
         };
       }))
-      "sudo-auth-proxy home-manager module rejected a multi-listener transports list";
-    "standalone/hm-ssh-agent-proxy-transports" =
+      "sudo-auth-proxy home-manager module rejected a multi-listener listeners list";
+    "standalone/hm-ssh-agent-proxy-listeners" =
       T
       (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
         tartarus.ssh-agent-proxy.server = {
           enable = true;
-          transports = [
+          listeners = [
             {
               type = "unix";
               socket = "/tmp/ssh-agent-proxy.sock";
@@ -3238,7 +3340,7 @@ in {
           ];
         };
       }))
-      "ssh-agent-proxy home-manager module rejected a multi-listener transports list";
+      "ssh-agent-proxy home-manager module rejected a multi-listener listeners list";
 
     # An enabled server with no listeners must fail evaluation (doc §2.4). The
     # server lives in the home-manager modules, so the HM driver is the one that
@@ -3248,16 +3350,16 @@ in {
       (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."sudo-auth-proxy" {
           tartarus.sudo-auth-proxy.server = {
             enable = true;
-            transports = [];
+            listeners = [];
           };
         }))
         && ! (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
           tartarus.ssh-agent-proxy.server = {
             enable = true;
-            transports = [];
+            listeners = [];
           };
         })))
-      "an enabled server with an empty transports list evaluated";
+      "an enabled server with an empty listeners list evaluated";
 
     # Importing a service module must not pull in the host option surface.
     "standalone/no-host-module" =

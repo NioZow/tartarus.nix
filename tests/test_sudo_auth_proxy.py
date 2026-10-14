@@ -7,8 +7,7 @@ knobs are now `transport_encryption` plus `client_auth`/`server_auth`, each of
 which is `"transport"` or `"none"`. Tests that need an authenticated credential
 drive the mTLS path (a real CA-issued leaf certificate passed as the peer DER,
 or the pinned leaf SPKI); tests that only need to exercise framing, routing and
-timing use the explicit unauthenticated pairing (`"none"` on all three knobs
-with the matching `acl.mode = "none"`).
+timing use the explicit unauthenticated pairing (`"none"` on all three knobs).
 
 Behaviours covered:
 
@@ -43,9 +42,10 @@ Behaviours covered:
    ``authorize_unix_peer`` fails closed on a foreign uid (Linux) and degrades
    with a documented weaker guarantee on Darwin, and ``src/tartarus/ca.py``
    emits client private keys ``0600`` rather than the historic ``0644``;
-7. authorization (Phase 4, doc §8) -- `acl.mode` resolution and validation,
-   `mode = "list"` SPKI pinning, `mode = "ca"` chain + EKU enforcement, the
-   `"none"` XOR with `client_auth`, and the ACL running *before* any dialog;
+7. authorization (Phase 4, doc §8) -- the document-level `[[rule]]` engine
+   (ordered, first-match-wins, no merging; `match.machine`/`listeners`/`service`/
+   `target_user`/`invoking_user`) and the client `[acl]` server pin (a fake or
+   wrong-service server is refused even if CA-signed);
 8. Phase 6 fast-fail/timeout semantics (doc §10.1-§10.5, §6.7; review logs
    NF4, Rank 5/R7, F5) -- ``resolve_read_timeouts`` maps ``decision_timeout =
    0`` to an unbounded tail, a silent Unix peer is bounded by ``recv_timeout``
@@ -188,9 +188,10 @@ def _decode(sap: types.ModuleType, raw: bytes) -> dict:
 # Authentication is mTLS-only: the three knobs are `transport_encryption` plus
 # the two auths, and the only two values an auth knob can take are "transport"
 # and "none". Most tests here exercise the *unauthenticated* pairing (a private
-# transport, `client_auth = "none"` + `acl.mode = "none"`), because it needs no
-# certificates and keeps the focus on framing, routing and timeouts; the mTLS
-# path is covered by the dedicated helpers and tests below.
+# transport, `client_auth = "none"` + `server_auth = "none"`), because it needs
+# no certificates and keeps the focus on framing, routing and timeouts; the mTLS
+# path is covered by the dedicated helpers and tests below. There is no
+# server-side ACL: the document-level `[[rule]]` list is the policy layer.
 
 
 def _server_security(*_unused: Any, **overrides: Any) -> dict:
@@ -249,22 +250,23 @@ def _mtls_client_config(**overrides: Any) -> dict:
 
 
 def _spki(sap: types.ModuleType, cert: Any) -> str:
-    """The ``SHA256:...`` leaf SPKI fingerprint a ``mode = "list"`` ACL pins."""
+    """The ``SHA256:...`` leaf SPKI fingerprint a client ``acl`` can pin."""
     return sap.spki_fingerprint(cert.public_key())
 
 
-def _acl_list(*fingerprints: str) -> dict:
-    """A ``mode = "list"`` ACL; no arguments is an intentional deny-all list."""
-    return {"mode": "list", "trusted_fingerprints": list(fingerprints)}
+def _client_acl(fingerprints: Any = (), names: Any = ()) -> dict:
+    """A client-side ``[acl]`` server pin (fingerprints and/or names)."""
+    acl: dict[str, Any] = {}
+    if fingerprints:
+        acl["trusted_fingerprints"] = list(fingerprints)
+    if names:
+        acl["trusted_names"] = list(names)
+    return acl
 
 
-def _acl_for(sap: types.ModuleType, keys: Any = None) -> dict:
-    """The default allow-any ACL used by the unauthenticated exchange helpers.
-
-    `client_auth = "none"` has no credential to authorize, so the matching ACL
-    is `mode = "none"`; the Python enforces that pairing as a fail-closed XOR.
-    """
-    return {"mode": "none"}
+def _acl_for(sap: types.ModuleType, keys: Any = None) -> None:
+    """The server has no ACL any more: authorization is the `[[rule]]` list."""
+    return None
 
 
 def test_request_round_trips_as_one_compact_line(sap: types.ModuleType) -> None:
@@ -455,7 +457,7 @@ def _exchange(
     decisions: Sequence[bool],
     request_bytes: bytes,
     keys: Any = None,
-    acl: Any = None,
+    rule: Any = None,
     *,
     security: Any = None,
     peer_cert_der: bytes | None = None,
@@ -464,16 +466,13 @@ def _exchange(
 
     No socket is bound and no connection is made: the handler reads the request
     bytes from an in-memory ``BytesIO`` and writes its framed response(s) into a
-    recording writer, exactly as it would over a socket. The server config
-    carries a real SSH trust root and host signing key, so authentication and
-    response signing are exercised end to end. ``acl`` defaults to a list that
-    authorizes the test requester; pass an explicit ``{"mode": "list"}`` (empty)
-    to exercise the fail-closed default.
+    recording writer, exactly as it would over a socket. ``rule`` is the
+    document-level `[[rule]]` list (default: none, so every request prompts).
 
     Returns ``(frames, prompts)`` where ``frames`` is the list of complete NDJSON
-    frames the handler wrote, in order. An authenticated+authorized request
-    yields ``[auth_pending, auth_response]`` (audit A2); an ACL denial or an
-    authentication failure yields ``[auth_response]`` or ``[]`` respectively.
+    frames the handler wrote, in order. An authenticated request no rule decided
+    yields ``[auth_pending, auth_response]`` (audit A2); a rule auto-decision
+    yields ``[auth_response]`` and an authentication failure yields ``[]``.
     """
 
     config = {
@@ -481,7 +480,7 @@ def _exchange(
         "dialog_program": "zenity",
         "transport": "tcp",
         "security": security if security is not None else _server_security(keys),
-        "acl": _acl_for(sap, keys) if acl is None else acl,
+        "rule": rule if rule is not None else [],
     }
     fake_server = types.SimpleNamespace(
         _config=config,
@@ -1980,7 +1979,6 @@ def _flat_unauthenticated_config() -> dict:
         "server_auth": "none",
         "response_ttl": 30,
         "clock_skew": 5,
-        "acl": {"mode": "none"},
     }
 
 
@@ -2038,7 +2036,7 @@ def test_schema_accepts_the_same_config_with_a_security_table(
 
     assert resolved.transport_encryption == "none"
     assert resolved.client_auth == "none"
-    assert resolved.acl.mode == "none"
+    assert resolved.rules == ()
 
 
 def test_schema_rejects_an_unknown_key_and_suggests_the_real_one(
@@ -2092,24 +2090,20 @@ def test_schema_rejects_a_non_table_sub_table(sap: types.ModuleType) -> None:
         sap.validate_config_schema({"mode": "server", "security": "none"})
 
 
-def test_schema_allows_the_acl_labels_map(sap: types.ModuleType) -> None:
-    """`acl.labels` is the one free-form table: fingerprints -> display labels."""
+def test_schema_allows_the_labels_map(sap: types.ModuleType) -> None:
+    """`[labels]` is the one free-form table: fingerprints -> display labels."""
     fingerprint = "SHA256:" + base64.b64encode(b"x" * 32).decode()
     config = {
         "mode": "server",
         "transport": "tcp",
         "security": _mtls_server_security(),
-        "acl": {
-            "mode": "list",
-            "trusted_fingerprints": [fingerprint],
-            "labels": {fingerprint: "vault"},
-        },
+        "labels": {fingerprint: "vault"},
     }
 
     sap.validate_config_schema(config)
     # labels are keyed by the *normalised* fingerprint (base64 padding stripped),
     # which is what `spki_fingerprint` produces when it verifies a credential.
-    assert sap.build_security(config, "server").acl.labels == {
+    assert sap.build_security(config, "server").labels == {
         fingerprint.rstrip("="): "vault"
     }
 
@@ -2135,7 +2129,8 @@ def test_schema_accepts_a_full_server_and_client_config(
         "resolution": "tartarus",
         "debug": False,
         "security": _server_security(),
-        "acl": _acl_for(sap),
+        "rule": [{"match": {"machine": ["*"]}, "policy": "ask"}],
+        "labels": {},
         "mtls": {
             "enable": True,
             "ca_file": "/etc/tartarus/x509/ca.crt",
@@ -2161,6 +2156,7 @@ def test_schema_accepts_a_full_server_and_client_config(
         "guest_hint": "vault",
         "debug": False,
         "security": _client_security(),
+        "acl": _client_acl(names=["host-*"]),
     }
 
     sap.validate_config_schema(server)
@@ -2181,12 +2177,11 @@ def test_shipped_example_config_matches_the_schema(sap: types.ModuleType) -> Non
     security = sap.build_security(config, "server")
 
     # The example is the unauthenticated standalone pairing: it may only run if
-    # it says so on all three knobs and pairs `client_auth = "none"` with
-    # `acl.mode = "none"`.
+    # it says so on all three knobs.
     assert security.transport_encryption == "none"
     assert security.client_auth == "none"
     assert security.server_auth == "none"
-    assert security.acl.mode == "none"
+    assert security.rules == ()
 
 
 # --- config validation (fail closed, no downgrade) ------------------------
@@ -2646,32 +2641,26 @@ def x509_material(crypto: types.ModuleType, tmp_path: Path):
         leaf_cert=leaf_cert,
         leaf_key=leaf_key,
     )
-# --- Phase 4: authorization / trust roots (ACL) ----------------------------
+# --- Phase 4: authorization (client server-pin; the rules live below) -------
 #
-# The `[acl]` decides who may use the mechanism. It is evaluated AFTER the
-# cryptographic verification of `client_auth` and BEFORE any dialog, and it
-# matches ONLY the verified credential: the mTLS leaf SPKI fingerprint, or a
-# CA chain + EKU. Metadata (`target_user`, `rhost`, `tty`, `guest_hint`, ...)
-# never influences the decision (doc §8; review logs S11/NF6).
+# The server has no ACL any more. The mTLS transport authenticates the
+# requester and the document-level `[[rule]]` list decides allow/ask/deny
+# (tested in the rules section further down). The only `[acl]` left is the
+# **client's**: it pins which *server* the client trusts to answer, so a fake
+# or wrong-service server is refused even if it holds a CA-signed certificate.
 
 # a syntactically valid fingerprint of a 32-byte SHA-256 digest that no test
 # key produces, so it can never match a real credential.
 _UNLISTED_FINGERPRINT = "SHA256:" + base64.b64encode(b"\x00" * 32).decode().rstrip("=")
 
 
-def _server_with_acl(sap: types.ModuleType, _material: Any, acl: dict) -> Any:
-    """Build a server `SecurityConfig` whose credential is the mTLS peer cert."""
-    config = {"transport": "unix", "security": _mtls_server_security(), "acl": acl}
-    return sap.build_security(config, "server")
-
-
-def _transport_server(sap: types.ModuleType, acl: dict) -> Any:
-    """A server whose requester credential is the mTLS transport certificate."""
-    return _server_with_acl(sap, None, acl)
-
-
-def _ca_path(material: Any) -> str:
-    return str(material.tmp_path / "ca.crt")
+def _client_cfg_with_acl(acl: dict) -> dict:
+    """A client config with an explicit server-pin `[acl]`."""
+    return {
+        "transport": "unix",
+        "security": _mtls_server_security(),
+        "acl": acl,
+    }
 
 
 def _leaf_der(material: Any) -> bytes:
@@ -2680,425 +2669,120 @@ def _leaf_der(material: Any) -> bytes:
     return material.leaf_cert.public_bytes(Encoding.DER)
 
 
-def _mtls_request(sap: types.ModuleType, **overrides: Any) -> dict:
-    """An mTLS request: the channel certificate is the credential."""
-    request = _request_obj(sap, **overrides)
-    request["client_auth"] = {"method": "transport"}
-    return request
+def _fake_tls_sock(der: Any, cert: dict | None = None) -> Any:
+    """A stand-in for a wrapped TLS socket exposing only `getpeercert`."""
+
+    class _Sock:
+        def getpeercert(self, binary_form: bool = False) -> Any:
+            return der if binary_form else (cert or {})
+
+    return _Sock()
 
 
-# -- ACL config validation ---------------------------------------------------
+def _cert_dict(cn: str | None = None, dns: Any = ()) -> dict:
+    cert: dict = {"subjectAltName": tuple(("DNS", d) for d in dns)}
+    if cn is not None:
+        cert["subject"] = ((("commonName", cn),),)
+    return cert
 
 
-def test_acl_absent_is_deny_all_list(sap: types.ModuleType) -> None:
-    acl = sap.load_acl_config({})
-
-    assert acl.mode == "list"
-    assert acl.trusted_fingerprints == frozenset()
-    assert acl.ca_file is None
-    assert acl.required_oid is None
-    assert sap.acl_allows_any(acl) is False
+# -- client [acl] parsing -----------------------------------------------------
 
 
-@pytest.mark.parametrize("mode", ["open", "", None, ["list"], 1])
-def test_acl_unknown_mode_rejected(sap: types.ModuleType, mode: Any) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="acl.mode"):
-        sap.load_acl_config({"acl": {"mode": mode}})
+def test_client_acl_absent_has_no_pin(sap: types.ModuleType) -> None:
+    fingerprints, names = sap.load_client_acl({})
+    assert fingerprints == frozenset()
+    assert names == ()
 
 
-def test_acl_ca_requires_ca_file(sap: types.ModuleType) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="requires acl.ca_file"):
-        sap.load_acl_config({"acl": {"mode": "ca", "required_oid": REQUIRED_OID}})
+def test_client_acl_requires_at_least_one_pin(sap: types.ModuleType) -> None:
+    with pytest.raises(
+        sap.SecurityConfigError, match="trusted_fingerprints and/or trusted_names"
+    ):
+        sap.load_client_acl({"acl": {}})
 
 
-def test_acl_ca_requires_required_oid(
-    sap: types.ModuleType, tmp_path: Path, crypto: types.ModuleType
-) -> None:
-    ca_cert, _ = _make_ca()
-    ca_path = tmp_path / "ca.crt"
-    _write_pem(ca_path, ca_cert)
-
-    with pytest.raises(sap.SecurityConfigError, match="requires acl.required_oid"):
-        sap.load_acl_config({"acl": {"mode": "ca", "ca_file": str(ca_path)}})
-
-
-def test_acl_rejects_the_removed_trusted_keys(sap: types.ModuleType) -> None:
-    """`[acl] trusted_keys` (SSH fingerprints) went with `client_auth = "ssh"`
-
-It is no longer *ignored*, which is what used to make a stale key a silent
-no-op: the schema refuses it, so the operator is told to migrate the entry to
-`trusted_fingerprints` instead of left believing it still authorizes someone.
-"""
+def test_client_acl_rejects_unknown_keys(sap: types.ModuleType) -> None:
     with pytest.raises(sap.SecurityConfigError, match="trusted_keys"):
-        sap.build_security(
-            {
-                "transport": "unix",
-                "security": _server_security(),
-                "acl": {"mode": "list", "trusted_keys": ["SHA256:x"]},
-            },
-            "server",
-        )
-
-    # What the schema-clean spelling of that list means: an empty one denies.
-    acl = sap.load_acl_config({"acl": {"mode": "list"}})
-    assert acl.trusted_fingerprints == frozenset()
-    with pytest.raises(sap.AuthError, match="not in the authorization list"):
-        sap.authorize_request(
-            _mtls_request(sap), _server_with_acl(sap, None, _acl_list()), "SHA256:x"
-        )
+        sap.load_client_acl({"acl": {"trusted_keys": ["SHA256:x"]}})
 
 
-def test_acl_list_rejects_ca_file(sap: types.ModuleType, tmp_path: Path) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="must not set ca_file"):
-        sap.load_acl_config(
-            {"acl": {"mode": "list", "ca_file": str(tmp_path / "ca.crt")}}
-        )
-
-
-@pytest.mark.parametrize(
-    "entry",
-    ["MD5:abcd", "SHA256:", "SHA256:notbase64!!", "SHA256:AAAA", 123],
-)
-def test_acl_rejects_malformed_fingerprint(sap: types.ModuleType, entry: Any) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="trusted_fingerprints"):
-        sap.load_acl_config(
-            {"acl": {"mode": "list", "trusted_fingerprints": [entry]}}
-        )
-
-
-def test_acl_normalizes_padded_fingerprint(sap: types.ModuleType) -> None:
-    body = base64.b64encode(b"\x01" * 32).decode().rstrip("=")
-
-    acl = sap.load_acl_config(
-        {"acl": {"mode": "list", "trusted_fingerprints": [f"SHA256:{body}="]}}
-    )
-
-    assert acl.trusted_fingerprints == frozenset({f"SHA256:{body}"})
-
-
-def test_acl_labels_must_be_string_map(sap: types.ModuleType) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="labels"):
-        sap.load_acl_config(
-            {"acl": {"mode": "list", "labels": {_UNLISTED_FINGERPRINT: 3}}}
-        )
-
-
-# -- mode = "list" -----------------------------------------------------------
-
-
-def test_acl_list_allows_listed_mtls_spki(
-    sap: types.ModuleType, x509_material: Any
-) -> None:
-    spki = _spki(sap, x509_material.leaf_cert)
-    server = _server_with_acl(sap, x509_material, _acl_list(spki))
-    request = _mtls_request(sap)
-    der = _leaf_der(x509_material)
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-
-    assert verified == spki
-    assert sap.authorize_request(request, server, verified, peer_cert_der=der) == spki
-
-
-def test_acl_list_denies_unlisted_but_valid_certificate(
-    sap: types.ModuleType, x509_material: Any
-) -> None:
-    # The certificate is genuine and chains to nothing in particular, but its
-    # SPKI is not listed: authentication succeeds and authorization refuses.
-    server = _server_with_acl(sap, x509_material, _acl_list(_UNLISTED_FINGERPRINT))
-    request = _mtls_request(sap)
-    der = _leaf_der(x509_material)
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-    with pytest.raises(sap.AuthError, match="not in the authorization list"):
-        sap.authorize_request(request, server, verified, peer_cert_der=der)
-
-
-def test_acl_list_empty_denies_everyone(sap: types.ModuleType, x509_material: Any) -> None:
-    server = _server_with_acl(sap, x509_material, _acl_list())
-    request = _mtls_request(sap)
-    der = _leaf_der(x509_material)
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-    with pytest.raises(sap.AuthError, match="not in the authorization list"):
-        sap.authorize_request(request, server, verified, peer_cert_der=der)
-
-
-def test_acl_label_is_display_only(sap: types.ModuleType, x509_material: Any) -> None:
-    spki = _spki(sap, x509_material.leaf_cert)
-    acl = {
-        "mode": "list",
-        "trusted_fingerprints": [spki],
-        "labels": {spki: "vault"},
-    }
-    server = _server_with_acl(sap, x509_material, acl)
-    request = _mtls_request(sap)
-    der = _leaf_der(x509_material)
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-
-    assert sap.authorize_request(request, server, verified, peer_cert_der=der) == "vault"
-
-
-def test_acl_decision_ignores_request_metadata(
-    sap: types.ModuleType, x509_material: Any
-) -> None:
-    spki = _spki(sap, x509_material.leaf_cert)
-    allow_server = _server_with_acl(sap, x509_material, _acl_list(spki))
-    deny_server = _server_with_acl(sap, x509_material, _acl_list())
-    metadata = {
-        "target_user": "daemon",
-        "invoking_user": "mallory",
-        "rhost": "10.9.9.9",
-        "tty": "/dev/pts/7",
-        "guest_hint": "evil",
-    }
-    request = _mtls_request(sap, **metadata)
-    der = _leaf_der(x509_material)
-
-    verified = sap.authenticate_request(request, allow_server, peer_cert_der=der)
-    assert sap.authorize_request(request, allow_server, verified, peer_cert_der=der) == spki
-
-    # the same metadata must not rescue an unlisted certificate either
-    denied = sap.authenticate_request(request, deny_server, peer_cert_der=der)
-    with pytest.raises(sap.AuthError, match="not in the authorization list"):
-        sap.authorize_request(request, deny_server, denied, peer_cert_der=der)
-
-
-# -- ACL is enforced before the dialog ---------------------------------------
-
-
-def test_handler_acl_denial_is_never_prompted(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, x509_material: Any
-) -> None:
-    """An authenticated-but-unauthorized mTLS request is denied without a dialog."""
-    der = _leaf_der(x509_material)
-    request = _mtls_request(sap)
-    frames, prompts = _exchange(
-        sap,
-        monkeypatch,
-        [],
-        _frame(sap, request),
-        acl=_acl_list(),
-        security=_mtls_server_security(),
-        peer_cert_der=der,
-    )
-
-    assert prompts == []
-    # A denial is answered without a dialog, so there is no `auth_pending`; the
-    # sole frame is the deny (audit A2).
-    assert len(frames) == 1
-    parsed = _decode(sap, frames[0])
-    assert parsed["type"] == "auth_response"
-    assert parsed["decision"] == "deny"
-    assert parsed["nonce"] == request["nonce"]
-    # the deny is a genuine, request-bound response
-    client = sap.build_security(_mtls_client_config(), "client")
-    assert sap.verify_response(parsed, request, client, set()) == "deny"
-
-
-def test_handler_acl_allows_listed_mtls_certificate_and_prompts(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, x509_material: Any
-) -> None:
-    """The full mTLS flow: a verified, authorized request reaches the dialog."""
-    der = _leaf_der(x509_material)
-    spki = _spki(sap, x509_material.leaf_cert)
-    request = _mtls_request(sap)
-    frames, prompts = _exchange(
-        sap,
-        monkeypatch,
-        [True],
-        _frame(sap, request),
-        acl=_acl_list(spki),
-        security=_mtls_server_security(),
-        peer_cert_der=der,
-    )
-
-    assert len(prompts) == 1
-    confirmation, _program = prompts[0]
-    # the dialog shows the *verified* SPKI (sanitised) as the requester
-    assert confirmation.identity == sap.sanitize_field(spki)
-    assert _decode(sap, frames[1])["decision"] == "allow"
-
-
-def test_handler_wrong_mtls_certificate_never_prompts(
-    sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, x509_material: Any
-) -> None:
-    """A genuine certificate whose SPKI is not pinned is denied, silently."""
-    der = _leaf_der(x509_material)
-    request = _mtls_request(sap)
-    frames, prompts = _exchange(
-        sap,
-        monkeypatch,
-        [],
-        _frame(sap, request),
-        acl=_acl_list(_UNLISTED_FINGERPRINT),
-        security=_mtls_server_security(),
-        peer_cert_der=der,
-    )
-
-    assert prompts == []
-    assert len(frames) == 1
-    assert _decode(sap, frames[0])["decision"] == "deny"
-
-
-# -- mode = "ca" -------------------------------------------------------------
-
-
-def test_acl_ca_allows_chained_cert(sap: types.ModuleType, x509_material: Any) -> None:
-    server = _server_with_acl(
-        sap,
-        x509_material,
-        {"mode": "ca", "ca_file": _ca_path(x509_material), "required_oid": REQUIRED_OID},
-    )
-    request = _mtls_request(sap)
-    der = _leaf_der(x509_material)
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-
-    assert sap.authorize_request(request, server, verified, peer_cert_der=der) == verified
-
-
-def test_acl_ca_denies_wrong_ca(sap: types.ModuleType, x509_material: Any) -> None:
-    other_ca, _ = _make_ca()
-    other_path = x509_material.tmp_path / "other-ca.crt"
-    _write_pem(other_path, other_ca)
-    server = _server_with_acl(
-        sap,
-        x509_material,
-        {"mode": "ca", "ca_file": str(other_path), "required_oid": REQUIRED_OID},
-    )
-    request = _mtls_request(sap)
-    der = _leaf_der(x509_material)
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-    with pytest.raises(sap.AuthError, match="no trusted issuer"):
-        sap.authorize_request(request, server, verified, peer_cert_der=der)
-
-
-def test_acl_ca_denies_missing_eku_at_acl_layer(
-    sap: types.ModuleType, x509_material: Any
-) -> None:
-    # The transport layer enforces the peer OID from `[mtls].peer_required_oid`;
-    # the ACL requires a *different* OID and refuses on its own.
-    server = _server_with_acl(
-        sap,
-        x509_material,
-        {"mode": "ca", "ca_file": _ca_path(x509_material), "required_oid": OTHER_OID},
-    )
-    request = _mtls_request(sap)
-    der = _leaf_der(x509_material)
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-    with pytest.raises(sap.AuthError, match="missing required EKU OID"):
-        sap.authorize_request(request, server, verified, peer_cert_der=der)
-
-
-def test_acl_ca_optional_spki_pin(sap: types.ModuleType, x509_material: Any) -> None:
-    spki = _spki(sap, x509_material.leaf_cert)
-    request = _mtls_request(sap)
-    der = _leaf_der(x509_material)
-
-    # a matching pin does not change the CA-mode allow
-    server_ok = _server_with_acl(
-        sap,
-        x509_material,
+def test_client_acl_parses_fingerprints_and_names(sap: types.ModuleType) -> None:
+    fingerprint = "SHA256:" + base64.b64encode(b"x" * 32).decode()
+    fingerprints, names = sap.load_client_acl(
         {
-            "mode": "ca",
-            "ca_file": _ca_path(x509_material),
-            "required_oid": REQUIRED_OID,
-            "trusted_fingerprints": [spki],
-        },
+            "acl": {
+                "trusted_fingerprints": [fingerprint],
+                "trusted_names": ["host-*"],
+            }
+        }
     )
-    verified = sap.authenticate_request(request, server_ok, peer_cert_der=der)
-    assert sap.authorize_request(request, server_ok, verified, peer_cert_der=der) == verified
+    assert fingerprints == frozenset({fingerprint.rstrip("=")})
+    assert names == ("host-*",)
 
-    # a mismatched pin narrows the CA trust to a deny
-    server_bad = _server_with_acl(
-        sap,
-        x509_material,
-        {
-            "mode": "ca",
-            "ca_file": _ca_path(x509_material),
-            "required_oid": REQUIRED_OID,
-            "trusted_fingerprints": [_UNLISTED_FINGERPRINT],
-        },
+
+def test_client_acl_rejects_malformed_fingerprint(sap: types.ModuleType) -> None:
+    with pytest.raises(sap.SecurityConfigError, match="SHA256"):
+        sap.load_client_acl({"acl": {"trusted_fingerprints": ["nope"]}})
+
+
+def test_client_acl_rejects_a_non_string_name(sap: types.ModuleType) -> None:
+    with pytest.raises(sap.SecurityConfigError, match="trusted_names"):
+        sap.load_client_acl({"acl": {"trusted_names": [3]}})
+
+
+def test_build_security_client_loads_the_pin(sap: types.ModuleType) -> None:
+    fingerprint = "SHA256:" + base64.b64encode(b"x" * 32).decode().rstrip("=")
+    security = sap.build_security(
+        _client_cfg_with_acl(_client_acl([fingerprint])), "client"
     )
-    mismatched = sap.authenticate_request(request, server_bad, peer_cert_der=der)
-    with pytest.raises(sap.AuthError, match="SPKI is not in the authorization list"):
-        sap.authorize_request(request, server_bad, mismatched, peer_cert_der=der)
+    assert security.trusted_fingerprints == frozenset({fingerprint})
 
 
-def test_acl_ca_denies_expired_cert(
-    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path
+# -- client [acl] enforcement (fake-server defence) ---------------------------
+
+
+def test_verify_server_acl_is_a_noop_without_a_pin(sap: types.ModuleType) -> None:
+    config = _client_cfg_with_acl({})
+    config.pop("acl")
+    sap.verify_server_acl(_fake_tls_sock(b"", None), config)
+
+
+def test_verify_server_acl_accepts_a_pinned_fingerprint(
+    sap: types.ModuleType, x509_material: Any
 ) -> None:
-    import datetime
+    spki = sap.spki_fingerprint(x509_material.leaf_cert.public_key())
+    config = _client_cfg_with_acl(_client_acl([spki]))
 
-    from cryptography.hazmat.primitives.serialization import Encoding
-
-    ca_cert, ca_key = _make_ca()
-    now = datetime.datetime.now(datetime.timezone.utc)
-    leaf, _leaf_key = _issue_leaf(
-        ca_cert,
-        ca_key,
-        oid=REQUIRED_OID,
-        not_before=now - datetime.timedelta(days=2),
-        not_after=now - datetime.timedelta(days=1),
-    )
-    _write_pem(tmp_path / "ca.crt", ca_cert)
-    der = leaf.public_bytes(Encoding.DER)
-    server = _server_with_acl(
-        sap,
-        None,
-        {"mode": "ca", "ca_file": str(tmp_path / "ca.crt"), "required_oid": REQUIRED_OID},
-    )
-    request = _mtls_request(sap)
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-    with pytest.raises(sap.AuthError, match="outside its validity window"):
-        sap.authorize_request(request, server, verified, peer_cert_der=der)
+    sap.verify_server_acl(_fake_tls_sock(_leaf_der(x509_material)), config)
 
 
-# -- mTLS transport credential pinning (NF6) ---------------------------------
-
-
-def test_acl_list_pins_mtls_spki(sap: types.ModuleType, crypto: types.ModuleType) -> None:
-    from cryptography.hazmat.primitives.serialization import Encoding
-
-    cert = _build_cert(REQUIRED_OID)
-    der = cert.public_bytes(Encoding.DER)
-    spki = sap.spki_fingerprint(cert.public_key())
-    request = _mtls_request(sap)
-    server = _transport_server(sap, {"mode": "list", "trusted_fingerprints": [spki]})
-
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
-    assert verified == spki
-    assert sap.authorize_request(request, server, verified, peer_cert_der=der) == spki
-
-    other_der = _build_cert(REQUIRED_OID).public_bytes(Encoding.DER)
-    mismatched = sap.authenticate_request(request, server, peer_cert_der=other_der)
-    with pytest.raises(sap.AuthError, match="not in the authorization list"):
-        sap.authorize_request(request, server, mismatched, peer_cert_der=other_der)
-
-
-def test_acl_ca_authorizes_mtls_cert(
-    sap: types.ModuleType, crypto: types.ModuleType, tmp_path: Path
+def test_verify_server_acl_accepts_a_pinned_name(
+    sap: types.ModuleType, x509_material: Any
 ) -> None:
-    from cryptography.hazmat.primitives.serialization import Encoding
+    config = _client_cfg_with_acl(_client_acl(names=["host-*"]))
+    sock = _fake_tls_sock(_leaf_der(x509_material), _cert_dict(dns=["host-a"]))
 
-    ca_cert, ca_key = _make_ca()
-    leaf, _ = _issue_leaf(ca_cert, ca_key, oid=REQUIRED_OID)
-    _write_pem(tmp_path / "ca.crt", ca_cert)
-    der = leaf.public_bytes(Encoding.DER)
-    request = _mtls_request(sap)
-    server = _transport_server(
-        sap,
-        {"mode": "ca", "ca_file": str(tmp_path / "ca.crt"), "required_oid": REQUIRED_OID},
-    )
+    sap.verify_server_acl(sock, config)
 
-    verified = sap.authenticate_request(request, server, peer_cert_der=der)
 
-    assert sap.authorize_request(request, server, verified, peer_cert_der=der) == verified
+def test_verify_server_acl_rejects_an_unpinned_server(
+    sap: types.ModuleType, x509_material: Any
+) -> None:
+    config = _client_cfg_with_acl(_client_acl([_UNLISTED_FINGERPRINT]))
+    sock = _fake_tls_sock(_leaf_der(x509_material), _cert_dict(dns=["host-a"]))
+
+    with pytest.raises(sap.AuthError, match="not in the client"):
+        sap.verify_server_acl(sock, config)
+
+
+def test_verify_server_acl_rejects_a_missing_peer_certificate(
+    sap: types.ModuleType,
+) -> None:
+    config = _client_cfg_with_acl(_client_acl([_UNLISTED_FINGERPRINT]))
+
+    with pytest.raises(sap.AuthError, match="did not yield a peer certificate"):
+        sap.verify_server_acl(_fake_tls_sock(None), config)
 
 
 # --- Phase 5: ca.py key-file permissions (doc §9.2; review log F12) --------
@@ -3591,7 +3275,6 @@ def test_stalled_tls_handshake_does_not_block_the_accept_loop(
             "cert_file": str(tmp_path / "server.crt"),
             "key_file": str(tmp_path / "server.key"),
         },
-        "acl": {"mode": "list", "trusted_fingerprints": []},
     }
 
     state = {"active": 0, "peak": 0, "calls": 0}
@@ -3950,7 +3633,7 @@ def _none_client_config() -> dict:
 
 
 def _none_server_config() -> dict:
-    """A server that accepts unauthenticated requests through `acl.mode = "none"`."""
+    """A server that accepts unauthenticated requests (`client_auth = "none"`)."""
     return {
         "transport": "unix",
         "security": {
@@ -3958,7 +3641,6 @@ def _none_server_config() -> dict:
             "client_auth": "none",
             "server_auth": "none",
         },
-        "acl": {"mode": "none"},
     }
 
 
@@ -4019,61 +3701,25 @@ def test_client_auth_none_end_to_end(sap: types.ModuleType) -> None:
     verified = sap.authenticate_request(request, server)
 
     assert verified == sap.NONE_IDENTITY == "none"
-    assert sap.authorize_request(request, server, verified) == "none"
-    # an unauthenticated ACL always "allows" (it is the explicit opt-in)
-    assert sap.acl_allows_any(server.acl) is True
+    # No server-side ACL any more: with no rules the request is only ever
+    # offered to the human (`ask`).
+    assert sap.evaluate_rules(
+        server.rules,
+        identities=sap.identity_candidates(requester=verified),
+        target_user="root",
+        invoking_user="",
+        service="sudo",
+    ) == "ask"
 
 
-def test_build_security_none_requires_none_acl(sap: types.ModuleType) -> None:
+def test_server_rejects_an_acl_table(sap: types.ModuleType) -> None:
+    """`[acl]` is the *client's* server pin; a server must not carry one."""
     config = _none_server_config()
-    config["acl"] = {"mode": "list", "trusted_fingerprints": [_UNLISTED_FINGERPRINT]}
+    config["mode"] = "server"
+    config["acl"] = {"mode": "none"}
 
-    with pytest.raises(sap.SecurityConfigError, match="requires acl.mode = 'none'"):
+    with pytest.raises(sap.SecurityConfigError, match="client's server pin"):
         sap.build_security(config, "server")
-
-
-def test_build_security_none_acl_requires_none_client_auth(
-    sap: types.ModuleType
-) -> None:
-    # The mirror image: an unauthenticated ACL may not be paired with a
-    # credential the server would otherwise authenticate.
-    config = {
-        "transport": "unix",
-        "security": _mtls_server_security(),
-        "acl": {"mode": "none"},
-    }
-
-    with pytest.raises(sap.SecurityConfigError, match="requires client_auth = 'none'"):
-        sap.build_security(config, "server")
-
-
-def test_load_acl_none_rejects_trust_material(sap: types.ModuleType) -> None:
-    with pytest.raises(sap.SecurityConfigError, match="must not set trusted_fingerprints"):
-        sap.load_acl_config(
-            {"acl": {"mode": "none", "trusted_fingerprints": [_UNLISTED_FINGERPRINT]}}
-        )
-
-
-def test_authorize_none_requires_none_acl(sap: types.ModuleType) -> None:
-    # A hand-built (or mutated) config that pairs "none" auth with a list ACL
-    # must still refuse rather than treat the sentinel as a listed fingerprint.
-    server = sap.build_security(_none_server_config(), "server")
-    server.acl = sap.AclConfig(mode="list")
-    request = _request_obj(sap)
-    sap.attach_client_auth(
-        request, sap.build_security(_none_client_config(), "client")
-    )
-
-    with pytest.raises(sap.AuthError, match="requires acl.mode = 'none'"):
-        sap.authorize_request(request, server, sap.NONE_IDENTITY)
-
-
-def test_authorize_none_acl_requires_none_client_auth(sap: types.ModuleType) -> None:
-    server = sap.build_security(_none_server_config(), "server")
-    server.client_auth = "transport"
-
-    with pytest.raises(sap.AuthError, match="requires client_auth = 'none'"):
-        sap.authorize_request(_request_obj(sap), server, sap.NONE_IDENTITY)
 
 
 # --- resolution: mode selection and the mofos resolver ----------------------
@@ -4187,126 +3833,184 @@ def test_get_peer_name_uses_mofos_for_the_peer(
     assert sap.get_peer_name(_Sock(), "mofos", transport) == "stream"
 
 
-# --- acl rule engine --------------------------------------------------------
+# --- rule engine (`[[rule]]`, document-level) -------------------------------
+#
+# The rules are the single policy layer: ordered, first-match-wins, no merging.
+# Order is security-critical (a permissive rule above a restrictive one wins).
 
 
-def test_parse_rules_reads_selectors_and_preserves_order(
+def test_parse_rules_reads_match_selectors_and_preserves_order(
     sap: types.ModuleType,
 ) -> None:
-    acl = sap.load_acl_config(
-        {
-            "acl": {
-                "mode": "none",
-                "rule": [
-                    {"identity": "gram", "target_user": "root", "policy": "allow"},
-                    {"identity": "*", "policy": "deny"},
-                ],
-            }
-        }
+    rules = sap._parse_rules(
+        [
+            {
+                "match": {"machine": "gram", "target_user": ["root", "wheel"]},
+                "policy": "allow",
+            },
+            {"policy": "deny"},
+        ]
     )
 
-    assert [rule.policy for rule in acl.rules] == ["allow", "deny"]
-    assert acl.rules[0].identity == "gram"
-    assert acl.rules[0].target_user == "root"
-    assert acl.rules[0].service == "*"
+    assert [rule.policy for rule in rules] == ["allow", "deny"]
+    assert rules[0].machine == ("gram",)
+    assert rules[0].target_user == ("root", "wheel")
+    assert rules[0].service == ()
+    assert rules[1].policy == "deny"
 
 
-def test_parse_rules_defaults_to_ask_and_star(sap: types.ModuleType) -> None:
-    acl = sap.load_acl_config({"acl": {"mode": "list", "rule": [{}]}})
+def test_parse_rules_defaults_to_ask_and_empty_match(sap: types.ModuleType) -> None:
+    rules = sap._parse_rules([{}])
 
-    assert acl.rules[0].policy == "ask"
-    assert acl.rules[0].identity == "*"
+    assert rules[0].policy == "ask"
+    assert rules[0].machine == ()
+    assert rules[0].listeners == ()
 
 
 @pytest.mark.parametrize(
-    "entry", [{"policy": "maybe"}, {"identity": 3}, "nope"]
+    "entry",
+    [
+        {"policy": "maybe"},
+        {"match": {"machine": 3}},
+        {"match": ["not-a-table"]},
+        "nope",
+    ],
 )
 def test_parse_rules_rejects_bad_entries(
     sap: types.ModuleType, entry: Any
 ) -> None:
     with pytest.raises(sap.SecurityConfigError):
-        sap.load_acl_config({"acl": {"mode": "list", "rule": [entry]}})
+        sap._parse_rules([entry])
 
 
 def test_parse_rules_rejects_an_unknown_key(sap: types.ModuleType) -> None:
     with pytest.raises(sap.SecurityConfigError, match="unknown key"):
-        sap.load_acl_config(
-            {"acl": {"mode": "list", "rule": [{"ident": "x"}]}}
-        )
+        sap._parse_rules([{"ident": "x"}])
+
+
+def test_parse_rules_rejects_an_unknown_match_key(sap: types.ModuleType) -> None:
+    with pytest.raises(sap.SecurityConfigError, match="unknown key"):
+        sap._parse_rules([{"match": {"machine_name": ["x"]}}])
 
 
 def test_evaluate_rules_first_match_wins(sap: types.ModuleType) -> None:
-    acl = sap.load_acl_config(
-        {
-            "acl": {
-                "mode": "list",
-                "rule": [
-                    {"identity": "gram", "policy": "deny"},
-                    {"identity": "gram", "policy": "allow"},
-                ],
-            }
-        }
+    rules = sap._parse_rules(
+        [
+            {"match": {"machine": ["gram"]}, "policy": "deny"},
+            {"match": {"machine": ["gram"]}, "policy": "allow"},
+        ]
     )
 
-    policy = sap.evaluate_rules(
-        acl.rules,
-        identities=("gram",),
-        target_user="root",
-        invoking_user="user",
-        service="sudo",
+    assert (
+        sap.evaluate_rules(
+            rules,
+            identities=("gram",),
+            target_user="root",
+            invoking_user="user",
+            service="sudo",
+        )
+        == "deny"
     )
-    assert policy == "deny"
 
 
 def test_evaluate_rules_matches_any_identity_candidate(
     sap: types.ModuleType,
 ) -> None:
-    acl = sap.load_acl_config(
-        {"acl": {"mode": "list", "rule": [{"identity": "template-*", "policy": "allow"}]}}
+    rules = sap._parse_rules(
+        [{"match": {"machine": ["template-*"]}, "policy": "allow"}]
     )
     identities = sap.identity_candidates(
         requester="SHA256:abc", label="", peer="template-nixos"
     )
 
-    assert sap.evaluate_rules(
-        acl.rules,
-        identities=identities,
-        target_user="root",
-        invoking_user="user",
-        service="sudo",
-    ) == "allow"
+    assert (
+        sap.evaluate_rules(
+            rules,
+            identities=identities,
+            target_user="root",
+            invoking_user="user",
+            service="sudo",
+        )
+        == "allow"
+    )
 
 
 def test_evaluate_rules_matches_target_and_service(sap: types.ModuleType) -> None:
-    acl = sap.load_acl_config(
-        {
-            "acl": {
-                "mode": "list",
-                "rule": [{"identity": "*", "service": "su", "policy": "deny"}],
-            }
-        }
-    )
+    rules = sap._parse_rules([{"match": {"service": ["su"]}, "policy": "deny"}])
 
-    assert sap.evaluate_rules(
-        acl.rules,
-        identities=("vault",),
-        target_user="root",
-        invoking_user="user",
-        service="su",
-    ) == "deny"
-    assert sap.evaluate_rules(
-        acl.rules,
-        identities=("vault",),
-        target_user="root",
-        invoking_user="user",
-        service="sudo",
-    ) == "ask"
+    assert (
+        sap.evaluate_rules(
+            rules,
+            identities=("vault",),
+            target_user="root",
+            invoking_user="user",
+            service="su",
+        )
+        == "deny"
+    )
+    assert (
+        sap.evaluate_rules(
+            rules,
+            identities=("vault",),
+            target_user="root",
+            invoking_user="user",
+            service="sudo",
+        )
+        == "ask"
+    )
 
 
 def test_evaluate_rules_defaults_to_ask(sap: types.ModuleType) -> None:
-    assert sap.evaluate_rules(
-        (), identities=(), target_user="root", invoking_user="user", service="sudo"
-    ) == "ask"
+    assert (
+        sap.evaluate_rules(
+            (), identities=(), target_user="root", invoking_user="user", service="sudo"
+        )
+        == "ask"
+    )
+
+
+def test_parse_rules_reads_listener_selector(sap: types.ModuleType) -> None:
+    rules = sap._parse_rules(
+        [
+            {"match": {"listeners": ["remote-guest"]}, "policy": "allow"},
+            {"policy": "deny"},
+        ]
+    )
+
+    assert rules[0].listeners == ("remote-guest",)
+    assert rules[1].listeners == ()
+
+
+def test_evaluate_rules_matches_listener(sap: types.ModuleType) -> None:
+    rules = sap._parse_rules(
+        [
+            {"match": {"listeners": ["remote-guest"]}, "policy": "allow"},
+            {"policy": "deny"},
+        ]
+    )
+    kwargs = dict(
+        identities=(), target_user="root", invoking_user="user", service="sudo"
+    )
+
+    assert sap.evaluate_rules(rules, listener="remote-guest", **kwargs) == "allow"
+    assert sap.evaluate_rules(rules, listener="tcp-callback", **kwargs) == "deny"
+    assert sap.evaluate_rules(rules, listener="", **kwargs) == "deny"
+
+
+def test_evaluate_rules_star_listener_matches_unnamed(sap: types.ModuleType) -> None:
+    rules = sap._parse_rules([{"match": {"listeners": ["*"]}, "policy": "allow"}])
+
+    assert (
+        sap.evaluate_rules(
+            rules,
+            identities=(),
+            target_user="root",
+            invoking_user="user",
+            service="sudo",
+            listener="",
+        )
+        == "allow"
+    )
 
 
 def test_identity_candidates_include_label_peer_and_credential(
@@ -4321,9 +4025,9 @@ def test_handler_rule_allow_answers_without_a_dialog(
     sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     request = _authed_request(sap)
-    acl = {"mode": "none", "rule": [{"identity": "*", "policy": "allow"}]}
+    rule = [{"match": {"machine": ["*"]}, "policy": "allow"}]
 
-    frames, prompts = _exchange(sap, monkeypatch, [], _frame(sap, request), acl=acl)
+    frames, prompts = _exchange(sap, monkeypatch, [], _frame(sap, request), rule=rule)
 
     assert prompts == []
     assert len(frames) == 1
@@ -4336,9 +4040,9 @@ def test_handler_rule_deny_answers_without_a_dialog(
     sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     request = _authed_request(sap)
-    acl = {"mode": "none", "rule": [{"identity": "*", "policy": "deny"}]}
+    rule = [{"match": {"machine": ["*"]}, "policy": "deny"}]
 
-    frames, prompts = _exchange(sap, monkeypatch, [], _frame(sap, request), acl=acl)
+    frames, prompts = _exchange(sap, monkeypatch, [], _frame(sap, request), rule=rule)
 
     assert prompts == []
     assert _decode(sap, frames[0])["decision"] == "deny"
@@ -4348,15 +4052,14 @@ def test_handler_rule_ask_still_prompts(
     sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     request = _authed_request(sap)
-    acl = {"mode": "none", "rule": [{"identity": "someone-else", "policy": "allow"}]}
+    rule = [{"match": {"machine": ["someone-else"]}, "policy": "allow"}]
 
     frames, prompts = _exchange(
-        sap, monkeypatch, [True], _frame(sap, request), acl=acl
+        sap, monkeypatch, [True], _frame(sap, request), rule=rule
     )
 
     assert len(prompts) == 1
     assert _decode(sap, frames[-1])["decision"] == "allow"
-
 
 # --- sudo target display ----------------------------------------------------
 
@@ -4387,7 +4090,7 @@ def test_build_confirmation_shows_root_for_sudo(sap: types.ModuleType) -> None:
 #
 # One server process may bind several listeners, each with its own transport,
 # bind target, security model and ACL. The document carries a
-# `[transport_defaults]` table deep-merged into every `[[transports]]` entry;
+# `[listener_defaults]` table deep-merged into every `[[listeners]]` entry;
 # `listener_views` expands that list into the flat per-listener shape the
 # existing transport/security code already accepts, and `run_server` binds all
 # listeners before serving any.
@@ -4436,7 +4139,7 @@ def _running_server(
     thread = threading.Thread(target=runner, daemon=True)
     thread.start()
 
-    expected = len(config["transports"])
+    expected = len(config["listeners"])
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if errors:
@@ -4461,7 +4164,7 @@ def test_listener_expansion_deep_merges_defaults(sap: types.ModuleType) -> None:
     """Entry fields win; nested tables merge field-by-field, lists replace."""
     config = {
         "mode": "server",
-        "transport_defaults": {
+        "listener_defaults": {
             "port": 65001,
             "security": {
                 "transport_encryption": "auto",
@@ -4474,14 +4177,12 @@ def test_listener_expansion_deep_merges_defaults(sap: types.ModuleType) -> None:
                 "ca_file": "./ca.crt",
                 "cert_file": "./server.crt",
             },
-            "acl": {"mode": "list", "trusted_fingerprints": ["SHA256:aaa"]},
         },
-        "transports": [
+        "listeners": [
             {
                 "type": "tcp",
                 "port": 65002,
                 "security": {"transport_encryption": "none"},
-                "acl": {"trusted_fingerprints": ["SHA256:bbb"]},
             },
             {"type": "unix", "socket": "/run/x.sock"},
         ],
@@ -4505,11 +4206,6 @@ def test_listener_expansion_deep_merges_defaults(sap: types.ModuleType) -> None:
     }
     assert second["security"]["transport_encryption"] == "auto"
 
-    # a list is replaced wholesale, never concatenated onto the defaults'
-    assert first["acl"]["mode"] == "list"
-    assert first["acl"]["trusted_fingerprints"] == ["SHA256:bbb"]
-    assert second["acl"]["trusted_fingerprints"] == ["SHA256:aaa"]
-
     # the entry's own bind target overrides the defaults, which survive otherwise
     assert second["socket"] == "/run/x.sock"
     assert first["mtls"]["ca_file"] == "./ca.crt"
@@ -4521,7 +4217,7 @@ def test_listener_views_map_type_to_transport(sap: types.ModuleType) -> None:
         "mode": "server",
         "dialog_program": "zenity",
         "debug": True,
-        "transports": [{"type": "vsock", "cid": 2}],
+        "listeners": [{"type": "vsock", "cid": 2}],
     }
 
     views = sap.listener_views(config)
@@ -4554,12 +4250,12 @@ def test_legacy_flat_config_is_single_listener(sap: types.ModuleType) -> None:
     assert "_listener_index" not in views[0]
 
 
-def test_schema_rejects_flat_key_alongside_transports(sap: types.ModuleType) -> None:
-    """A flat transport/security key next to `transports` is ambiguous."""
+def test_schema_rejects_flat_key_alongside_listeners(sap: types.ModuleType) -> None:
+    """A flat transport/security key next to `listeners` is ambiguous."""
     config = {
         "mode": "server",
         "transport": "vsock",
-        "transports": [{"type": "tcp"}],
+        "listeners": [{"type": "tcp"}],
     }
 
     with pytest.raises(sap.SecurityConfigError) as exc:
@@ -4573,7 +4269,7 @@ def test_schema_rejects_unknown_listener_key(sap: types.ModuleType) -> None:
     """A typo inside a listener entry names the key and offers the real one."""
     config = {
         "mode": "server",
-        "transports": [{"type": "tcp", "max_connection": 64}],
+        "listeners": [{"type": "tcp", "max_connection": 64}],
     }
 
     with pytest.raises(sap.SecurityConfigError) as exc:
@@ -4584,28 +4280,47 @@ def test_schema_rejects_unknown_listener_key(sap: types.ModuleType) -> None:
     assert "max_connections" in message  # the did-you-mean hint
 
 
+def test_schema_rejects_old_transports_key(sap: types.ModuleType) -> None:
+    """The renamed `transports`/`transport_defaults` keys fail loudly."""
+    with pytest.raises(sap.SecurityConfigError, match="renamed to"):
+        sap.validate_document_schema(
+            {"mode": "server", "transports": [{"type": "tcp"}]}
+        )
+
+
+def test_schema_rejects_duplicate_listener_name(sap: types.ModuleType) -> None:
+    config = {
+        "mode": "server",
+        "listeners": [
+            {"type": "unix", "name": "dup"},
+            {"type": "tcp", "name": "dup"},
+        ],
+    }
+
+    with pytest.raises(sap.SecurityConfigError, match="duplicate listener name"):
+        sap.validate_document_schema(config)
+
+
 def test_load_config_resolves_transport_default_paths(
     sap: types.ModuleType, tmp_path: Path
 ) -> None:
-    """Relative `[mtls]`/`[acl]` paths resolve in defaults and in each entry."""
+    """Relative `[mtls]` paths resolve in the defaults and in each entry."""
     path = tmp_path / "c.toml"
     path.write_text(
         "mode = \"server\"\n"
-        "[transport_defaults.mtls]\n"
+        "[listener_defaults.mtls]\n"
         "ca_file = \"./ca.crt\"\n"
-        "[[transports]]\n"
+        "[[listeners]]\n"
         "type = \"unix\"\n"
         "socket = \"/run/x.sock\"\n"
-        "[transports.acl]\n"
-        "mode = \"ca\"\n"
-        "ca_file = \"./acl-ca.crt\"\n"
-        "required_oid = \"1.2.3\"\n"
+        "[listeners.mtls]\n"
+        "ca_file = \"./entry-ca.crt\"\n"
     )
 
     config = sap.load_config(str(path))
 
-    assert config["transport_defaults"]["mtls"]["ca_file"] == str(tmp_path / "ca.crt")
-    assert config["transports"][0]["acl"]["ca_file"] == str(tmp_path / "acl-ca.crt")
+    assert config["listener_defaults"]["mtls"]["ca_file"] == str(tmp_path / "ca.crt")
+    assert config["listeners"][0]["mtls"]["ca_file"] == str(tmp_path / "entry-ca.crt")
 
 
 def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
@@ -4613,7 +4328,7 @@ def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
 
     `examples/sudo-auth-proxy-listeners.toml` is the file the multi-transport
     setup tells an operator to install, so it must load, pass the document
-    schema, and expand to one view per `[[transports]]` entry. Loading it here
+    schema, and expand to one view per `[[listeners]]` entry. Loading it here
     (rather than an inline copy) keeps the shipped file and the Python in sync.
     """
     config = sap.load_config(str(_MULTI_LISTENER_EXAMPLE_PATH))
@@ -4623,37 +4338,42 @@ def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
 
     assert len(views) == 3
     assert [view["transport"] for view in views] == ["vsock", "tcp", "unix"]
+    assert [view.get("name") for view in views] == [
+        "vm-callback",
+        "tcp-callback",
+        "remote-guest",
+    ]
     # a relative path inside a listener resolves next to the config file
     assert views[2]["mtls"]["ca_file"] == str(_MULTI_LISTENER_EXAMPLE_PATH.parent / "ca.crt")
+    # the shipped approval rule is document-level and scoped to the named unix
+    # listener (there is no per-listener ACL)
+    assert config["rule"][0]["match"]["listeners"] == ["remote-guest"]
 
 
-def test_run_server_binds_two_unix_listeners_with_distinct_acls(
+def test_run_server_binds_two_unix_listeners_with_distinct_rules(
     sap: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """One process, two unix listeners, different ACL rules.
+    """One process, two unix listeners, different policy by listener name.
 
-    Listener A carries no rule (an authorized request prompts and is approved);
-    listener B carries a deny-all rule, so the same request is answered deny
-    without a dialog. Both listeners are independently reachable.
+    Listener A is unnamed (no rule matches it) so an authenticated request
+    prompts and is approved; listener B is named `b` and a document-level rule
+    denies it without a dialog. Both listeners are independently reachable.
     """
     sock_a = tmp_path / "a" / "server.sock"
     sock_b = tmp_path / "b" / "server.sock"
     config = {
         "mode": "server",
         "dialog_program": "zenity",
-        "transport_defaults": {
+        "rule": [{"match": {"listeners": ["b"]}, "policy": "deny"}],
+        "listener_defaults": {
             "resolution": "none",
             "socket_dir_mode": "0700",
             "socket_mode": "0600",
             "security": _server_security(),
         },
-        "transports": [
-            {"type": "unix", "socket": str(sock_a), "acl": {"mode": "none"}},
-            {
-                "type": "unix",
-                "socket": str(sock_b),
-                "acl": {"mode": "none", "rule": [{"identity": "*", "policy": "deny"}]},
-            },
+        "listeners": [
+            {"type": "unix", "socket": str(sock_a)},
+            {"type": "unix", "socket": str(sock_b), "name": "b"},
         ],
     }
 
@@ -4693,19 +4413,18 @@ def test_run_server_binds_tcp_and_unix_together(
     config = {
         "mode": "server",
         "dialog_program": "zenity",
-        "transport_defaults": {
+        "listener_defaults": {
             "resolution": "none",
             "socket_dir_mode": "0700",
             "socket_mode": "0600",
             "security": _server_security(),
         },
-        "transports": [
-            {"type": "unix", "socket": str(sock_path), "acl": {"mode": "none"}},
+        "listeners": [
+            {"type": "unix", "socket": str(sock_path)},
             {
                 "type": "tcp",
                 "host": "127.0.0.1",
                 "port": port,
-                "acl": {"mode": "none"},
             },
         ],
     }
@@ -4743,19 +4462,18 @@ def test_any_listener_bind_failure_is_fatal(
 
     config = {
         "mode": "server",
-        "transport_defaults": {
+        "listener_defaults": {
             "resolution": "none",
             "socket_dir_mode": "0700",
             "socket_mode": "0600",
             "security": _server_security(),
         },
-        "transports": [
-            {"type": "unix", "socket": str(sock_path), "acl": {"mode": "none"}},
+        "listeners": [
+            {"type": "unix", "socket": str(sock_path)},
             {
                 "type": "tcp",
                 "host": "127.0.0.1",
                 "port": port,
-                "acl": {"mode": "none"},
             },
         ],
     }
@@ -4781,12 +4499,11 @@ def test_listener_views_resolve_security_per_listener(
     """
     config = {
         "mode": "server",
-        "transports": [
+        "listeners": [
             {
                 "type": "unix",
                 "socket": "/run/a.sock",
                 "security": _server_security(),
-                "acl": {"mode": "none"},
             },
             {
                 "type": "unix",
@@ -4798,7 +4515,6 @@ def test_listener_views_resolve_security_per_listener(
                     "cert_file": "/x/s.crt",
                     "key_file": "/x/s.key",
                 },
-                "acl": {"mode": "list", "trusted_fingerprints": []},
             },
         ],
     }
@@ -4822,17 +4538,16 @@ def test_per_listener_security_isolation(
     sock_mtls = tmp_path / "mtls" / "server.sock"
     config = {
         "mode": "server",
-        "transport_defaults": {
+        "listener_defaults": {
             "resolution": "none",
             "socket_dir_mode": "0700",
             "socket_mode": "0600",
         },
-        "transports": [
+        "listeners": [
             {
                 "type": "unix",
                 "socket": str(sock_none),
                 "security": _server_security(),
-                "acl": {"mode": "none"},
             },
             {
                 "type": "unix",
@@ -4844,7 +4559,6 @@ def test_per_listener_security_isolation(
                     "cert_file": str(x509_material.tmp_path / "client.crt"),
                     "key_file": str(x509_material.tmp_path / "client.key"),
                 },
-                "acl": {"mode": "list", "trusted_fingerprints": []},
             },
         ],
     }
@@ -4852,7 +4566,7 @@ def test_per_listener_security_isolation(
     with _running_server(sap, monkeypatch, config) as (captured, errors):
         assert errors == []
         assert len(captured) == 2
-        # captured in bind order, i.e. the order of `transports`
+        # captured in bind order, i.e. the order of `listeners`
         none_server = captured[0][0]
         mtls_server = captured[1][0]
         assert none_server._security.transport_encryption == "none"

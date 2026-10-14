@@ -12,15 +12,16 @@ Behaviours covered:
    and the ``client_auth``/``server_auth`` consistency checks;
 3. the ``unix`` transport rejecting ``tartarus``/``mofos`` resolution at load;
 4. the wildcard-only matching rule for an unset identity (``resolution =
-   "none"``): a specific ``vm_names`` pattern can never match an
+   "none"``): a specific ``machine`` pattern can never match an
    unauthenticated peer;
 5. ``mofos`` resolution (``mofos ls --json`` by CID / ``ipv4_address``);
 6. the display-label vs matching-identity split of ``resolve_peer``;
-7. ``_merge_upstream_paths`` -- per-connection directory scanning, non-socket
-   children ignored, absent entries skipped, realpath de-duplication;
+7. ``_resolve_agent_sockets`` -- per-connection directory scanning (opt-in via
+   ``scan_dirs``), non-socket children ignored, absent entries skipped, realpath
+   de-duplication, and the per-session socket short-circuit;
 8. a real ``unix`` server/client round-trip over AF_UNIX (no mTLS);
 9. the multi-listener server schema -- ``Config.load`` expands a
-   ``[transport_defaults]`` + ``[[transports]]`` document into one
+   ``[listener_defaults]`` + ``[[listeners]]`` document into one
    ``ListenerConfig`` per entry (per-listener resolution/security), keeps a flat
    config as a single implicit listener, rejects an ambiguous mix, allows
    duplicate types, binds several ``unix`` listeners at once, and builds one
@@ -101,7 +102,7 @@ def test_default_transport_is_tcp(sap: types.ModuleType, tmp_path: Path) -> None
     cfg = _load_proxy(
         sap,
         tmp_path,
-        'mode = "proxy"\ndefault_agent_socket_path = "/tmp/a"\n',
+        'mode = "proxy"\nagent_sockets = ["/tmp/a"]\n',
     )
     assert cfg.transport == "tcp"
 
@@ -112,7 +113,7 @@ def test_legacy_vsock_port_derives_vsock(
     cfg = _load_proxy(
         sap,
         tmp_path,
-        'mode = "proxy"\ndefault_agent_socket_path = "/tmp/a"\nvsock_port = 65000\n',
+        'mode = "proxy"\nagent_sockets = ["/tmp/a"]\nvsock_port = 65000\n',
     )
     assert cfg.transport == "vsock"
     assert cfg.vsock_port == 65000
@@ -125,7 +126,7 @@ def test_legacy_tcp_bind_derives_tcp(
     cfg = _load_proxy(
         sap,
         tmp_path,
-        'mode = "proxy"\ndefault_agent_socket_path = "/tmp/a"\n'
+        'mode = "proxy"\nagent_sockets = ["/tmp/a"]\n'
         'tcp_bind = "127.0.0.1:65000"\n',
     )
     assert cfg.transport == "tcp"
@@ -194,7 +195,7 @@ def test_unix_rejects_cid_ip_resolution(
         _load_proxy(
             sap,
             tmp_path,
-            'mode = "proxy"\ntransport = "unix"\ndefault_agent_socket_path = "/tmp/a"\n'
+            'mode = "proxy"\ntransport = "unix"\nagent_sockets = ["/tmp/a"]\n'
             + f'resolution = "{resolution}"\n',
         )
 
@@ -203,18 +204,33 @@ def test_unix_rejects_cid_ip_resolution(
 
 
 def test_none_identity_matches_only_wildcards(sap: types.ModuleType) -> None:
-    assert sap.Rule(key="*").matches_vm(None) is True
-    assert sap.Rule(key="*", vm_names=[]).matches_vm(None) is True
-    assert sap.Rule(key="*", vm_names=["*"]).matches_vm(None) is True
-    assert sap.Rule(key="*", vm_names=["dev"]).matches_vm(None) is False
+    assert sap.Rule(key="*").matches_machine(None) is True
+    assert sap.Rule(key="*", machine=[]).matches_machine(None) is True
+    assert sap.Rule(key="*", machine=["*"]).matches_machine(None) is True
+    assert sap.Rule(key="*", machine=["dev"]).matches_machine(None) is False
     # every pattern must be a wildcard
-    assert sap.Rule(key="*", vm_names=["dev", "*"]).matches_vm(None) is False
+    assert sap.Rule(key="*", machine=["dev", "*"]).matches_machine(None) is False
 
 
 def test_identity_matches_specific_and_wildcard(sap: types.ModuleType) -> None:
-    assert sap.Rule(key="*", vm_names=["dev"]).matches_vm("dev") is True
-    assert sap.Rule(key="*", vm_names=["dev"]).matches_vm("other") is False
-    assert sap.Rule(key="*", vm_names=["d*"]).matches_vm("dev") is True
+    assert sap.Rule(key="*", machine=["dev"]).matches_machine("dev") is True
+    assert sap.Rule(key="*", machine=["dev"]).matches_machine("other") is False
+    assert sap.Rule(key="*", machine=["d*"]).matches_machine("dev") is True
+
+
+def test_listener_selector_matching(sap: types.ModuleType) -> None:
+    # An empty selector matches every listener, named or unnamed.
+    assert sap.Rule(key="*").matches_listener(None) is True
+    assert sap.Rule(key="*").matches_listener("merge") is True
+    assert sap.Rule(key="*", listeners=[]).matches_listener(None) is True
+    # A named listener is matched by a specific or wildcard pattern.
+    assert sap.Rule(key="*", listeners=["merge"]).matches_listener("merge") is True
+    assert sap.Rule(key="*", listeners=["merge"]).matches_listener("other") is False
+    assert sap.Rule(key="*", listeners=["m*"]).matches_listener("merge") is True
+    # An unnamed listener only matches a wildcard selector (mirrors matches_machine).
+    assert sap.Rule(key="*", listeners=["merge"]).matches_listener(None) is False
+    assert sap.Rule(key="*", listeners=["*"]).matches_listener(None) is True
+    assert sap.Rule(key="*", listeners=["*", "merge"]).matches_listener(None) is False
 
 
 # --- 5. mofos resolution ---------------------------------------------------
@@ -278,7 +294,7 @@ def _bind_socket(path: Path) -> socket.socket:
     return sock
 
 
-def test_merge_upstream_paths_directory_scan(sap: types.ModuleType, tmp_path: Path) -> None:
+def test_resolve_agent_sockets_directory_scan(sap: types.ModuleType, tmp_path: Path) -> None:
     sockets_dir = tmp_path / "forwarded"
     sockets_dir.mkdir()
     s1 = _bind_socket(sockets_dir / "s1.sock")
@@ -288,14 +304,32 @@ def test_merge_upstream_paths_directory_scan(sap: types.ModuleType, tmp_path: Pa
     # realpath de-duplication.
     entries = [str(sockets_dir), str(s1.getsockname()), str(missing)]
     try:
-        resolved = sap._merge_upstream_paths(entries)
+        resolved = sap._resolve_agent_sockets(entries, scan_dirs=True)
     finally:
         s1.close()
     # non-socket ignored, absent skipped, the aliased socket appears once.
     assert resolved == [str(sockets_dir / "s1.sock")]
 
 
-def test_merge_upstream_paths_session_socket_short_circuits(
+def test_resolve_agent_sockets_scan_off_skips_dirs(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    sockets_dir = tmp_path / "forwarded"
+    sockets_dir.mkdir()
+    child = _bind_socket(sockets_dir / "child.sock")
+    literal = _bind_socket(tmp_path / "literal.sock")
+    literal_path = str(literal.getsockname())
+    try:
+        # With the scan off, a directory entry contributes nothing, but a
+        # literal socket path is still used as-is.
+        resolved = sap._resolve_agent_sockets([str(sockets_dir), literal_path])
+    finally:
+        child.close()
+        literal.close()
+    assert resolved == [literal_path]
+
+
+def test_resolve_agent_sockets_session_socket_short_circuits(
     sap: types.ModuleType, tmp_path: Path
 ) -> None:
     sockets_dir = tmp_path / "forwarded"
@@ -304,14 +338,39 @@ def test_merge_upstream_paths_session_socket_short_circuits(
     session = _bind_socket(sockets_dir / "session.sock")
     session_path = str(session.getsockname())
     try:
-        resolved = sap._merge_upstream_paths(
-            [str(sockets_dir)], session_socket=session_path
+        resolved = sap._resolve_agent_sockets(
+            [str(sockets_dir)], scan_dirs=True, session_socket=session_path
         )
     finally:
         child.close()
         session.close()
     # The exact session socket is preferred and the directory is not scanned.
     assert resolved == [session_path]
+
+
+def test_resolve_agent_sockets_expands_runtime_dir(
+    sap: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    literal = _bind_socket(tmp_path / "ssh-agent")
+    forwarded = tmp_path / "forwarded"
+    forwarded.mkdir()
+    child = _bind_socket(forwarded / "s1.sock")
+    try:
+        # A `%t/...` literal is expanded for the filesystem check but returned
+        # verbatim as the identifier (so it still matches `key.socket`).
+        assert sap._resolve_agent_sockets(["%t/ssh-agent"]) == ["%t/ssh-agent"]
+        # A `%t/...` directory entry is expanded before being scanned.
+        assert sap._resolve_agent_sockets(["%t/forwarded"], scan_dirs=True) == [
+            str(forwarded / "s1.sock")
+        ]
+        # A `%t` literal and its absolute spelling de-duplicate to one entry.
+        assert sap._resolve_agent_sockets(
+            ["%t/ssh-agent", str(tmp_path / "ssh-agent")]
+        ) == ["%t/ssh-agent"]
+    finally:
+        literal.close()
+        child.close()
 
 
 # --- 8. unix round-trip ----------------------------------------------------
@@ -383,8 +442,7 @@ def test_unix_server_client_roundtrip(sap: types.ModuleType, tmp_path: Path) -> 
 transport = "unix"
 socket = "{server_sock}"
 resolution = "none"
-default_agent_socket_path = "{upstream}"
-forward_sockets = ["{upstream}"]
+agent_sockets = ["{upstream}"]
 [security]
 transport_encryption = "none"
 client_auth = "none"
@@ -402,6 +460,82 @@ server_auth = "none"
         assert resp is not None
         assert resp[0] == IDENTITIES_ANSWER
         assert struct.unpack(">I", resp[1:5])[0] == 0
+    finally:
+        stop.set()
+
+
+def _fake_agent_one_identity(
+    path: Path, stop: threading.Event, blob: bytes, comment: bytes
+) -> threading.Thread:
+    """An upstream agent that always offers the single given identity."""
+
+    def serve() -> None:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(8)
+        server.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+            try:
+                msg = _recv_frame(conn)
+                if msg and msg[0] == REQUEST_IDENTITIES:
+                    payload = struct.pack(">BI", IDENTITIES_ANSWER, 1)
+                    payload += _frame(blob) + _frame(comment)
+                    conn.sendall(_frame(payload))
+                else:
+                    conn.sendall(_frame(bytes([FAILURE])))
+            except OSError:
+                pass
+            finally:
+                conn.close()
+        server.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_upstream_agent_socket_expands_runtime_dir(
+    sap: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `%t/...` agent_sockets entry is expanded at connect time, so a key
+    offered by the upstream is actually enumerated (the pre-fix behaviour left
+    `%t` literal, failed to connect, and returned zero identities)."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    upstream = tmp_path / "upstream.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    key_blob = struct.pack(">I", 11) + b"ssh-ed25519" + b"AAAA"
+    _fake_agent_one_identity(upstream, stop, key_blob, b"test-key")
+    _wait_for_socket(upstream)
+
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        f'''mode = "proxy"
+transport = "unix"
+socket = "{server_sock}"
+resolution = "none"
+agent_sockets = ["%t/upstream.sock"]
+[security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+''',
+    )
+    thread = threading.Thread(target=sap.run_proxy, args=(cfg,), daemon=True)
+    thread.start()
+    _wait_for_socket(server_sock)
+
+    try:
+        remote = sap.RemoteConnection(str(server_sock), 0, "unix", None, cfg)
+        resp = remote.request(bytes([REQUEST_IDENTITIES]))
+        assert resp is not None
+        assert resp[0] == IDENTITIES_ANSWER
+        assert struct.unpack(">I", resp[1:5])[0] == 1
     finally:
         stop.set()
 
@@ -428,28 +562,28 @@ def _wait_until(predicate, timeout: float = 5.0) -> None:
     raise AssertionError("condition not met within timeout")
 
 
-def test_load_builds_listeners_from_transports(
+def test_load_builds_listeners_from_listeners(
     sap: types.ModuleType, tmp_path: Path
 ) -> None:
     cfg = _load_proxy(
         sap,
         tmp_path,
         '''mode = "proxy"
-default_agent_socket_path = "/tmp/agent"
+agent_sockets = ["/tmp/agent"]
 
-[transport_defaults]
+[listener_defaults]
 resolution = "tartarus"
 
-[transport_defaults.security]
+[listener_defaults.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
-[[transports]]
+[[listeners]]
 type = "vsock"
 cid = 3
 
-[[transports]]
+[[listeners]]
 type = "tcp"
 host = "10.0.0.1"
 port = 65000
@@ -473,6 +607,92 @@ resolution = "mofos"
     assert tcp.resolution == "mofos"
 
 
+def test_load_parses_listener_names_and_match_listener(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        '''mode = "proxy"
+agent_sockets = ["/tmp/agent"]
+
+[listener_defaults]
+resolution = "none"
+
+[listener_defaults.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+[[listeners]]
+type = "unix"
+socket = "/tmp/merge.sock"
+name = "merge"
+
+[[listeners]]
+type = "unix"
+socket = "/tmp/other.sock"
+
+[[rule]]
+key = "*"
+match.listeners = "merge"
+auth = "allow"
+
+[[rule]]
+key = "*"
+match.listeners = ["a", "b"]
+auth = "ask"
+''',
+    )
+    # a named listener and an unnamed one
+    assert [listener.name for listener in cfg.listeners] == ["merge", None]
+    # `match.listeners` accepts a bare string or a list of patterns
+    merge_rule, multi_rule = cfg.rules
+    assert merge_rule.listeners == ["merge"]
+    assert multi_rule.listeners == ["a", "b"]
+
+
+def test_duplicate_listener_name_rejected(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="duplicate listener name"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            '''mode = "proxy"
+agent_sockets = ["/tmp/agent"]
+
+[listener_defaults]
+resolution = "none"
+
+[listener_defaults.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+[[listeners]]
+type = "unix"
+socket = "/tmp/a.sock"
+name = "dup"
+
+[[listeners]]
+type = "unix"
+socket = "/tmp/b.sock"
+name = "dup"
+''',
+        )
+
+
+def test_empty_listener_name_rejected(sap: types.ModuleType, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="listener name"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\ntransport = "vsock"\ncid = 2\nname = ""\n'
+            'agent_sockets = ["/tmp/agent"]\n',
+        )
+
+
 def test_load_legacy_flat_single_listener(
     sap: types.ModuleType, tmp_path: Path
 ) -> None:
@@ -480,7 +700,7 @@ def test_load_legacy_flat_single_listener(
         sap,
         tmp_path,
         'mode = "proxy"\ntransport = "vsock"\ncid = 4\nport = 65000\n'
-        'resolution = "tartarus"\ndefault_agent_socket_path = "/tmp/agent"\n',
+        'resolution = "tartarus"\nagent_sockets = ["/tmp/agent"]\n',
     )
     assert len(cfg.listeners) == 1
     listener = cfg.listeners[0]
@@ -491,7 +711,7 @@ def test_load_legacy_flat_single_listener(
     assert listener.host == cfg.host
 
 
-def test_load_transports_with_flat_transport_is_rejected(
+def test_load_listeners_with_flat_transport_is_rejected(
     sap: types.ModuleType, tmp_path: Path
 ) -> None:
     with pytest.raises(ValueError, match="cannot be combined"):
@@ -499,8 +719,19 @@ def test_load_transports_with_flat_transport_is_rejected(
             sap,
             tmp_path,
             'mode = "proxy"\ntransport = "tcp"\n'
-            'default_agent_socket_path = "/tmp/agent"\n'
-            '[[transports]]\ntype = "vsock"\n',
+            'agent_sockets = ["/tmp/agent"]\n'
+            '[[listeners]]\ntype = "vsock"\n',
+        )
+
+
+def test_old_transports_key_rejected(sap: types.ModuleType, tmp_path: Path) -> None:
+    """The renamed `transports`/`transport_defaults` keys fail loudly."""
+    with pytest.raises(ValueError, match="renamed to"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\nagent_sockets = ["/tmp/agent"]\n'
+            '[[transports]]\ntype = "vsock"\ncid = 2\n',
         )
 
 
@@ -511,21 +742,21 @@ def test_duplicate_transport_types_allowed(
         sap,
         tmp_path,
         '''mode = "proxy"
-default_agent_socket_path = "/tmp/agent"
+agent_sockets = ["/tmp/agent"]
 
-[transport_defaults]
+[listener_defaults]
 resolution = "none"
 
-[transport_defaults.security]
+[listener_defaults.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
-[[transports]]
+[[listeners]]
 type = "unix"
 socket = "/tmp/a.sock"
 
-[[transports]]
+[[listeners]]
 type = "unix"
 socket = "/tmp/b.sock"
 ''',
@@ -542,24 +773,24 @@ def test_listener_resolution_is_per_listener(
         sap,
         tmp_path,
         '''mode = "proxy"
-default_agent_socket_path = "/tmp/agent"
+agent_sockets = ["/tmp/agent"]
 
-[[transports]]
+[[listeners]]
 type = "unix"
 socket = "/tmp/x.sock"
 
-[transports.security]
+[listeners.security]
 transport_encryption = "mtls"
 client_auth = "transport"
 server_auth = "transport"
 
-[transports.mtls]
+[listeners.mtls]
 enable = true
 ca_file = "/tmp/ca.crt"
 cert_file = "/tmp/server.crt"
 key_file = "/tmp/server.key"
 
-[[transports]]
+[[listeners]]
 type = "vsock"
 resolution = "tartarus"
 ''',
@@ -573,18 +804,18 @@ resolution = "tartarus"
         _load_proxy(
             sap,
             tmp_path,
-            'mode = "proxy"\ndefault_agent_socket_path = "/tmp/agent"\n'
-            '[[transports]]\ntype = "unix"\nsocket = "/tmp/x.sock"\n'
+            'mode = "proxy"\nagent_sockets = ["/tmp/agent"]\n'
+            '[[listeners]]\ntype = "unix"\nsocket = "/tmp/x.sock"\n'
             'resolution = "tartarus"\n',
         )
 
 
 def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
-    """The shipped multi-listener example loads and builds two listeners.
+    """The shipped multi-listener example loads and builds three listeners.
 
     `examples/ssh-agent-proxy-listeners.toml` is the file the multi-transport
     setup tells an operator to install, so it must load and expand to one
-    `ListenerConfig` per `[[transports]]` entry, each with its own
+    `ListenerConfig` per `[[listeners]]` entry, each with its own `name`,
     `resolution`/`security`. Loading the shipped file (rather than an inline
     copy) keeps the example and the parser in sync.
     """
@@ -593,15 +824,27 @@ def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
     config = sap.Config()
     config.load(str(path), mode="proxy")
 
-    assert len(config.listeners) == 2
-    vsock, unix = config.listeners
-    assert [listener.transport for listener in config.listeners] == ["vsock", "unix"]
+    assert len(config.listeners) == 3
+    vsock, unix, merge = config.listeners
+    assert [listener.transport for listener in config.listeners] == [
+        "vsock",
+        "unix",
+        "unix",
+    ]
+    # only the two intended listeners are named; the callback is unnamed.
+    assert [listener.name for listener in config.listeners] == [
+        None,
+        "remote-guest",
+        "merge",
+    ]
     # per-listener identity: CID-based on the callback, certificate on the SSH
-    # forwarded socket.
+    # forwarded socket, unset on the local merge socket.
     assert vsock.resolution == "tartarus"
     assert unix.resolution == "certificate"
-    # per-listener security: the callback is unauthenticated, the unix socket is
-    # mTLS (so the certificate CN names the peer).
+    assert merge.resolution == "none"
+    # per-listener security: the callback and the local merge socket are
+    # unauthenticated, the unix forwarded socket is mTLS (so the certificate CN
+    # names the peer).
     assert (vsock.transport_encryption, vsock.client_auth, vsock.server_auth) == (
         "none",
         "none",
@@ -612,8 +855,18 @@ def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
         "transport",
         "transport",
     )
+    assert (merge.transport_encryption, merge.client_auth, merge.server_auth) == (
+        "none",
+        "none",
+        "none",
+    )
     # a relative path inside a listener resolves next to the config file
     assert unix.mtls_ca_file == str(path.parent / "ca.crt")
+    # the merge listener is scoped by a `match.listeners` rule that allows all.
+    merge_rule = next(r for r in config.rules if r.listeners == ["merge"])
+    assert merge_rule.auth == "allow"
+    assert merge_rule.data_signing == "allow"
+    assert merge_rule.notify is False
 
 
 def test_run_proxy_binds_two_unix_listeners(
@@ -630,21 +883,21 @@ def test_run_proxy_binds_two_unix_listeners(
         sap,
         tmp_path,
         f'''mode = "proxy"
-default_agent_socket_path = "{upstream}"
+agent_sockets = ["{upstream}"]
 
-[transport_defaults]
+[listener_defaults]
 resolution = "none"
 
-[transport_defaults.security]
+[listener_defaults.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
-[[transports]]
+[[listeners]]
 type = "unix"
 socket = "{sock_a}"
 
-[[transports]]
+[[listeners]]
 type = "unix"
 socket = "{sock_b}"
 ''',
@@ -750,28 +1003,28 @@ def test_create_ssl_context_is_per_listener(
         sap,
         tmp_path,
         '''mode = "proxy"
-default_agent_socket_path = "/tmp/agent"
+agent_sockets = ["/tmp/agent"]
 
-[transport_defaults]
+[listener_defaults]
 resolution = "none"
 
-[transport_defaults.security]
+[listener_defaults.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
-[[transports]]
+[[listeners]]
 type = "vsock"
 
-[[transports]]
+[[listeners]]
 type = "tcp"
 
-[transports.security]
+[listeners.security]
 transport_encryption = "mtls"
 client_auth = "transport"
 server_auth = "transport"
 
-[transports.mtls]
+[listeners.mtls]
 enable = true
 ca_file = "./ca.crt"
 cert_file = "./server.crt"
@@ -784,3 +1037,227 @@ required_oid = "1.3.6.1.4.1.99999.2.1"
     assert secure.mtls_ca_file == str(tmp_path / "ca.crt")
     assert sap.create_ssl_context(plain, server=True) is None
     assert sap.create_ssl_context(secure, server=True) is not None
+
+
+# --- 10. agent_sockets -----------------------------------------------------
+
+
+def test_agent_sockets_defaults_to_env(
+    sap: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/env-agent")
+    cfg = _load_proxy(sap, tmp_path, 'mode = "proxy"\n')
+    assert cfg.agent_sockets == ["/tmp/env-agent"]
+
+
+def test_agent_sockets_requires_a_socket(
+    sap: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    with pytest.raises(ValueError, match="SSH_AUTH_SOCK empty"):
+        _load_proxy(sap, tmp_path, 'mode = "proxy"\n')
+
+
+def test_agent_sockets_first_is_key_default(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        'mode = "proxy"\n'
+        'agent_sockets = ["/tmp/first", "/tmp/second"]\n'
+        '[[key]]\nid = "k1"\npubkey = "ssh-ed25519 aGVsbG8="\n',
+    )
+    assert cfg.agent_sockets == ["/tmp/first", "/tmp/second"]
+    k1 = next(k for k in cfg.keys.values() if k.id == "k1")
+    assert k1.socket == "/tmp/first"
+
+
+# --- 11. merge = an allow-all local proxy server ---------------------------
+
+
+SIGN_REQUEST = 13
+SIGN_RESPONSE = 14
+
+
+def _fake_key_agent(
+    path: Path, stop: threading.Event, blob: bytes, comment: bytes = b"test"
+) -> threading.Thread:
+    """An upstream agent exposing one identity and answering sign requests."""
+
+    def serve() -> None:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(8)
+        server.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            conn.settimeout(0.2)
+            try:
+                while not stop.is_set():
+                    try:
+                        msg = _recv_frame(conn)
+                    except socket.timeout:
+                        continue
+                    except (OSError, struct.error):
+                        break
+                    if not msg:
+                        break
+                    if msg[0] == REQUEST_IDENTITIES:
+                        payload = struct.pack(">BI", IDENTITIES_ANSWER, 1)
+                        payload += struct.pack(">I", len(blob)) + blob
+                        payload += struct.pack(">I", len(comment)) + comment
+                        conn.sendall(_frame(payload))
+                    elif msg[0] == SIGN_REQUEST:
+                        conn.sendall(_frame(bytes([SIGN_RESPONSE]) + b"sig"))
+                    else:
+                        conn.sendall(_frame(bytes([FAILURE])))
+            except OSError:
+                pass
+            finally:
+                conn.close()
+        server.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_proxy_unix_listener_merges_two_agents_allow_all(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    """Merging is a normal allow-all unix proxy: two upstreams, one socket."""
+    a = tmp_path / "a.sock"
+    b = tmp_path / "b.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    blob_a = struct.pack(">I", 11) + b"ssh-ed25519"
+    blob_b = struct.pack(">I", 11) + b"ssh-ed25519"
+    _fake_key_agent(a, stop, blob_a + b"A", b"key-a")
+    _fake_key_agent(b, stop, blob_b + b"B", b"key-b")
+    _wait_for_socket(a)
+    _wait_for_socket(b)
+
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        f'''mode = "proxy"
+agent_sockets = ["{a}", "{b}"]
+
+[[rule]]
+key = "*"
+auth = "allow"
+data_signing = "allow"
+notify = false
+
+[[listeners]]
+type = "unix"
+socket = "{server_sock}"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+''',
+    )
+    thread = threading.Thread(target=sap.run_proxy, args=(cfg,), daemon=True)
+    thread.start()
+    _wait_for_socket(server_sock)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5.0)
+    try:
+        client.connect(str(server_sock))
+        client.sendall(_frame(bytes([REQUEST_IDENTITIES])))
+        resp = _recv_frame(client)
+        assert resp[0] == IDENTITIES_ANSWER
+        count = struct.unpack(">I", resp[1:5])[0]
+        # the union of both upstreams, no prompts (allow-all wildcard rule)
+        assert count == 2
+
+        # a sign request for one upstream's key is forwarded without a dialog
+        sign = bytes([SIGN_REQUEST])
+        sign += struct.pack(">I", len(blob_a) + 1) + blob_a + b"A"
+        sign += struct.pack(">I", 4) + b"data"
+        client.sendall(_frame(sign))
+        sign_resp = _recv_frame(client)
+        assert sign_resp[0] == SIGN_RESPONSE
+    finally:
+        client.close()
+        stop.set()
+
+
+def test_merge_mode_rejected(sap: types.ModuleType, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="merge"):
+        _load_proxy(sap, tmp_path, 'mode = "merge"\n')
+    # also without the CLI mode override
+    path = _write_config(tmp_path, 'mode = "merge"\n')
+    with pytest.raises(ValueError, match="merge"):
+        sap.Config().load(str(path))
+
+
+def test_merge_sockets_key_rejected(sap: types.ModuleType, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="merge"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\nmerge_sockets = ["/tmp/a"]\nagent_sockets = ["/tmp/a"]\n',
+        )
+
+
+def test_scan_flags_rejected_on_non_unix(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="only valid on the unix transport"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\nagent_sockets = ["/tmp/a"]\n'
+            '[[listeners]]\ntype = "vsock"\nscan_agent_socket_dirs = true\n',
+        )
+    with pytest.raises(ValueError, match="only valid on the unix transport"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\nagent_sockets = ["/tmp/a"]\n'
+            '[[listeners]]\ntype = "tcp"\nresolve_session_socket = true\n',
+        )
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        'mode = "proxy"\nagent_sockets = ["/tmp/a"]\n'
+        '[[listeners]]\ntype = "unix"\nsocket = "/tmp/x.sock"\n'
+        'resolution = "none"\n'
+        'scan_agent_socket_dirs = true\nresolve_session_socket = true\n',
+    )
+    assert cfg.listeners[0].scan_agent_socket_dirs is True
+    assert cfg.listeners[0].resolve_session_socket is True
+
+
+def test_shipped_merge_example_parses(sap: types.ModuleType) -> None:
+    """`examples/ssh-agent-proxy-merge.toml` is the documented merge recipe."""
+    path = EXAMPLES_DIR / "ssh-agent-proxy-merge.toml"
+
+    config = sap.Config()
+    config.load(str(path), mode="proxy")
+
+    assert len(config.listeners) == 1
+    listener = config.listeners[0]
+    assert listener.transport == "unix"
+    assert listener.resolution == "none"
+    assert (listener.transport_encryption, listener.client_auth, listener.server_auth) == (
+        "none",
+        "none",
+        "none",
+    )
+    assert config.agent_sockets == ["%t/ssh-agent", "%t/gnupg/S.gpg-agent.ssh"]
+    assert len(config.rules) == 1
+    rule = config.rules[0]
+    assert rule.key == "*"
+    assert rule.auth == "allow"
+    assert rule.data_signing == "allow"
+    assert rule.notify is False

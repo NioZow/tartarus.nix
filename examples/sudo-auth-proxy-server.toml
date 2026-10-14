@@ -9,20 +9,21 @@
 # It is deliberately written as a plain TOML file so it can run on a machine
 # with no Nix at all — any Linux distribution with Python 3.11+ and the
 # `cryptography` wheel. The full design and threat model live in
-# `docs/sudo-auth-proxy.md`; §15.1 has the step-by-step setup.
+# `docs/technical/sudo-auth-proxy.md`; §15.1 has the step-by-step setup.
 #
 # Copy it to `~/.config/sudo-auth-proxy/config.toml` and run:
 #
 #   sudo-auth-proxy --config ~/.config/sudo-auth-proxy/config.toml
 #
 # This is the **flat** (single-transport) form: a top-level `transport` plus the
-# `[security]`/`[acl]`/`[mtls]` tables. The server still accepts it and treats
-# the whole document as **one implicit listener**, so existing hand-written
-# configs keep working. To bind several transports in one process (a `vsock` VM
-# *and* a `tcp` container *and* an `ssh -R` forwarded `unix` socket), use the
-# multi-listener form instead: `examples/sudo-auth-proxy-listeners.toml` — a
-# `[transport_defaults]` table plus one `[[transports]]` entry per listener. This
-# file and that one are the same server, one listener versus many.
+# `[security]`/`[mtls]` tables and the document-level `[[rule]]` list. The server
+# still accepts it and treats the whole document as **one implicit listener**, so
+# existing hand-written configs keep working. To bind several transports in one
+# process (a `vsock` VM *and* a `tcp` container *and* an `ssh -R` forwarded
+# `unix` socket), use the multi-listener form instead:
+# `examples/sudo-auth-proxy-listeners.toml` — a `[listener_defaults]` table plus
+# one `[[listeners]]` entry per listener. This file and that one are the same
+# server, one listener versus many.
 #
 # Paths inside this file are resolved relative to the file's own directory, so
 # `./ca.crt` means "next to this config".
@@ -53,9 +54,11 @@
 # Accepted top-level keys: mode, transport, cid, host, port, socket,
 # socket_dir_mode, socket_mode, connect_timeout, decision_timeout, recv_timeout,
 # max_connections, server_read_timeout, dialog_program, resolution, debug,
-# approver, client_version, guest_hint -- plus the `[security]`, `[acl]` and
-# `[mtls]` tables. The full key list is doc §7.9; the `[security]` keys are
-# spelled out below. `tests/test_sudo_auth_proxy.py`
+# approver, client_version, guest_hint -- plus the `[security]`/`[mtls]` tables,
+# the `[labels]` map and the `[[rule]]` list. There is no `[acl]` on the server
+# (the client `[acl]` pins the trusted server instead). The full key list is doc
+# §7.9; the `[security]` keys are spelled out below.
+# `tests/test_sudo_auth_proxy.py`
 # (`test_shipped_example_config_matches_the_schema`) validates this file, so it
 # cannot drift out of the schema unnoticed.
 
@@ -130,7 +133,7 @@ dialog_program = "zenity"
 # `socket` is the single Unix socket for the `unix` transport (`%t` = the
 # per-user runtime directory). Unused for `vsock`/`tcp`, but harmless — and it
 # is where a `unix`-transport server would listen. It must be written BEFORE
-# the `[security]`/`[acl]` tables below: in TOML, every key after a table
+# the `[security]`/`[mtls]` tables below: in TOML, every key after a table
 # header belongs to that table.
 socket = "%t/sudo-auth-proxy/server.sock"
 socket_dir_mode = "0700"
@@ -150,7 +153,7 @@ debug = false
 #   "mofos"        `mofos ls --json`, matching the peer's VSOCK CID or
 #                  `ipv4_address` to a VM name
 #
-# The resolved name is also what an `[[acl.rule]]` `identity` selector matches.
+# The resolved name is also what a `[[rule]]` `match.machine` selector matches.
 # For the MOFOS guest callback this example resolves the VM name via `mofos`.
 resolution = "mofos"
 
@@ -171,7 +174,7 @@ resolution = "mofos"
 # "none" | "mtls". A VSOCK connection is point-to-point between the guest and
 # its hypervisor, with no network path for a third party, so this example
 # leaves it unencrypted. Use "mtls" for anything that crosses a network you do
-# not control, and see docs/sudo-auth-proxy.md §7 for the `[mtls]` block.
+# not control, and see docs/technical/sudo-auth-proxy.md §7 for the `[mtls]` block.
 transport_encryption = "none"
 
 # "transport" | "none". Does not authenticate the requester: any process inside
@@ -190,40 +193,36 @@ response_ttl = 30
 clock_skew = 5
 
 # ---------------------------------------------------------------------------
-# [acl] — authorization: *who* may use the mechanism, given a verified
-# credential. Evaluated before any dialog, matches only cryptographic
-# material (never usernames, TTYs, addresses or any other request metadata),
-# and defaults to deny-all.
+# [[rule]] — the approval policy. A single ordered, document-level list; there
+# is no per-listener ACL and no separate authorization table. The mTLS
+# transport authenticates the requester (when `client_auth = "transport"`), and
+# the rules decide the outcome.
 #
-#   "list"  only credentials whose mTLS leaf SPKI fingerprint is listed in
-#           `trusted_fingerprints`
-#   "ca"    any mTLS credential that chains to `ca_file` and carries
-#           `required_oid` (optionally additionally pinned by
-#           `trusted_fingerprints`)
-#   "none"  deliberately authorize every request, because `client_auth` above
-#           leaves no credential to authorize
+# **First match wins; there is no merging between rules.** A permissive rule
+# written above a restrictive one therefore takes precedence: rule order is a
+# security decision.
 #
-# `mode = "none"` is only accepted when `client_auth` is also "none" (the
-# pair is a fail-closed XOR), and it must not carry any trust material.
-# ---------------------------------------------------------------------------
-[acl]
-mode = "none"
-
-# Optional approval rules (`[[acl.rule]]`). The ACL above decides *whether* the
-# credential may use the mechanism; these rules refine the *approval* decision
-# once it has been authorized. Each rule matches glob patterns against the
-# requester's identity (the `resolution` name, the ACL label and the verified
-# credential), the target/invoking user and the PAM service; the first matching
-# rule wins and no match means `ask`. `policy` is `allow` (reply without a
-# dialog), `deny` (reply without a dialog) or `ask` (show the prompt). A rule
-# can never grant access the ACL denied. Uncomment to auto-allow a known VM:
+# Each rule has an optional `[rule.match]` table and an optional `policy`
+# (`allow` = reply without a dialog, `deny` = reply without a dialog, `ask` =
+# show the prompt; the default with no match is `ask`). Every selector is a glob
+# (`fnmatch`) written as a bare string or a list of patterns; an empty/absent
+# selector matches anything.
 #
-#   [[acl.rule]]
-#   identity = "template-nixos"
-#   target_user = "root"
-#   service = "sudo"
+#   match.machine        resolved name / label / verified credential fingerprint
+#   match.listeners      accepting listener name (empty matches any)
+#   match.target_user    target (PAM) user
+#   match.invoking_user  invoking user
+#   match.service        PAM service (sudo/su/login)
+#
+# `target_user`/`invoking_user`/`service` are self-reported by the guest, so
+# they refine the decision but can never authorize a request the transport did
+# not authenticate. Uncomment to auto-allow a known VM and prompt otherwise:
+#
+#   [[rule]]
+#   match.machine = "template-nixos"
+#   match.target_user = "root"
+#   match.service = "sudo"
 #   policy = "allow"
 #
-#   [[acl.rule]]
-#   identity = "*"
+#   [[rule]]
 #   policy = "ask"

@@ -5,8 +5,8 @@ implementation; see `plans/sudo-auth-proxy-redesign.md`).
 **Audience:** operators of tartarus guests/hosts and reviewers of this service.
 
 > This document is the **source of truth** for _what_ `sudo-auth-proxy` is and
-> _how it is expected to work_. The companion
-> [`plans/sudo-auth-proxy-redesign.md`](plans/sudo-auth-proxy-redesign.md)
+> _how it is expected to work_. The companion internal plan
+> (`plans/sudo-auth-proxy-redesign.md`, not shipped with the repository)
 > describes _how_ the redesign is implemented and in what order.
 
 > **⚠️ Authentication is mTLS or nothing.** The service once supported SSH-key,
@@ -89,7 +89,7 @@ cryptographic credential it can prove and the authorization model (§5, §8).
 | **Server authentication** | How the **client** verifies it is talking to the real server: `transport` (mTLS) or `none`.                                  |
 | **Client authentication** | How the **server** verifies who is asking: `transport` (mTLS) or `none`.                                                     |
 | **Approver**              | The human who answers the dialog; identified by the host user running the server.                                            |
-| **Principal**             | A verified cryptographic identity used by the ACL (a trusted public key or certificate, never a socket path or address).     |
+| **Principal**             | A verified cryptographic identity used to authenticate a peer (a trusted public key or certificate, never a socket path or address). |
 
 ### 1.4 Goals and non-goals
 
@@ -107,14 +107,14 @@ cryptographic credential it can prove and the authorization model (§5, §8).
   or any other connection metadata (§7). Both come from the same place now —
   mTLS — so "authenticate by default" means "use `mtls`"; a transport that
   turns it off has to say so on all three knobs.
-- Restrict _who may use the mechanism_ (not everyone) by matching **only
-  cryptographic credentials** (CA-signed mTLS certificates and their SPKI
-  fingerprints).
-  This ACL gates the **proxy**, not `sudo` itself: other PAM methods still apply
-  if enabled (§8, §10.3).
-- Let one server process bind **one listener per entry in `transports`** (any
-  mix of `vsock`/`tcp`/`unix`), each with its own bind target, security and ACL,
-  so a single host can serve a `vsock` VM, a `tcp` container and an
+- Restrict _who may use the mechanism_ (not everyone): the client pins the
+  server it will trust to answer (its `[acl]`), and the server's ordered
+  `[[rule]]` list decides `allow`/`ask`/`deny` for an already-authenticated
+  requester (§8). This gates the **proxy**, not `sudo` itself: other PAM methods
+  still apply if enabled (§8, §10.3).
+- Let one server process bind **one listener per entry in `listeners`** (any
+  mix of `vsock`/`tcp`/`unix`), each with its own bind target and transport
+  security, so a single host can serve a `vsock` VM, a `tcp` container and an
   SSH-forwarded `unix` guest at once (§3). There is still no per-guest or
   per-session server socket: the guest is identified cryptographically (§5, §8).
 - Fail fast and stay optional in the PAM stack. **This is a security property,
@@ -158,9 +158,9 @@ cryptographic credential it can prove and the authorization model (§5, §8).
 - A per-host-user service (`systemd --user` on Linux, launchd user agent on
   macOS). It must be tied to the approver's login session because it needs that
   user's GUI to show the dialog.
-- Binds **one listener per entry in `tartarus.sudo-auth-proxy.server.transports`**
+- Binds **one listener per entry in `tartarus.sudo-auth-proxy.server.listeners`**
   (§3.4): each entry is a `vsock`, `tcp` or `unix` endpoint with its own
-  address/port/socket, `[security]`, `[mtls]` and `[acl]`. All listeners run in
+  address/port/socket, `[security]` and `[mtls]`. All listeners run in
   the one server process. There is no per-guest socket (review log S1, §19.7) —
   the guest is identified cryptographically, not by the socket it connected to.
 - Authenticates the requester (§7.3) and the channel (§7.4), authorizes the
@@ -216,8 +216,8 @@ shared-account case (§12.6 R6).
 
 Each **listener** selects its transport with `type = "vsock" | "tcp" | "unix"`,
 which also determines the **call direction**. The server takes a **list** of
-listeners (`tartarus.sudo-auth-proxy.server.transports`) plus a
-`transportDefaults` block that the Python deep-merges into every entry (§3.4).
+listeners (`tartarus.sudo-auth-proxy.server.listeners`) plus a
+`listenerDefaults` block that the Python deep-merges into every entry (§3.4).
 There is no per-guest or per-session server socket (review log S1, §19.7): a
 listener's address is not an identity, and the guest is identified
 cryptographically (§5, §8).
@@ -329,18 +329,18 @@ decision, never a runtime fallback.
 
 ### 3.4 Multiple listeners in one process
 
-The server binds **one listener per entry in `server.transports`**, and a single
+The server binds **one listener per entry in `server.listeners`**, and a single
 process may bind any number of them — including several of the same kind:
 
 ```nix
 tartarus.sudo-auth-proxy.server = {
   enable = true;
-  transportDefaults = {              # deep-merged into every entry
+  listenerDefaults = {              # deep-merged into every entry
     port = 65001;
     recvTimeout = 0.5;
     decisionTimeout = 120;
   };
-  transports = [
+  listeners = [
     { type = "vsock"; cid = 2; }                    # local Linux VM (callback)
     { type = "unix";                                # SSH-forwarded remote (tunnel)
       socket = "%t/sudo-auth-proxy/server.sock";
@@ -353,12 +353,16 @@ tartarus.sudo-auth-proxy.server = {
 ```
 
 - Each entry is **independent**: its own `type`, bind target and — crucially —
-  its own `security`, `mtls`, `acl` and `resolution`. A `vsock` listener can be
+  its own `security`, `mtls` and `resolution`. A `vsock` listener can be
   `none`/`none` while a `unix` listener on the same server is `mtls`.
-- `transportDefaults` supplies the shared values once; the Python deep-merges it
+- A listener may be given a `name` (unique across the server). A
+  `[[rule]]` `match.listeners` glob then selects it; empty/`*` matches any
+  listener, including an unnamed one (see §8.2). `name` is a label only: it
+  never affects the bind target or the identity.
+- `listenerDefaults` supplies the shared values once; the Python deep-merges it
   into every entry, and an entry's explicitly-set field wins.
 - Multiple entries of the same `type` are allowed (e.g. two `unix` listeners
-  with different `socket` paths and different ACLs).
+  with different `socket` paths and different transport security).
 - All listeners are bound **before any serves a request**: if one bind or one
   `[security]`/mTLS setup fails, the whole server exits non-zero and no listener
   ever serves. A runtime failure in one listener's thread does not stop the
@@ -440,7 +444,7 @@ The design resolves both **without** any per-guest server socket:
 
 A `sudo` in `/run/.../alice@laptop-<token>.sock` therefore reaches _Alice's_
 server, on _Alice's_ session; the server independently verifies the requester's
-key/certificate against its trust roots and applies the ACL (§8). Bob's session
+key/certificate against its trust roots and applies its `[[rule]]` policy (§8). Bob's session
 uses a different guest path (and a different token) and cannot interfere. There
 is **no explicit teardown hook** (audit A8): the guest's `sshd` removes its own
 stream-local forward when the session ends, and `StreamLocalBindUnlink` handles
@@ -626,10 +630,11 @@ socket path, a network address, or a self-reported string.
 - `client_auth = "transport"`: the mTLS peer certificate authenticates the
   requester; the identity is its leaf SPKI fingerprint (and its CN).
 - `client_auth = "none"`: **no identity at all.** The server has nothing to
-  verify, so the ACL must be the matching `mode = "none"` and every request is
-  authorized by construction (§7.3, §8). The dialog renders this as
-  "Unauthenticated requester" rather than an empty field.
-- The ACL (§8) matches **only** these cryptographic identities.
+  verify, so only an empty/`*`-only `match.machine` selector can match, and the
+  dialog renders this as "Unauthenticated requester" rather than an empty field
+  (§7.3, §8.3).
+- A `match.machine` selector matches **only** these cryptographic identities
+  (plus the display-only resolved name and label; §8.2).
 
 ### 5.3 Guest login user and session
 
@@ -740,8 +745,8 @@ With `client_auth = "none"` the block is `{"method": "none"}` and carries no
 credential at all.
 
 The request is **not** trusted merely because it is well-formed: the `client_auth`
-credential must verify against the server's trust roots (§7.3) and the ACL (§8)
-must accept the resulting identity. There is no `command`/`command_display`
+credential must verify against the server's trust roots (§7.3) before the
+`[[rule]]` policy (§8) decides the outcome. There is no `command`/`command_display`
 field; the command is deliberately absent (§5.4).
 
 ### 6.2a Pre-dialog acknowledgement (`type: "auth_pending"`)
@@ -824,7 +829,7 @@ strings):
 | `method`      | Fields present | Meaning                                                                                                       |
 | ------------- | -------------- | ------------------------------------------------------------------------------------------------------------- |
 | `"transport"` | _(none)_       | mTLS only. No `alg`/`key_id`/`signature`: the channel certificate is the credential.                            |
-| `"none"`      | _(none)_       | No credential is carried at all; accepted only when the server is configured the same way, with `acl.mode = "none"`. |
+| `"none"`      | _(none)_       | No credential is carried at all; accepted only when the server is configured the same way (`client_auth = "none"`). |
 
 A `client_auth.method` that does not match the server's configured
 `client_auth` is rejected outright, as is a missing block.
@@ -914,7 +919,8 @@ one. Source of truth: `nix/packages/sudo-auth-proxy/sudo-auth-proxy.py`.
 
 - `key_id` format: `SHA256:` + base64(SHA-256 of the DER
   **SubjectPublicKeyInfo**) of the peer leaf certificate, base64 padding
-  stripped. The same string appears in `[acl].trusted_fingerprints`.
+  stripped. The same string is what a `match.machine` rule (or a client `[acl]`
+  pin) matches.
 - Fingerprint lists accept the padded or unpadded form and normalise to the
   unpadded one.
 - There is no `alg`/`signature`/`public_key`/`cert` field anywhere in the
@@ -959,8 +965,8 @@ one. Source of truth: `nix/packages/sudo-auth-proxy/sudo-auth-proxy.py`.
   `json.dumps`-encoded message in the script source; `swiftDialog` applies
   `escape_swiftdialog_markup` after the allow-list pass (§11.2).
 
-The `[security]` and `[acl]` tables the implementation actually parses are
-listed in §7.9 and §8.5.
+The `[security]`/`[mtls]` tables and the document-level `[[rule]]`/`[labels]`
+the implementation actually parses are listed in §7.9, §7.7 and §8.
 
 ---
 
@@ -1015,7 +1021,7 @@ How the **server** knows who is asking. Exactly one value:
 | Value         | Meaning                                                                                                                                                                     |
 | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `"transport"` | **Client authentication is delegated to the transport:** the mTLS peer certificate authenticates the requester (CA chain + EKU), with no separate request signature. Requires `transport_encryption = "mtls"`. |
-| `"none"`      | **No requester authentication.** The request carries a `{"method": "none"}` marker and nothing else. Only accepted when the `[acl]` is the matching `mode = "none"` (a fail-closed XOR, §8.3), and the service warns loudly at startup.        |
+| `"none"`      | **No requester authentication.** The request carries a `{"method": "none"}` marker and nothing else. Only accepted when the server is configured the same way (`client_auth = "none"`), and the service warns loudly at startup.        |
 
 The former `"ssh"` (SSH-key or ssh-agent signatures, verified against a
 `trusted_keys` fingerprint list) and `"x509"` (an application-layer certificate
@@ -1024,7 +1030,7 @@ existed to serve them: the `ssh_signing_key`/`ssh_agent`/`ssh_agent_socket`/
 `ssh_key`/`client_cert`/`client_key`/`ca_file`/`client_required_oid`/
 `trusted_server_keys`/`server_signing_key`/`trusted_keys` configuration keys, the
 signature algorithm allow-lists, the SSH wire-blob key encoding, the ssh-agent
-protocol client, and the `[acl].trusted_keys` SSH fingerprint list.
+protocol client, and the `[acl].trusted_keys`-style SSH fingerprint list.
 
 > **What this costs.** An SSH-key or X.509 credential could be used _without_
   paying for a TLS handshake per `sudo`, and it identified the requester
@@ -1090,7 +1096,7 @@ mints the host certificate with **all three server OIDs** and a guest client
 certificate with **all three client OIDs**. The OIDs therefore separate the
 _server_ role from the _client_ role, but they do **not** prevent a certificate
 minted for one service from being used for another. In particular, under
-`acl.mode = "ca"` any guest's tartarus client certificate (which carries
+a CA-chained mTLS credential any guest's tartarus client certificate (which carries
 `1.3.6.1.4.1.99999.1.2`) authorizes sudo-auth-proxy, clipboard-bridge and
 ssh-agent-proxy alike. This is one CA-issued identity per guest; per-service
 issuance is future work. The table below records the intended mapping:
@@ -1138,8 +1144,9 @@ critical extensions rejected).
 - **Nothing is copied into the Nix store except public material.** Private keys
   are referenced by path and written by `ca.py` at runtime; the store is
   world-readable.
-- The requester's certificate is what `[acl] mode = "list"` pins (its leaf SPKI
-  fingerprint) and what `mode = "ca"` chains to the CA.
+- The requester's certificate is what the transport verifies: its leaf SPKI
+  fingerprint is the identity a `match.machine` rule can pin, and the chain is
+  verified against `[mtls].ca_file`.
 
 ### 7.9 `[security]` table as parsed
 
@@ -1176,29 +1183,30 @@ two listener tables:
 
 - globals: `mode`, `dialog_program`, `debug`, `approver`, `client_version`,
   `guest_hint`;
-- `[transport_defaults]` — one table of default listener fields, deep-merged
+- `[listener_defaults]` — one table of default listener fields, deep-merged
   into every entry by the Python;
-- `[[transports]]` — a **non-empty array** of listener tables, each requiring
+- `[[listeners]]` — a **non-empty array** of listener tables, each requiring
   `type`.
 
-Each listener table (`[transport_defaults]` and every `[[transports]]` entry)
-accepts exactly: `type` (entry only), `port`, `cid`, `host`, `socket`,
-`socket_dir_mode`, `socket_mode`, `connect_timeout`, `decision_timeout`,
-`recv_timeout`, `max_connections`, `server_read_timeout`, `resolution`, and the
-per-listener tables `[security]`, `[mtls]` and `[acl]` (with the keys of this
-section, §7.7 and §8.5). A flat `transport`/`cid`/`security`/… key written
-alongside `transports` is **ambiguous and rejected**. Duplicate `type`s are
-allowed (two `unix` listeners); duplicate `socket` paths fail at bind time, not
-in the schema.
+Each listener table (`[listener_defaults]` and every `[[listeners]]` entry)
+accepts exactly: `type` (entry only), `name` (entry only, unique), `port`,
+`cid`, `host`, `socket`, `socket_dir_mode`, `socket_mode`, `connect_timeout`,
+`decision_timeout`, `recv_timeout`, `max_connections`, `server_read_timeout`,
+`resolution`, and the per-listener tables `[security]` and `[mtls]`
+(with the keys of this section and §7.7). There is no per-listener `[acl]`. A flat
+`transport`/`cid`/`security`/… key written alongside `listeners` is **ambiguous
+and rejected**. Duplicate `type`s are allowed (two `unix` listeners); duplicate
+`socket` paths fail at bind time, not in the schema.
 
 **Legacy flat schema.** For Python compatibility only (§14.3), a document with no
-`transports` array is read as a **single implicit listener**: top level `mode`,
+`listeners` array is read as a **single implicit listener**: top level `mode`,
 `transport`, `cid`, `host`, `port`, `socket`, `socket_dir_mode`, `socket_mode`,
 `connect_timeout`, `decision_timeout`, `recv_timeout`, `max_connections`,
 `server_read_timeout`, `dialog_program`, `resolution`, `debug`, `approver`,
-`client_version`, `guest_hint`; the tables `[security]`, `[acl]` and `[mtls]`;
-and the keys listed for each in this section, §8.5 and §7.7. `[acl].labels` is
-the one free-form table (fingerprint → display label).
+`client_version`, `guest_hint`; the tables `[security]` and `[mtls]`; the
+document-level `[[rule]]` list and `[labels]` map; and the keys listed for each
+in this section, §8 and §7.7. `[labels]` is the one free-form table
+(fingerprint → display label).
 
 Values are still typed where they are used, so the schema checks *names*;
 `examples/sudo-auth-proxy-server.toml` (legacy flat) is checked against it by the
@@ -1219,186 +1227,137 @@ under mTLS both auth knobs are forced to `"transport"`. Paths inside `[mtls]` ar
 resolved relative to the **config file's directory**, and a leading `~/` is
 expanded.
 
-## 8. Authorization model (who is allowed to use the mechanism)
+## 8. Authorization model
 
-**Principle: nobody is allowed by default; a request is eligible only if its
-cryptographically verified credential matches the configured policy, evaluated
-_before_ the dialog is shown.**
+Authorization is split across the two ends, and the split is deliberate.
 
-This ACL governs **access to the proxy mechanism**, not access to `sudo`: an
-unlisted requester can still elevate through any other PAM method the guest
-offers. To make the proxy a sole gate, the other methods must be disabled _and_ a
+- **The client decides *who may approve*.** Its `[acl]` pins the **server**
+  identity it will trust to answer. Without it the client still verifies the
+  server chain + EKU against `[mtls]` (§7.2), but accepts any CA-signed server;
+  with it, a fake or wrong-service server is refused even when it holds a
+  CA-signed certificate. This is the client's protection against an impostor
+  talking it into elevating.
+- **The server decides *how to answer*.** It has **no cryptographic ACL table**.
+  When `client_auth = "transport"` the mTLS transport authenticates the
+  requester, and the ordered, document-level `[[rule]]` list decides
+  `allow`/`ask`/`deny`. A `client_auth = "none"` listener has no credential, so
+  a rule can only match it with an empty/`*`-only selector.
+
+This governs **access to the proxy mechanism**, not access to `sudo`: to make
+the proxy a sole gate the other PAM methods must be disabled *and* a
 non-ignorable `deny` enforced — which is **not implementable with `pam_exec`**
 and requires the native PAM module of §17 (see §10.3). This distinction is
 deliberate (review log Rank 10).
 
-The ACL matches **only cryptographic material** — CA-signed client certificates
-and their fingerprints, or a deliberate "no credential at all". It deliberately
-does **not** match the transport, the destination, the socket path, the network
-address, or a self-reported guest name (review log S11, §19.7). Those are
-metadata: they cross transports badly and can be spoofed, so they are never an
-authorization input.
+### 8.1 Client `[acl]` — who may approve
 
-### 8.1 Modes
+The client `[acl]` is **crypto material only**, never request metadata, and it is
+never read from the wire. It accepts a server whose certificate matches **any**
+of the following:
 
-Server config `[acl]`:
+| Key                    | Type / values                                    | Notes                                                                 |
+| ---------------------- | ------------------------------------------------ | --------------------------------------------------------------------- |
+| `trusted_fingerprints` | list of `SHA256:...` server leaf SPKI fingerprints | Authoritative on a match.                                           |
+| `trusted_names`        | list of `fnmatch` patterns                       | Matched against the server certificate's CN/DNS SAN. Authoritative on a match. |
 
-| `mode`   | Meaning                                                                                                                |
-| -------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `"ca"`   | Accept any mTLS credential that chains to a configured trusted CA and carries the service EKU OID.                       |
-| `"list"` | Accept only credentials whose **leaf SPKI fingerprint** is explicitly listed. An empty list denies everyone.              |
-| `"none"` | Authorize **every** request, because `client_auth = "none"` leaves no credential to authorize. Accepted only when the configured `client_auth` is also `"none"` (a fail-closed XOR) and no trust material is set. |
+At least one of the two must be set when `[acl]` is present (an empty pin would
+trust any CA-signed server, so it is refused). The check runs **after** the TLS
+handshake, on the wrapped socket, in addition to the CA-chain + EKU verification
+the handshake already performed.
 
-### 8.2 What is matched
+```toml
+[acl]
+trusted_fingerprints = ["SHA256:AbCdEf..."]  # pin the host server's leaf SPKI
+# trusted_names = ["host-*"]                 # ... or its certificate CN/SAN
+```
 
-- **Certificate SPKI fingerprint** — `SHA256:...`, the mTLS leaf's
-  SubjectPublicKeyInfo hash (`trusted_fingerprints`, for `mode = "list"`; an
-  optional extra pin in `mode = "ca"`).
-- **CA chain + EKU** — for `mode = "ca"`, the leaf must chain to `ca_file` and
-  carry `required_oid`.
-- An optional **label** attached to a trusted credential, used only to name it in
-  the dialog/log. It is not an authorization input and is never accepted from the
-  requester.
-- **Not matched:** `PAM_USER`, `PAM_RUSER`, `PAM_TTY`, `rhost`, socket path, IP,
-  CID, or `guest_hint`. The former SSH-key fingerprint list (`trusted_keys`) is
-  **gone** along with `client_auth = "ssh"` (§7.3).
+Validation is fail-closed at startup: a fingerprint entry must start with
+`SHA256:` and decode to exactly 32 bytes (padding is normalised away); an unknown
+key, a non-string name or an empty pin is a startup error.
 
-### 8.3 Defaults and fail-closed
+### 8.2 Server rules (`[[rule]]`) — how to answer
 
-- Default is deny. Empty trust lists allow nobody; there is no wildcard shortcut.
-- An unknown or unverifiable credential is rejected and logged, never prompted.
-- `mode = "none"` and `client_auth = "none"` must agree: the pair is an XOR.
-  `client_auth = "none"` without the ACL (and vice versa) is a startup error,
-  never a silent decision.
-- A request that fails the ACL is answered with a `deny` (authenticated by mTLS
-  when `server_auth = "transport"`), or not answered — never silently ignored.
+Rules are a single **document-level** list — never per listener — ordered and
+evaluated first-match-wins with **no merging between rules**. This ordering is
+**security-critical**: a permissive rule written above a restrictive one takes
+precedence, so rule *order* is a policy decision, not a formatting detail.
+
+| `policy` | Effect                                                          |
+| -------- | --------------------------------------------------------------- |
+| `allow`  | reply `allow` immediately, without a dialog                     |
+| `ask`    | show the confirmation dialog (the default when nothing matches) |
+| `deny`   | reply `deny` immediately, without a dialog                      |
+
+Each rule has an optional `[rule.match]` table; every selector is an `fnmatch`
+glob written as a bare string or a list of globs. An empty/absent selector
+matches anything:
+
+| Selector             | Matched against                                                                                                                        |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `match.machine`      | Any requester name the server holds: the `resolution` friendly name (`mofos` VM name, certificate CN, tartarus name), the `[labels]` entry, and the verified credential (`SHA256:...` or `none`). |
+| `match.listeners`    | The **name** the accepting listener was given in its `[[listeners]]` entry (§3.4). An unnamed listener matches only `*`/empty.          |
+| `match.target_user`  | The effective target account (`root` for a plain `sudo`; see §11.1).                                                                    |
+| `match.invoking_user`| The invoking user.                                                                                                                     |
+| `match.service`      | The PAM service (`sudo`, `su`, `login`).                                                                                               |
+
+`match.target_user`/`match.invoking_user`/`match.service` are self-reported by the
+guest. They refine the decision but can never authorize a request the transport
+did not authenticate; the human approver sees them too. The verified credential
+is the only identity input (§8.3).
+
+### 8.3 Fail-closed defaults
+
+- No rule matching means `ask`: the human is prompted. There is no wildcard
+  `allow` unless the operator writes one.
+- A permissive rule is an explicit, auditable line in the config; it can never
+  be reached by an unauthenticated peer through a specific `match.machine`
+  pattern (an unresolved peer has the `none` sentinel as its only identity, which
+  no specific pattern matches).
+- An auto-decision (`allow`/`deny`) is answered immediately and logged; the
+  client's first-frame bound (§6.2a) still applies, so no dialog is raised.
 - `resolution = "none"` (or an unresolved peer) yields **no matching identity**
-  (§11.5): the resolved name is display-only, so only a `"*"`/empty `identity`
-  selector can match. Never authorize an unauthenticated peer by a specific
-  display-name pattern.
+  (§11.5): the resolved name is display-only, so only an empty/`*`-only
+  `match.machine` selector can match.
+- `[labels]` (top-level) maps a fingerprint to a display/log label. It is **not**
+  an authorization input and is never accepted from the requester.
 
 ### 8.4 Worked examples
 
-Any credential that chains to the tartarus CA with the client EKU (the shipped
-configuration for the `unix` transport):
+Auto-allow a known guest and prompt for everything else:
 
 ```toml
-[acl]
-mode = "ca"
-ca_file = "./ca.crt"
-required_oid = "1.3.6.1.4.1.99999.1.2"
-```
+[labels]
+"SHA256:AbCdEf..." = "template-nixos"
 
-Or pin specific mTLS leaf SPKI fingerprints:
-
-```toml
-[acl]
-mode = "list"
-trusted_fingerprints = ["SHA256:AbCdEf...", "SHA256:GhIjKl..."]
-```
-
-Unauthenticated callback transport: authorizes every request on purpose:
-
-```toml
-[acl]
-mode = "none"
-```
-
-### 8.5 `[acl]` table as parsed
-
-The server reads exactly these keys; the client never sees this table.
-
-| Key                    | Mode         | Type / values                                     | Notes                                                                                                      |
-| ---------------------- | ------------ | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `mode`                 | both         | `"list"` (default) \| `"ca"` \| `"none"`          | Exactly one mode; there is no `ca` + `list` combination. A missing table is a valid **deny-all** `"list"` policy. |
-| `trusted_fingerprints` | `list`, `ca` | list of `SHA256:...` mTLS leaf SPKI fingerprints  | In `list`, the allow-list. In `ca`, an **optional** additional leaf-SPKI pin on top of the CA chain.        |
-| `ca_file`              | `ca`         | path (PEM)                                        | Trusted CA. Required in `ca`; forbidden in `list`. Resolved against the config directory.                   |
-| `required_oid`         | `ca`         | OID string                                        | EKU the requester certificate must carry. Required in `ca`; forbidden in `list`.                            |
-| `labels`               | all but `none` | table: `SHA256:...` → string                    | Display/log label for a credential. **Not** an authorization input and never accepted from the requester.   |
-| `rule`                 | all          | array of tables (`[[acl.rule]]`)                  | Optional approval rules (§8.6); first match wins, no match means `ask`. Accepted under every mode.          |
-
-Validation rules (all fail closed, at startup):
-
-- A fingerprint entry must start with `SHA256:` and decode to exactly 32 bytes;
-  padding is accepted and normalised away.
-- `mode = "ca"` requires `ca_file` and `required_oid`, and the CA file must be
-  readable at load time.
-- `mode = "list"` forbids `ca_file`/`required_oid` (use `mode = "ca"`).
-- `mode = "none"` forbids **all** trust material (`trusted_fingerprints`,
-  `ca_file`, `required_oid`): a pin the operator believes is enforced must never
-  be silently ignored.
-
-> **mTLS chain limitation (audit A12).** `acl.mode = "ca"` rebuilds the chain
-> from the peer **leaf DER only** (`ssl` exposes the peer certificate, not the
-> sent chain). A single-tier CA — the tartarus CA — validates correctly; a
-> **multi-tier** mTLS CA would need its intermediate certificates passed to the
-> ACL verifier. `ca.py` is single-tier today, so this is latent. Use
-> `mode = "list"` (leaf SPKI pins) for a multi-tier mTLS deployment until the
-> chain is plumbed through.
-
-The Nix home-manager module exposes this table **per listener** as
-`tartarus.sudo-auth-proxy.server.transports[*].acl.{mode, trustedFingerprints,
-caFile, requiredOid, rule}` (and `transportDefaults.acl.*` for the shared
-defaults); `labels` is currently only reachable through the free-form
-`extraSettings`/`settings` escape hatch. The shipped host module gives its
-`unix` listener `acl.mode = "ca"` with the tartarus CA and the sudo client OID
-(audit A1), and `acl.mode = "none"` on the unauthenticated callback listeners, so
-a configured guest is authorized without an operator-maintained fingerprint
-list.
-
-### 8.6 Approval rules (`[[acl.rule]]`)
-
-The ACL above is the **authorization gate**: it decides whether a credential may
-use the mechanism at all. The optional `[[acl.rule]]` list is a second,
-**approval** refinement evaluated only *after* `authorize_request` accepts the
-credential. Rules can therefore never grant access the ACL denied; they only
-decide how an already-authorized request is answered:
-
-| `policy` | Effect                                                      |
-| -------- | ----------------------------------------------------------- |
-| `allow`  | reply `allow` immediately, without a dialog                 |
-| `ask`    | show the confirmation dialog (the default when nothing matches) |
-| `deny`   | reply `deny` immediately, without a dialog                  |
-
-Rules are evaluated in file order and the **first match wins** — there is no
-merging, exactly like `ssh-agent-proxy`'s rule list. Each rule has these
-`fnmatch` glob selectors; `*` (or an omitted selector) matches anything:
-
-| Key             | Matched against                                                                                                     |
-| --------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `identity`      | Any requester name the server holds: the `resolution` friendly name (`mofos` VM name, certificate CN, tartarus name), the ACL `labels` entry, and the verified credential (`SHA256:...` or `none`). |
-| `target_user`   | The effective target account (`root` for a plain `sudo`; see §11.1).                                                 |
-| `invoking_user` | The invoking user.                                                                                                  |
-| `service`       | The PAM service (`sudo`, `su`, `login`).                                                                            |
-| `policy`        | `allow` \| `ask` \| `deny` (default `ask`).                                                                          |
-
-Worked example — auto-allow a known guest, prompt for everything else:
-
-```toml
-[acl]
-mode = "ca"
-ca_file = "./ca.crt"
-required_oid = "1.3.6.1.4.1.99999.1.2"
-
-[[acl.rule]]
-identity = "template-nixos"   # the mofos name from `resolution = "mofos"`
-target_user = "root"
-service = "sudo"
+[[rule]]
+match.machine = "template-nixos"   # the mofos name from `resolution = "mofos"`
+match.target_user = "root"
+match.service = "sudo"
 policy = "allow"
 
-[[acl.rule]]
-identity = "*"
+[[rule]]
 policy = "ask"
 ```
 
-Because `identity` also matches the ACL label and the verified fingerprint, a
-rule can pin a credential directly (`identity = "SHA256:AbCdEf..."`) or target a
-friendly name. An unknown key, a non-string selector or a `policy` other than
-`allow`/`ask`/`deny` is a startup error (fail closed, like the rest of the
-schema). Rules are accepted under every ACL mode, including `none`, because they
-inspect only display/approval metadata — never the credential the ACL is
-responsible for.
+Scope a rule to one listener, and pin a credential directly by fingerprint:
 
+```toml
+[[rule]]
+match.listeners = ["remote-guest"]
+match.machine = ["SHA256:AbCdEf..."]
+policy = "allow"
+```
+
+An unknown key, an unknown `[rule.match]` key, a selector that is neither a
+string nor a list of strings, or a `policy` other than `allow`/`ask`/`deny` is a
+startup error (fail closed, like the rest of the schema).
+
+The Nix home-manager module exposes the document-level list as
+`tartarus.sudo-auth-proxy.server.rule` (each entry a `match` sub-table plus
+`policy`) and the map as `server.labels`; the client pin is
+`tartarus.sudo-auth-proxy.acl.{trustedFingerprints, trustedNames}`. The shipped
+host module leaves the rule list empty (every request prompts), and the guest
+client may set its own pin.
 ---
 
 ## 9. Socket and file permissions
@@ -1473,7 +1432,7 @@ Permissions are part of the security model, not an afterthought.
 | Situation                                                      | Control                                                                                                                                                                                                       |
 | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Host process of another user connects to the server socket     | `0700` dir + `SO_PEERCRED` uid check.                                                                                                                                                                         |
-| Host process of the _same_ user connects                       | It is the same approver at the OS level, but it must still present a trusted mTLS credential or the ACL rejects it; otherwise it can only cause a prompt, which is logged. No cross-user escalation. |
+| Host process of the _same_ user connects                       | It is the same approver at the OS level, but it must still present a trusted mTLS credential or the `[[rule]]` policy denies it; otherwise it can only cause a prompt, which is logged. No cross-user escalation. |
 | Guest process races the tunnel listener                        | mTLS prevents forged allows; socket `lstat` + (Linux) `SO_PEERCRED`→`/proc/<pid>/exe` limits misrouting.                                                                                                 |
 | Fake server on a `server_auth = "none"` socket                 | **Not mitigated**; that is exactly why `"none"` is not recommended and is strongly discouraged on `tcp` (T26, §7.2).                                                                                          |
 | Same guest UID redirects a socket to another legitimate tunnel | **Residual risk (R6)**; only fully fixed by per-person guest accounts.                                                                                                                                        |
@@ -1508,7 +1467,7 @@ Three independent bounds are configured. With the pre-dialog acknowledgement
 | `decision_timeout` | `120 s` | the wait for the final `auth_response` — the human decision                 | wait indefinitely |
 
 The **server** has its own two pre-authentication resource bounds (audit A3/N2),
-exposed **per listener** as the `transports`/`transportDefaults` fields
+exposed **per listener** as the `listeners`/`listenerDefaults` fields
 `maxConnections` / `serverReadTimeout` and emitted into the generated server TOML
 as `max_connections` / `server_read_timeout` (audit N5). Each listener carries its
 own cap and read timeout; their defaults match the Python constants.
@@ -1655,11 +1614,11 @@ tartarus.sudo-auth-proxy = {
 
 This is exactly what the tartarus guest module emits for a guest that sets
 `services.sudoAuthProxyTransport = "unix"`, and the mirror image of what the host
-module configures for its server (`acl.mode = "ca"` with the same CA and client
-OID). For a callback transport (`vsock`/`tcp`) the shipped configuration is the
-opposite trade: `transport_encryption = "none"`, `serverAuth = "none"`,
-`clientAuth = "none"` and `acl.mode = "none"`, because the tartarus-internal
-channel is private by construction. The MOFOS guest
+module configures for its server (an mTLS `unix` listener with the same CA and
+client OID). For a callback transport (`vsock`/`tcp`) the shipped configuration is
+the opposite trade: `transport_encryption = "none"`, `serverAuth = "none"` and
+`clientAuth = "none"`, because the tartarus-internal channel is private by
+construction. The MOFOS guest
 (`hosts/nixos/mofos/default.nix` in nixcfg) uses that form on `vsock` port 65012.
 
 > `recvTimeout` bounds the `auth_pending` ack, which the server writes before it
@@ -1804,20 +1763,18 @@ it never gates anything and is sanitised like every other field.
 degrades to the raw label when the binary is missing, exits non-zero, or returns
 malformed JSON — resolution is cosmetic and must never delay or fail a prompt.
 `resolution` is **per listener**: the Nix module exposes it as
-`tartarus.sudo-auth-proxy.server.transports[*].resolution` (or
-`transportDefaults.resolution` for the shared default). An unset (`null`)
+`tartarus.sudo-auth-proxy.server.listeners[*].resolution` (or
+`listenerDefaults.resolution` for the shared default). An unset (`null`)
 listener defaults to `certificate` when it is mTLS and `tartarus` otherwise. The
-resolved name is one of the candidates an `[[acl.rule]]` `identity` selector
-matches (§8.6).
+resolved name is one of the candidates a `[[rule]]` `match.machine` selector
+matches (§8.2).
 
 **`resolution = "none"` is wildcard-only.** The resolved name is a *display*
 label, never a matching identity: with `none` the identity is unset, so only an
-empty `identity` selector or `"*"` can match. A specific `identity` pattern can
-never authorize an unauthenticated peer (it would be name spoofing by label).
-This is enforced in ssh-agent-proxy by a dedicated `matches_vm(None)` rule
-(see `docs/ssh-agent-proxy.md` §5.2) and is the model the `[[acl.rule]]`
-matching must follow: match cryptographic material, never a display string. The
-`mofos` resolver is available here at parity with ssh-agent-proxy.
+empty `match.machine` selector or `"*"` can match. A specific pattern can never
+match an unauthenticated peer (it would be name spoofing by label). This mirrors
+ssh-agent-proxy's `matches_machine(None)` rule (see `ssh-agent-proxy.md`
+§5.2). The `mofos` resolver is available here at parity with ssh-agent-proxy.
 
 ---
 
@@ -1876,10 +1833,10 @@ untrusted; host user space is trusted but not other host users; CA keys are root
 | T1  | Forge an `allow` into the client                                                                                       | ADV1      | mTLS (`server_auth = "transport"`); the TLS channel authenticates the responder, and the client verifies nonce + request digest. With `server_auth = "none"` this is **not** mitigated (§7.2, §6.6) |
 | T2  | Replay an old `allow`                                                                                                  | ADV1      | Client **single-use nonce** + request digest + expiry; no server-side cache needed. (§6.6)                                                                                                |
 | T3  | Change request fields between approval and execution                                                                   | ADV1/ADV2 | `request_digest` recomputed by the client and bound to the nonce; mismatch rejected. (§6.4)                                                                                                |
-| T4  | Guest/user B impersonates A                                                                                            | ADV2      | The mTLS client certificate is verified against the server's trust roots and the ACL; the listener's socket carries no identity. **Caveat A4:** the service EKU OIDs do not isolate services today — a guest's tartarus client certificate is valid for every tartarus service (§7.6). With `client_auth = "none"` there is nothing to verify at all (§7.3, §8) |
+| T4  | Guest/user B impersonates A                                                                                            | ADV2      | The mTLS client certificate is verified against the server's trust roots; the listener's socket carries no identity. **Caveat A4:** the service EKU OIDs do not isolate services today — a guest's tartarus client certificate is valid for every tartarus service (§7.6). With `client_auth = "none"` there is nothing to verify at all (§7.3, §8) |
 | T5  | Person B receives/answers person A's prompt (different host users)                                                     | ADV3      | Per-host-user server and its listeners in the owner's runtime dir; `SO_PEERCRED` uid check. (§4.2, §9.1)                                                                                  |
 | T6  | Person B receives person A's prompt (same guest account, different host users)                                         | ADV3      | Per-session guest bind path + `SUDO_AUTH_PROXY_SOCK` (guaranteed by `sudoers env_keep`) selects the session owner. Same-UID redirection remains R6; multiplexer caveat §4.6.              |
-| T7  | A non-whitelisted requester triggers elevation                                                                         | ADV1      | Cryptographic ACL evaluated before the dialog, default deny. (§8)                                                                                                                         |
+| T7  | A requester with no matching rule triggers elevation                                                                    | ADV1      | No rule matching means `ask`: the human is prompted (the `[[rule]]` list is the policy; §8).                                                                                              |
 | T8  | Network attacker MITM on a callback transport                                                                          | ADV4      | `tcp` defaults to mTLS (EKU + CA), `vsock` optional. `tcp` + `none` is allowed but leaves both confidentiality *and* authentication to the network: a MITM can forge a decision. (§7.4) |
 | T9  | Socket pre-creation / listener race in the guest                                                                       | ADV1      | mTLS defeats forgery (with `server_auth = "none"` it does not); selector-only resolution (no fallback) plus `lstat`/peer-process check (`sshd`, root-owned, not peer-owned — audit A7) limit redirection. Redirection to a real tunnel remains R6. (§9.2) |
 | T10 | Another local host process connects to the single server socket                                                        | ADV3      | `0700` dir, `0600` socket, `SO_PEERCRED` uid check, **and** it must still present a trusted credential (§8). (§9.1)                                                                       |
@@ -1899,7 +1856,7 @@ untrusted; host user space is trusted but not other host users; CA keys are root
 | T24 | Stale guest socket after a crashed session → silent degradation / spoof target                                         | ADV1      | **No explicit teardown hook (A8):** `sshd` removes its own forward on session close and `StreamLocalBindUnlink` handles a same-name re-bind; a stale path is never reused (per-session token) and the first-frame receive timeout bounds a bound-but-unlistened read. (§4.3, §9.2) |
 | T25 | **macOS** peer verification is weaker: no `/proc`, and `getpeereid` returns only uid/gid (no pid)                      | ADV1      | Linux peer-process check unavailable; rely on socket-path integrity/ownership, the random path token (NF7), and server authentication. Accepted residual **R11**. (§9.2, §12.6)           |
 | T26 | A fake server answers on a `server_auth = "none"` socket                                                               | ADV1      | **Not mitigated**; `"none"` is not recommended and is strongly discouraged on `tcp`. (§7.2, §12.6 R13)                                                                                    |
-| T27 | A same-uid host process connects to the single server socket and generates prompts                                     | ADV3      | It must present a trusted `client_auth` credential or the ACL rejects it; otherwise it can only cause a (logged) prompt. No cross-user escalation. (§8, §9.1)                             |
+| T27 | A same-uid host process connects to the single server socket and generates prompts                                     | ADV3      | It must present a trusted `client_auth` credential for a specific rule to match; otherwise it can only cause a (logged) prompt. No cross-user escalation. (§8, §9.1)                             |
 | T28 | A multiplexer pins a stale/foreign selector                                                                            | ADV3      | Selector-only resolution + fail-closed + cryptographic request binding; per-person guest accounts are the full fix. Accepted residual **R12**. (§4.6)                                     |
 
 ### 12.6 Residual risks (accepted)
@@ -1927,7 +1884,8 @@ untrusted; host user space is trusted but not other host users; CA keys are root
   pre-check) or interactive/automation use degrades (review log Rank 5).
 - **R8** **Metadata fields are unverifiable.** `invoking_user`, `target_user`,
   `tty`, `rhost` and `cwd` are guest-provided. They are shown and bound but are
-  not authorization inputs; the ACL matches only the credential (§8).
+  not authorization inputs; a `match.machine` selector matches only the
+  credential/resolved name/label (§8.2).
 - **R9** **Predictable/raceable guest socket path.** Without the per-session
   random token (NF7) a same-UID guest process could predict and race the
   `RemoteForward` bind path. The token makes the name unguessable, but the bind
@@ -1968,7 +1926,7 @@ untrusted; host user space is trusted but not other host users; CA keys are root
 
 - Protecting against a compromised host OS or host desktop.
 - Protecting against a compromised hypervisor.
-- Preventing a guest from running the client; the ACL decides whether it may.
+- Preventing a guest from running the client; the `[[rule]]` policy decides whether it may.
 
 ---
 
@@ -1984,7 +1942,7 @@ untrusted; host user space is trusted but not other host users; CA keys are root
 | "Peer certificate missing required EKU OID" | Cert minted for another service                                 | Re-issue with the sudo-auth-proxy EKU (CA tooling).                                                             |
 | Prompt appears on the wrong user's screen   | Multiplexer pinned a stale selector, or shared account          | Restart the multiplexer inside the correct SSH session; use per-person guest accounts (§4.6, R12).              |
 | Fake/forged allow suspected                 | `server_auth = "none"`, so nothing authenticated the responder | Set `transport_encryption = "mtls"` (which forces `server_auth = "transport"`); there is no signing fallback (§7.2). |
-| Request rejected as unauthorized            | Credential not trusted                                          | Add the mTLS leaf SPKI to `[acl].trusted_fingerprints`, or the CA/EKU for `mode = "ca"` (§8.5).                        |
+| Request auto-denied                         | A `policy = "deny"` rule matched                                  | Reorder the `[[rule]]` list (first match wins) or adjust its `match` (§8.2).                                    |
 | Plaintext-`tcp` warning                     | `transport_encryption = "none"` on `tcp`                        | Expected on a trusted network; prefer mTLS. Nothing authenticates the request or the response (§7.4).          |
 | `transport_encryption = 'none' requires an explicit client_auth = 'none' …` | A config that turns authentication off without saying so | Write `client_auth = "none"` and `server_auth = "none"` explicitly, or use `mtls` (§7.5).                             |
 | `'client_auth' must be written in [security], but it is written at the top level` | The `[security]` keys were written **above** the `[security]` header, so TOML made them top-level keys and the service saw no `[security]` table at all (§7.9) | Move those lines under `[security]`. The error names the key and the table it belongs to.                      |
@@ -2038,8 +1996,8 @@ socket,socketDirMode,socketMode,connectTimeout,decisionTimeout,recvTimeout,
 maxConnections,serverReadTimeout,resolution,security,mtls,acl}` no longer exist
 (the same applies to `extraServer`). A consumer that set them must migrate to:
 
-- `server.transports = [ { type = "…"; … } ]` — one entry per listener, and
-- `server.transportDefaults = { … }` — shared per-field defaults deep-merged into
+- `server.listeners = [ { type = "…"; … } ]` — one entry per listener, and
+- `server.listenerDefaults = { … }` — shared per-field defaults deep-merged into
   every entry by the Python.
 
 A partially-migrated config therefore **fails evaluation loudly**, rather than
@@ -2062,8 +2020,9 @@ Python; there is no Nix option for it.
   (recommended); `none` is accepted explicitly but **insecure** and emits a
   warning. `server_auth = "none"` is accepted but not recommended and is strongly
   discouraged on `tcp` (§7.2, §7.4, §7.5).
-- New keys: the `[acl]` authorization table (§8.5), `socket`, `socket_dir_mode`,
-  `socket_mode`, `recv_timeout`, `response_ttl`, `clock_skew` (§7.9, §8.5).
+- New keys: the document-level `[[rule]]` approval list and `[labels]` map
+  (§8.2), `socket`, `socket_dir_mode`, `socket_mode`, `recv_timeout`,
+  `response_ttl`, `clock_skew` (§7.9, §7.7, §8).
 - **Every signing/auth key is gone.** `[security].ssh_signing_key`,
   `ssh_agent`, `ssh_agent_socket`, `ssh_key`, `client_cert`, `client_key`,
   `ca_file`, `client_required_oid`, `trusted_server_keys`, `server_signing_key`
@@ -2072,8 +2031,8 @@ Python; there is no Nix option for it.
   `clientCert`, `clientKey`, `caFile`, `clientRequiredOid`,
   `trustedServerKeys`, `serverSigningKey`, `acl.trustedKeys`) were removed from
   the module — a leftover setting in a Nix config is now an evaluation error,
-  which is the intent. `[acl].trustedFingerprints` remains, now meaning mTLS
-  leaf SPKI fingerprints only. See §14.2 and §7.2/§7.3.
+  which is the intent. Server-side `[acl].trustedFingerprints` is gone too: a
+  fingerprint is now pinned as a `match.machine` rule. See §14.2 and §7.2/§7.3.
 - **The config is validated against an exact schema (§7.9).** This is a breaking
   change for hand-written files: an unknown key — including one of the removed
   keys above — now aborts startup instead of being ignored, and a key written on
@@ -2090,8 +2049,8 @@ Python; there is no Nix option for it.
   `unix` transport, which used to authenticate with an application-layer X.509
   client certificate and signed responses, now runs mTLS inside the SSH tunnel:
   `transport_encryption = "mtls"`, `client_auth = "transport"`,
-  `server_auth = "transport"`, and `acl.mode = "ca"` with the tartarus CA and
-  the sudo client OID. The host module and the guest module both ship that
+  `server_auth = "transport"`, with the tartarus CA and the sudo client OID as
+  the mTLS trust root. The host module and the guest module both ship that
   configuration.
 - The guest must have `/run/sudo-auth-proxy` `0700` **owned by the guest login
   user**, and `sshd` must `AcceptEnv SUDO_AUTH_PROXY_SOCK` and
@@ -2112,8 +2071,8 @@ Python; there is no Nix option for it.
   host for that guest with the guest in `hosts` (§15.1), set the guest transport
   to `unix`, set `transport_encryption = "mtls"` with the tartarus client
   certificate, and rebuild. Verify with a test `sudo` while logged in (§15.3).
-  The host side must be switched at the same time (`acl.mode = "ca"` with the
-  CA + client OID, `mtls.enable = true`); the shipped modules do this for you.
+  The host side must be switched at the same time (mTLS with the CA + client
+  OID, `mtls.enable = true`); the shipped modules do this for you.
 
 ### 14.6 Third-party clients
 
@@ -2121,8 +2080,9 @@ Python; there is no Nix option for it.
 (§1.2). The protocol is now specified precisely enough in §6 and §6.8 that a
 future client could be written deliberately, but there is **no compatibility
 guarantee** for any third-party client, and a peer is not trusted merely because
-it speaks the wire format — trust comes from the credential it proves and the ACL
-(§5, §8). Any third-party client requires a design review against this document.
+it speaks the wire format — trust comes from the credential it proves and the
+server's `[[rule]]` policy (§5, §8). Any third-party client requires a design
+review against this document.
 
 ### 14.7 Unauthenticated transports (`client_auth = "none"`)
 
@@ -2135,27 +2095,25 @@ enable and fails closed:
   already forces `client_auth = "transport"`) and emits a warning that any
   process able to reach the socket may trigger a prompt.
 - The client sends `client_auth = {"method": "none"}` and proves nothing.
-- The server requires the matching `[acl] mode = "none"` (an explicit
-  allow-any); `mode = "none"` refuses to carry any trust material
-  (`trusted_fingerprints`, `ca_file`, `required_oid`).
-- The Python enforces the **XOR** between the two knobs: `client_auth = "none"`
-  with a non-`none` ACL raises, and `acl.mode = "none"` with a non-`none`
-  `client_auth` raises. Disabling auth is therefore always a conscious choice on
-  both sides.
+- The server has no credential to inspect, so only an empty/`*`-only
+  `match.machine` selector can ever match such a request; the `[[rule]]` list
+  still decides `allow`/`ask`/`deny`.
+- Setting `client_auth = "none"` is the only explicit opt-in; there is no ACL to
+  pair it with. Disabling auth is therefore always a conscious choice on both
+  sides (the client must also set `client_auth = "none"`).
 
 The shipped tartarus guest/host default for the callback transport
-(`vsock`/`tcp`) is now `transport_encryption = "none"`, `client_auth = "none"`,
-`server_auth = "none"`, `[acl] mode = "none"`: the MicroVM channel is private by
-construction and runs with no crypto (`server_auth = "none"` warns
-accordingly). Either all three knobs are written out, or the process refuses to
-start.
+(`vsock`/`tcp`) is now `transport_encryption = "none"`, `client_auth = "none"`
+and `server_auth = "none"`: the MicroVM channel is private by construction and
+runs with no crypto (`server_auth = "none"` warns accordingly). Either all three
+knobs are written out, or the process refuses to start.
 
 ### 14.8 A second server instance (`extraServer`)
 
 A host can run one additional, independent server alongside the legacy
 `server`. The home-manager option
-`tartarus.sudo-auth-proxy.extraServer` has its own `transports` /
-`transportDefaults`, `extraSettings` and `name`; it runs as the unit
+`tartarus.sudo-auth-proxy.extraServer` has its own `listeners` /
+`listenerDefaults`, `extraSettings` and `name`; it runs as the unit
 `sudo-auth-proxy-<name>` with the config file
 `~/.config/sudo-auth-proxy/<name>.toml` (and its own runtime directory). This is
 what lets one host serve its tartarus guests on the callback transport **and** a
@@ -2173,16 +2131,16 @@ the root config and recurses.)
 #### NixOS / nix-darwin (the shipped path)
 
 1. Ensure the host's SSH config reaches the guest (existing tartarus setup).
-2. Enable the server and its trust roots: the per-listener `[acl]` policy and
-   `[mtls]` certificate material. **The shipped tartarus host module derives all
-   of this (audit A1):** `nix/host/services.nix` emits a `server.transports` list
-   with one listener per distinct transport the guests'
+2. Enable the server and its trust roots: the document-level `[[rule]]` policy
+   and the per-listener `[mtls]` certificate material. **The shipped tartarus
+   host module derives all of this (audit A1):** `nix/host/services.nix` emits a
+   `server.listeners` list with one listener per distinct transport the guests'
    `services.sudoAuthProxyTransport` markers ask for (`vsock`/`tcp` for
    containers and no-VSOCK guests, `unix` for the SSH-forwarded path), gives the
-   `unix` listener `acl.mode = "ca"` with the tartarus CA + sudo client OID and
-   mTLS, and gives the callback listeners `acl.mode = "none"` with no
-   encryption. Mixing transports across the guests of one host is **no longer an
-   evaluation error or warning** — the listeners coexist. Set these options by
+   `unix` listener mTLS with the tartarus CA + sudo client OID, and leaves the
+   callback listeners unencrypted. Mixing transports across the guests of one
+   host is **no longer an evaluation error or warning** — the listeners coexist.
+   The rule list is left empty (every request prompts). Set these options by
    hand only when not using the tartarus host module.
 3. Enable the SSH-forward wrapper for the chosen host patterns. The guest-side
    path template uses `%r` (resolved login user) and `%h` (destination as typed);
@@ -2246,41 +2204,41 @@ coexist, each with its own security:
 mode = "server"
 dialog_program = "zenity"
 
-[transport_defaults]
+[listener_defaults]
 port = 65001
 recv_timeout = 0.5
 decision_timeout = 120
 
-[transport_defaults.security]
+[listener_defaults.security]
 transport_encryption = "auto"
 client_auth = "transport"
 server_auth = "transport"
 
-[transport_defaults.acl]
+[listener_defaults.acl]
 mode = "list"
 
-[[transports]]
+[[listeners]]
 type = "vsock"
 cid = 2
 
-[transports.security]
+[listeners.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
-[transports.acl]
+[listeners.acl]
 mode = "none"
 
-[[transports]]
+[[listeners]]
 type = "unix"
 socket = "%t/sudo-auth-proxy/server.sock"
 
-[transports.security]
+[listeners.security]
 transport_encryption = "mtls"
 client_auth = "transport"
 server_auth = "transport"
 
-[transports.mtls]
+[listeners.mtls]
 enable = true
 ca_file = "./ca.crt"
 cert_file = "./server.crt"
@@ -2288,7 +2246,7 @@ key_file = "./server.key"
 required_oid = "1.3.6.1.4.1.99999.1.1"
 peer_required_oid = "1.3.6.1.4.1.99999.1.2"
 
-[transports.acl]
+[listeners.acl]
 mode = "ca"
 ca_file = "./ca.crt"
 required_oid = "1.3.6.1.4.1.99999.1.2"
@@ -2306,8 +2264,8 @@ required_oid = "1.3.6.1.4.1.99999.1.2"
 2. Check the port and the transport agree with the guest. The example binds
    `cid = 2` (VMADDR_CID_HOST) on port **65012**, which is what the MOFOS guest
    in nixcfg uses on its side (`tartarus.sudo-auth-proxy.port`). Both ends must
-   match, and the matching server-side requirement of `client_auth = "none"` is
-   the `[acl] mode = "none"` in the same file.
+   match, and the matching server-side requirement is `client_auth = "none"` in
+   the same file.
 3. Make sure VSOCK is available: the host kernel needs `vhost_vsock` (or
    `vmw_vsock_virtio_transport` under VMware), and the VM must be started with a
    vsock device and a CID. `modprobe vhost_vsock` and `lsmod | grep vsock`
@@ -2334,7 +2292,7 @@ required_oid = "1.3.6.1.4.1.99999.1.2"
 > parsed and resolved by the same `load_config` + `build_security` path the
 > service uses, and it resolves to `transport = "vsock"`, `cid = 2`,
 > `port = 65012`, `transport_encryption = "none"`, `client_auth = "none"`,
-> `server_auth = "none"`, `acl.mode = "none"`.
+> `server_auth = "none"`.
 
 ### 15.2 Guest
 
@@ -2359,8 +2317,8 @@ required_oid = "1.3.6.1.4.1.99999.1.2"
    make per-session routing deterministic and keep the recursion guard working
    (§4.3, §10.4).
 4. For mTLS, provision the guest's certificate and key `0600` and register the
-   trust root on the host: the CA + EKU for `acl.mode = "ca"`, or the leaf SPKI
-   in `[acl].trusted_fingerprints` for `mode = "list"`. Setting
+   trust root on the host (`[mtls].ca_file` + `peer_required_oid`), and
+   optionally pin the host's leaf SPKI in the client's `[acl]`. Setting
    `services.sudoAuthProxyTransport = "unix"` makes the tartarus guest module
    wire the tartarus client certificate automatically (audit A1).
 5. Keep the PAM rule optional (`[success=done default=ignore]`).
@@ -2403,13 +2361,13 @@ required_oid = "1.3.6.1.4.1.99999.1.2"
 
 **Identity & auth**
 
-- [ ] One listener per `server.transports` entry (any mix of `vsock`/`tcp`/`unix`); no per-guest server socket.
+- [ ] One listener per `server.listeners` entry (any mix of `vsock`/`tcp`/`unix`); no per-guest server socket.
 - [ ] `tcp` + `none` is warned as insecure (no confidentiality, no authentication).
 - [ ] `transport_encryption = "mtls"` ⇒ **both** `client_auth` and `server_auth` are `"transport"`.
 - [ ] `client_auth`/`server_auth` are each exactly `"transport"` or `"none"` — no other value is accepted anywhere in the code.
 - [ ] With `transport_encryption = "none"`, both auth knobs are written **explicitly** as `"none"` (a missing one is a startup error, never a silent default).
-- [ ] ACL matches only credentials (mTLS leaf SPKI, or a CA chain), never metadata.
-- [ ] ACL is evaluated before any dialog; default deny; `acl.mode = "none"` and `client_auth = "none"` agree (XOR).
+- [ ] The `[[rule]]` list is ordered and first-match-wins; no match means `ask` (a permissive rule above a restrictive one wins — this is intentional).
+- [ ] The client `[acl]` pins the trusted server (fingerprint and/or CN/SAN) when mTLS is not enough on its own.
 - [ ] The requester credential is the mTLS peer certificate validated by `ssl` against a root-owned CA, with the peer EKU OID enforced after the handshake.
 - [ ] Host user verified via `SO_PEERCRED`/`getpeereid`.
 
@@ -2465,8 +2423,8 @@ required_oid = "1.3.6.1.4.1.99999.1.2"
 - A session/pty-scoped recursion guard that survives into the elevated context
   (audit A5; today the guard covers only the helper process, §10.4).
 - TPM/HSM-backed certificate keys.
-- ~~Identity-based approval rules.~~ **Implemented (§8.6):** `[[acl.rule]]`
-  auto-allows/auto-denies or prompts by resolved identity. Still future work:
+- ~~Identity-based approval rules.~~ **Implemented (§8.2):** `[[rule]]`
+  auto-allows/auto-denies or prompts by `match.machine`/`match.listeners`/… . Still future work:
   two-person approval and command allow/deny policies (the command is not in the
   protocol; §5.4).
 - Out-of-band approval (phone/push) for headless approvers.
@@ -2489,7 +2447,8 @@ required_oid = "1.3.6.1.4.1.99999.1.2"
 | **mTLS**                              | Mutual TLS: the transport encryption that is also the only authentication mechanism. |
 | **EKU OID**                           | Extended Key Usage object identifier distinguishing service roles.      |
 | **Tunnel**                            | The host→guest SSH `RemoteForward` that carries the Unix socket.        |
-| **ACL**                               | The authorization policy (§8) deciding who may use the mechanism.       |
+| **ACL (client `[acl]`)**              | The client-side server pin (§8.1) deciding which server may approve.    |
+| **Rule (`[[rule]]`)**                 | The server's ordered approval policy (§8.2) deciding `allow`/`ask`/`deny`. |
 | **Callback**                          | Guest dials host (`vsock`/`tcp`).                                       |
 | **Approver**                          | The host user who answers the dialog.                                   |
 
@@ -2527,7 +2486,7 @@ inline edits above reference these IDs. No code is written until the
 | Rank 4  | Two people on the same **host** account are one principal; cross-guest within one account is a shared approval pool. | Accepted; documented in §5.6/R1/R6.                                                                                                                   |
 | Rank 5  | Fallthrough adds latency on every `sudo`.                                                                            | §10.2: connect timeout ≤200 ms + socket-existence pre-check; residual **R7**.                                                                         |
 | Q5      | Signed response should include the approver identity.                                                                | §6.3/§6.4 now sign the `approver` field.                                                                                                              |
-| Rank 10 | "Only whitelisted can elevate" is only true _through this mechanism_.                                                | Goal wording tightened (§1.4, §8); §10.3 warns the ACL gates the proxy, not `sudo`.                                                                   |
+| Rank 10 | "Only whitelisted can elevate" is only true _through this mechanism_.                                                | Goal wording tightened (§1.4, §8); §10.3 warns the policy gates the proxy, not `sudo`.                                                                   |
 | Rank 6  | Certificate/key distribution inherits Nix-store trust.                                                                | §7.8 now calls this out explicitly.                                                                                                                   |
 
 ### 19.3 Confirmed sound
@@ -2536,7 +2495,7 @@ inline edits above reference these IDs. No code is written until the
   `AcceptEnv` necessity (`ssh -G` verified `%C` expansion in `RemoteForward`).
 - `SO_PEERCRED` (Linux) / `getpeereid` (macOS, uid/gid only).
 - Per-guest host socket enforcing guest identity in `unix` mode.
-- Nonce/digest binding; default deny ACL.
+- Nonce/digest binding; a first-match-wins rule policy defaulting to `ask`.
 - Current `client.key` `0644` and reuse-proxy socket `0666` are confirmed present
   in today's code and are fixed by this design.
 
@@ -2599,7 +2558,7 @@ model. The **single host socket** replaces per-guest sockets; authentication
 becomes an explicit three-knob model; and several insecure or awkward features
 are removed. Inline edits above carry these IDs. (The single-socket-per-transport
 part of S1 is later **superseded** by the multi-listener model of §3.4: a server
-now binds one listener per `transports` entry. The lasting point is that no
+now binds one listener per `listeners` entry. The lasting point is that no
 socket carries guest identity.)
 
 | ID  | Change                                                                                                                                                                                  | Where                     |
@@ -2614,7 +2573,7 @@ socket carries guest identity.)
 | S8  | Domain-separation label changed from `"SAP-v1"` to `"tartarus/sudo-auth-proxy/v1"`.                                                                                                     | §6.4                      |
 | S9  | Server-side nonce cache removed; the client's single-use nonce is the whole replay defence.                                                                                             | §6.6, §12.6 R10           |
 | S10 | `client_auth` is exactly one of `ssh`/`x509` (`transport` under mTLS); never the two together.                                                                                          | §7.3, §7.5                |
-| S11 | ACL matches **only** cryptographic credentials, never destination/metadata.                                                                                                             | §8                        |
+| S11 | Approval rules match cryptographic identity plus self-reported metadata; a permissive rule only ever affects the decision, never whether a credential is accepted.                      | §8                        |
 | S12 | Anti-fatigue machinery (rate limit/backoff/breaker) removed.                                                                                                                            | §11.3                     |
 | S13 | `server_auth`/`client_auth`/`transport_encryption` knobs defined; `tcp` defaults to mTLS but `none` is permitted (insecure); `client_auth = "transport"` delegates client auth to mTLS. | §7.2–§7.5                 |
 | S14 | Guest `/run/sudo-auth-proxy` must be owned by the login user (answers the bind-writability question).                                                                                   | §4.3, §9.2, §15.2         |
@@ -2622,7 +2581,7 @@ socket carries guest identity.)
 
 Superseded findings: v1 F3 (reuse-proxy framing), v2 NF5 (anti-fatigue) and v2
 C3/R10 (nonce cache) are resolved **by removal**; v2 NF6 (unix pinning) is
-resolved by the credential-based ACL; the v1 per-guest-socket identity model no
+resolved by the credential-based rule engine; the v1 per-guest-socket identity model no
 longer applies.
 
 The following entries in §19.1/§19.2 are also superseded by v3 (§19.7) and must

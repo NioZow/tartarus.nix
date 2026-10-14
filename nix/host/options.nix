@@ -247,7 +247,7 @@ in {
             the hypervisor enforces this; on macOS/vfkit, which ignores it, the
             engine instead copies `source` into the Nix store and shares that,
             since store paths are root-owned and non-writable (see
-            `docs/shares.md`). Because that copy is world-readable, set
+            `docs/technical/shares.md`). Because that copy is world-readable, set
             `snapshot = false` on a read-only share that contains secrets;
             sources under `/nix/store` and `/run` are never copied.
           '';

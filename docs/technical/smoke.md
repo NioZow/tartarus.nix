@@ -238,7 +238,7 @@ here needs the tartarus host module or a guest.
       request id) and asks again, that **Details** alone never allows, and that
       `debug = true` logs the full block (doc §11.4).
 - [ ] `ssh-agent-proxy`: `nixosModules."ssh-agent-proxy"` (host server) and
-      `homeManagerModules."ssh-agent-proxy"` (server/bridge/agent/merge);
+      `homeManagerModules."ssh-agent-proxy"` (server/bridge/agent);
       confirm the guest's `SSH_AUTH_SOCK` is the merged socket and that
       `ssh-add -l` lists the host keys.
 - [ ] `clipboard-bridge`: `nixosModules."clipboard-bridge"` (host server) and
