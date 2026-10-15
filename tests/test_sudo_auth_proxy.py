@@ -2173,15 +2173,21 @@ def test_shipped_example_config_matches_the_schema(sap: types.ModuleType) -> Non
     with open(EXAMPLE_CONFIG_PATH, "rb") as handle:
         config = tomllib.load(handle)
 
-    sap.validate_config_schema(config, source=str(EXAMPLE_CONFIG_PATH))
-    security = sap.build_security(config, "server")
+    sap.validate_document_schema(config, source=str(EXAMPLE_CONFIG_PATH))
+    resolved = {
+        view["name"]: sap.build_security(view, "server")
+        for view in sap.listener_views(config)
+    }
 
-    # The example is the unauthenticated standalone pairing: it may only run if
-    # it says so on all three knobs.
-    assert security.transport_encryption == "none"
-    assert security.client_auth == "none"
-    assert security.server_auth == "none"
-    assert security.rules == ()
+    # The callback listeners are the unauthenticated standalone pairing: they may
+    # only run if they say so on all three knobs. The unix listener is mTLS.
+    for callback in ("vm-callback", "tcp-callback"):
+        assert resolved[callback].transport_encryption == "none"
+        assert resolved[callback].client_auth == "none"
+        assert resolved[callback].server_auth == "none"
+    assert resolved["remote-guest"].transport_encryption == "mtls"
+    assert resolved["remote-guest"].client_auth == "transport"
+    assert resolved["remote-guest"].server_auth == "transport"
 
 
 # --- config validation (fail closed, no downgrade) ------------------------
@@ -4089,20 +4095,20 @@ def test_build_confirmation_shows_root_for_sudo(sap: types.ModuleType) -> None:
 # --- multi-listener server (doc §4) ----------------------------------------
 #
 # One server process may bind several listeners, each with its own transport,
-# bind target, security model and ACL. The document carries a
-# `[listener_defaults]` table deep-merged into every `[[listeners]]` entry;
-# `listener_views` expands that list into the flat per-listener shape the
-# existing transport/security code already accepts, and `run_server` binds all
-# listeners before serving any.
+# bind target, security model and identity. Every `[[listeners]]` entry is
+# self-contained (there is no `[listener_defaults]` block); `listener_views`
+# expands that list into the flat per-listener shape the existing
+# transport/security code already accepts, and `run_server` binds all listeners
+# before serving any.
 
-# The shipped multi-listener example (owned by the examples task). It is the
-# exact file an operator copies for a multi-transport host, so the parse test
-# loads it from the repo instead of a private inline copy -- a drift between the
-# documented example and what the server accepts would then fail here.
+# The shipped server example (owned by the examples task). It is the exact file
+# an operator copies for a multi-transport host, so the parse test loads it from
+# the repo instead of a private inline copy -- a drift between the documented
+# example and what the server accepts would then fail here.
 _MULTI_LISTENER_EXAMPLE_PATH = (
     Path(__file__).resolve().parents[1]
     / "examples"
-    / "sudo-auth-proxy-listeners.toml"
+    / "sudo-auth-proxy-server.toml"
 )
 
 
@@ -4160,29 +4166,21 @@ def _running_server(
         assert not thread.is_alive(), "run_server did not stop"
 
 
-def test_listener_expansion_deep_merges_defaults(sap: types.ModuleType) -> None:
-    """Entry fields win; nested tables merge field-by-field, lists replace."""
+def test_listener_views_keep_each_entry_self_contained(
+    sap: types.ModuleType,
+) -> None:
+    """Each view carries only the entry's own fields; no defaults are merged."""
     config = {
         "mode": "server",
-        "listener_defaults": {
-            "port": 65001,
-            "security": {
-                "transport_encryption": "auto",
-                "client_auth": "transport",
-                "server_auth": "transport",
-                "response_ttl": 30,
-            },
-            "mtls": {
-                "enable": False,
-                "ca_file": "./ca.crt",
-                "cert_file": "./server.crt",
-            },
-        },
         "listeners": [
             {
                 "type": "tcp",
                 "port": 65002,
-                "security": {"transport_encryption": "none"},
+                "security": {
+                    "transport_encryption": "none",
+                    "client_auth": "none",
+                    "server_auth": "none",
+                },
             },
             {"type": "unix", "socket": "/run/x.sock"},
         ],
@@ -4193,22 +4191,14 @@ def test_listener_expansion_deep_merges_defaults(sap: types.ModuleType) -> None:
     assert len(views) == 2
     first, second = views
 
-    # an entry wins on a scalar field; the defaults supply the rest
+    # the entry keeps its own values ...
     assert first["port"] == 65002
-    assert second["port"] == 65001
-
-    # nested tables merge field-by-field: only transport_encryption is overridden
-    assert first["security"] == {
-        "transport_encryption": "none",
-        "client_auth": "transport",
-        "server_auth": "transport",
-        "response_ttl": 30,
-    }
-    assert second["security"]["transport_encryption"] == "auto"
-
-    # the entry's own bind target overrides the defaults, which survive otherwise
+    assert first["security"]["transport_encryption"] == "none"
     assert second["socket"] == "/run/x.sock"
-    assert first["mtls"]["ca_file"] == "./ca.crt"
+    # ... and a field it omits is simply absent; the flat readers apply their
+    # built-in defaults later, never a shared block
+    assert "port" not in second
+    assert "security" not in second
 
 
 def test_listener_views_map_type_to_transport(sap: types.ModuleType) -> None:
@@ -4288,6 +4278,18 @@ def test_schema_rejects_old_transports_key(sap: types.ModuleType) -> None:
         )
 
 
+def test_schema_rejects_listener_defaults(sap: types.ModuleType) -> None:
+    """The removed `[listener_defaults]` block fails loudly."""
+    with pytest.raises(sap.SecurityConfigError, match="listener_defaults"):
+        sap.validate_document_schema(
+            {
+                "mode": "server",
+                "listener_defaults": {"port": 65001},
+                "listeners": [{"type": "tcp"}],
+            }
+        )
+
+
 def test_schema_rejects_duplicate_listener_name(sap: types.ModuleType) -> None:
     config = {
         "mode": "server",
@@ -4301,15 +4303,13 @@ def test_schema_rejects_duplicate_listener_name(sap: types.ModuleType) -> None:
         sap.validate_document_schema(config)
 
 
-def test_load_config_resolves_transport_default_paths(
+def test_load_config_resolves_listener_mtls_paths(
     sap: types.ModuleType, tmp_path: Path
 ) -> None:
-    """Relative `[mtls]` paths resolve in the defaults and in each entry."""
+    """Relative `[mtls]` paths resolve inside each `[[listeners]]` entry."""
     path = tmp_path / "c.toml"
     path.write_text(
         "mode = \"server\"\n"
-        "[listener_defaults.mtls]\n"
-        "ca_file = \"./ca.crt\"\n"
         "[[listeners]]\n"
         "type = \"unix\"\n"
         "socket = \"/run/x.sock\"\n"
@@ -4319,17 +4319,16 @@ def test_load_config_resolves_transport_default_paths(
 
     config = sap.load_config(str(path))
 
-    assert config["listener_defaults"]["mtls"]["ca_file"] == str(tmp_path / "ca.crt")
     assert config["listeners"][0]["mtls"]["ca_file"] == str(tmp_path / "entry-ca.crt")
 
 
 def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
-    """The shipped multi-listener example loads and expands to three listeners.
+    """The shipped server example loads and expands to three listeners.
 
-    `examples/sudo-auth-proxy-listeners.toml` is the file the multi-transport
-    setup tells an operator to install, so it must load, pass the document
-    schema, and expand to one view per `[[listeners]]` entry. Loading it here
-    (rather than an inline copy) keeps the shipped file and the Python in sync.
+    `examples/sudo-auth-proxy-server.toml` is the file the setup tells an
+    operator to install, so it must load, pass the document schema, and expand
+    to one view per `[[listeners]]` entry. Loading it here (rather than an inline
+    copy) keeps the shipped file and the Python in sync.
     """
     config = sap.load_config(str(_MULTI_LISTENER_EXAMPLE_PATH))
 
@@ -4365,15 +4364,20 @@ def test_run_server_binds_two_unix_listeners_with_distinct_rules(
         "mode": "server",
         "dialog_program": "zenity",
         "rule": [{"match": {"listeners": ["b"]}, "policy": "deny"}],
-        "listener_defaults": {
-            "resolution": "none",
-            "socket_dir_mode": "0700",
-            "socket_mode": "0600",
-            "security": _server_security(),
-        },
         "listeners": [
-            {"type": "unix", "socket": str(sock_a)},
-            {"type": "unix", "socket": str(sock_b), "name": "b"},
+            {
+                "type": "unix",
+                "socket": str(sock_a),
+                "resolution": "none",
+                "security": _server_security(),
+            },
+            {
+                "type": "unix",
+                "socket": str(sock_b),
+                "name": "b",
+                "resolution": "none",
+                "security": _server_security(),
+            },
         ],
     }
 
@@ -4413,18 +4417,18 @@ def test_run_server_binds_tcp_and_unix_together(
     config = {
         "mode": "server",
         "dialog_program": "zenity",
-        "listener_defaults": {
-            "resolution": "none",
-            "socket_dir_mode": "0700",
-            "socket_mode": "0600",
-            "security": _server_security(),
-        },
         "listeners": [
-            {"type": "unix", "socket": str(sock_path)},
+            {
+                "type": "unix",
+                "socket": str(sock_path),
+                "resolution": "none",
+                "security": _server_security(),
+            },
             {
                 "type": "tcp",
                 "host": "127.0.0.1",
                 "port": port,
+                "security": _server_security(),
             },
         ],
     }
@@ -4462,18 +4466,18 @@ def test_any_listener_bind_failure_is_fatal(
 
     config = {
         "mode": "server",
-        "listener_defaults": {
-            "resolution": "none",
-            "socket_dir_mode": "0700",
-            "socket_mode": "0600",
-            "security": _server_security(),
-        },
         "listeners": [
-            {"type": "unix", "socket": str(sock_path)},
+            {
+                "type": "unix",
+                "socket": str(sock_path),
+                "resolution": "none",
+                "security": _server_security(),
+            },
             {
                 "type": "tcp",
                 "host": "127.0.0.1",
                 "port": port,
+                "security": _server_security(),
             },
         ],
     }
@@ -4538,20 +4542,17 @@ def test_per_listener_security_isolation(
     sock_mtls = tmp_path / "mtls" / "server.sock"
     config = {
         "mode": "server",
-        "listener_defaults": {
-            "resolution": "none",
-            "socket_dir_mode": "0700",
-            "socket_mode": "0600",
-        },
         "listeners": [
             {
                 "type": "unix",
                 "socket": str(sock_none),
+                "resolution": "none",
                 "security": _server_security(),
             },
             {
                 "type": "unix",
                 "socket": str(sock_mtls),
+                "resolution": "none",
                 "security": _mtls_server_security(),
                 "mtls": {
                     "enable": True,

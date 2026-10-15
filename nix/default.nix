@@ -83,7 +83,8 @@ in {
   # The `tartarus-sudo-auth-proxy-toml-shape` check is the one build-forcing
   # member (doc §7.3): it renders a standalone home-manager server config with
   # two listeners and greps the generated `sudo-auth-proxy-server.toml` for the
-  # multi-listener schema, pinning exactly what the module emits.
+  # self-contained multi-listener schema, pinning exactly what the module
+  # emits.
   checks = forAllSystems (system: let
     pkgs = import inputs.nixpkgs {
       inherit system;
@@ -97,8 +98,9 @@ in {
 
     # A standalone home-manager config whose sudo-auth-proxy server binds two
     # listeners (a `unix` one that disables auth explicitly, a `tcp` one that
-    # resolves to mTLS via `auto`). The generated TOML must therefore carry a
-    # `[listener_defaults]` block and two `[[listeners]]` headers.
+    # resolves to mTLS via `auto`). The generated TOML must therefore carry two
+    # self-contained `[[listeners]]` headers -- one plaintext, one mTLS -- and
+    # no `[listener_defaults]` block.
     sudoTomlHm = inputs.home-manager.lib.homeManagerConfiguration {
       inherit pkgs;
       modules = [
@@ -137,8 +139,10 @@ in {
       .source;
     tomlShape = pkgs.runCommand "tartarus-sudo-auth-proxy-toml-shape" {} ''
       set -eu
-      grep -qF '[listener_defaults]' ${sudoToml}
-      test "$(grep -c '^\[\[listeners\]\]' ${sudoToml})" -ge 2
+      test "$(grep -c '^\[\[listeners\]\]' ${sudoToml})" -eq 2
+      ! grep -qF '[listener_defaults]' ${sudoToml}
+      grep -qF 'transport_encryption = "mtls"' ${sudoToml}
+      grep -qF 'transport_encryption = "none"' ${sudoToml}
       echo ok > $out
     '';
   in

@@ -216,8 +216,9 @@ shared-account case (§12.6 R6).
 
 Each **listener** selects its transport with `type = "vsock" | "tcp" | "unix"`,
 which also determines the **call direction**. The server takes a **list** of
-listeners (`tartarus.sudo-auth-proxy.server.listeners`) plus a
-`listenerDefaults` block that the Python deep-merges into every entry (§3.4).
+self-contained listeners (`tartarus.sudo-auth-proxy.server.listeners`); each
+entry carries its own values, a field it omits falling back to the built-in
+default (§3.4).
 There is no per-guest or per-session server socket (review log S1, §19.7): a
 listener's address is not an identity, and the guest is identified
 cryptographically (§5, §8).
@@ -335,19 +336,15 @@ process may bind any number of them — including several of the same kind:
 ```nix
 tartarus.sudo-auth-proxy.server = {
   enable = true;
-  listenerDefaults = {              # deep-merged into every entry
-    port = 65001;
-    recvTimeout = 0.5;
-    decisionTimeout = 120;
-  };
   listeners = [
-    { type = "vsock"; cid = 2; }                    # local Linux VM (callback)
+    { type = "vsock"; cid = 2;                      # local Linux VM (callback)
+      security = {transportEncryption = "none";
+                  clientAuth = "none"; serverAuth = "none";}; }
     { type = "unix";                                # SSH-forwarded remote (tunnel)
       socket = "%t/sudo-auth-proxy/server.sock";
       security = {transportEncryption = "mtls";
                   clientAuth = "transport"; serverAuth = "transport";};
-      mtls = {enable = true; /* CA + host cert/key */};
-      acl  = {mode = "ca";   /* CA + sudo client OID */}; }
+      mtls = {enable = true; /* CA + host cert/key */}; }
   ];
 };
 ```
@@ -359,8 +356,10 @@ tartarus.sudo-auth-proxy.server = {
   `[[rule]]` `match.listeners` glob then selects it; empty/`*` matches any
   listener, including an unnamed one (see §8.2). `name` is a label only: it
   never affects the bind target or the identity.
-- `listenerDefaults` supplies the shared values once; the Python deep-merges it
-  into every entry, and an entry's explicitly-set field wins.
+- Each entry is **self-contained**: a field it omits falls back to the built-in
+  default (`port = 65001`, `recvTimeout = 0.5`, `decisionTimeout = 120`, …).
+  There is no shared defaults table, and a `listener_defaults` block is refused
+  at load time.
 - Multiple entries of the same `type` are allowed (e.g. two `unix` listeners
   with different `socket` paths and different transport security).
 - All listeners are bound **before any serves a request**: if one bind or one
@@ -1179,24 +1178,23 @@ The service accepts **two document shapes**, both validated against an exact
 schema (every key, at every level, must be one it reads):
 
 **New schema (preferred).** The top level may carry only the global keys plus the
-two listener tables:
+`listeners` array:
 
 - globals: `mode`, `dialog_program`, `debug`, `approver`, `client_version`,
   `guest_hint`;
-- `[listener_defaults]` — one table of default listener fields, deep-merged
-  into every entry by the Python;
 - `[[listeners]]` — a **non-empty array** of listener tables, each requiring
   `type`.
 
-Each listener table (`[listener_defaults]` and every `[[listeners]]` entry)
-accepts exactly: `type` (entry only), `name` (entry only, unique), `port`,
-`cid`, `host`, `socket`, `socket_dir_mode`, `socket_mode`, `connect_timeout`,
-`decision_timeout`, `recv_timeout`, `max_connections`, `server_read_timeout`,
-`resolution`, and the per-listener tables `[security]` and `[mtls]`
-(with the keys of this section and §7.7). There is no per-listener `[acl]`. A flat
-`transport`/`cid`/`security`/… key written alongside `listeners` is **ambiguous
-and rejected**. Duplicate `type`s are allowed (two `unix` listeners); duplicate
-`socket` paths fail at bind time, not in the schema.
+Each `[[listeners]]` entry is **self-contained** and accepts exactly: `type`,
+`name` (unique), `port`, `cid`, `host`, `socket`, `socket_dir_mode`,
+`socket_mode`, `connect_timeout`, `decision_timeout`, `recv_timeout`,
+`max_connections`, `server_read_timeout`, `resolution`, and the per-listener
+tables `[security]` and `[mtls]` (with the keys of this section and §7.7). A
+field an entry omits falls back to the built-in default. There is no
+per-listener `[acl]` and no `[listener_defaults]` block (it is refused at load
+time). A flat `transport`/`cid`/`security`/… key written alongside `listeners`
+is **ambiguous and rejected**. Duplicate `type`s are allowed (two `unix`
+listeners); duplicate `socket` paths fail at bind time, not in the schema.
 
 **Legacy flat schema.** For Python compatibility only (§14.3), a document with no
 `listeners` array is read as a **single implicit listener**: top level `mode`,
@@ -1467,7 +1465,7 @@ Three independent bounds are configured. With the pre-dialog acknowledgement
 | `decision_timeout` | `120 s` | the wait for the final `auth_response` — the human decision                 | wait indefinitely |
 
 The **server** has its own two pre-authentication resource bounds (audit A3/N2),
-exposed **per listener** as the `listeners`/`listenerDefaults` fields
+exposed **per listener** as the `listeners` entry fields
 `maxConnections` / `serverReadTimeout` and emitted into the generated server TOML
 as `max_connections` / `server_read_timeout` (audit N5). Each listener carries its
 own cap and read timeout; their defaults match the Python constants.
@@ -1763,8 +1761,7 @@ it never gates anything and is sanitised like every other field.
 degrades to the raw label when the binary is missing, exits non-zero, or returns
 malformed JSON — resolution is cosmetic and must never delay or fail a prompt.
 `resolution` is **per listener**: the Nix module exposes it as
-`tartarus.sudo-auth-proxy.server.listeners[*].resolution` (or
-`listenerDefaults.resolution` for the shared default). An unset (`null`)
+`tartarus.sudo-auth-proxy.server.listeners[*].resolution`. An unset (`null`)
 listener defaults to `certificate` when it is mTLS and `tartarus` otherwise. The
 resolved name is one of the candidates a `[[rule]]` `match.machine` selector
 matches (§8.2).
@@ -1996,9 +1993,8 @@ socket,socketDirMode,socketMode,connectTimeout,decisionTimeout,recvTimeout,
 maxConnections,serverReadTimeout,resolution,security,mtls,acl}` no longer exist
 (the same applies to `extraServer`). A consumer that set them must migrate to:
 
-- `server.listeners = [ { type = "…"; … } ]` — one entry per listener, and
-- `server.listenerDefaults = { … }` — shared per-field defaults deep-merged into
-  every entry by the Python.
+- `server.listeners = [ { type = "…"; … } ]` — one **self-contained** entry per
+  listener; a field an entry omits falls back to the built-in default.
 
 A partially-migrated config therefore **fails evaluation loudly**, rather than
 silently binding the wrong transport. The old mixed-`vsock`/`tcp` warning and the
@@ -2112,8 +2108,8 @@ knobs are written out, or the process refuses to start.
 
 A host can run one additional, independent server alongside the legacy
 `server`. The home-manager option
-`tartarus.sudo-auth-proxy.extraServer` has its own `listeners` /
-`listenerDefaults`, `extraSettings` and `name`; it runs as the unit
+`tartarus.sudo-auth-proxy.extraServer` has its own `listeners`,
+`extraSettings` and `name`; it runs as the unit
 `sudo-auth-proxy-<name>` with the config file
 `~/.config/sudo-auth-proxy/<name>.toml` (and its own runtime directory). This is
 what lets one host serve its tartarus guests on the callback transport **and** a
@@ -2192,46 +2188,35 @@ ready-to-edit pair:
 
 | File                                | Purpose                                                        |
 | ----------------------------------- | -------------------------------------------------------------- |
-| `examples/sudo-auth-proxy-server.toml` | Annotated `~/.config/sudo-auth-proxy/config.toml` for a `vsock` server with no encryption and no authentication. |
+| `examples/sudo-auth-proxy-server.toml` | Annotated `~/.config/sudo-auth-proxy/config.toml`: one server binding a `vsock` callback, a `tcp` callback and an mTLS `unix` listener. |
 | `examples/sudo-auth-proxy.service`  | A systemd **user** unit that runs it inside the approver's graphical session. |
 
 **Multiple listeners without Nix.** The list form binds several listeners in one
-process; the flat file above is a single implicit listener kept for
-compatibility. A `vsock` callback and an SSH-forwarded `unix` listener can
-coexist, each with its own security:
+process, and every `[[listeners]]` entry is **self-contained**: a field it omits
+falls back to the built-in default (there is no `[listener_defaults]` block).
+`examples/sudo-auth-proxy-server.toml` is the complete, annotated file; a `vsock`
+callback and an SSH-forwarded `unix` listener can coexist, each with its own
+security:
 
 ```toml
 mode = "server"
 dialog_program = "zenity"
 
-[listener_defaults]
-port = 65001
-recv_timeout = 0.5
-decision_timeout = 120
-
-[listener_defaults.security]
-transport_encryption = "auto"
-client_auth = "transport"
-server_auth = "transport"
-
-[listener_defaults.acl]
-mode = "list"
-
 [[listeners]]
 type = "vsock"
 cid = 2
+port = 65001
+resolution = "none"
 
 [listeners.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
-[listeners.acl]
-mode = "none"
-
 [[listeners]]
 type = "unix"
 socket = "%t/sudo-auth-proxy/server.sock"
+resolution = "certificate"
 
 [listeners.security]
 transport_encryption = "mtls"
@@ -2245,11 +2230,6 @@ cert_file = "./server.crt"
 key_file = "./server.key"
 required_oid = "1.3.6.1.4.1.99999.1.1"
 peer_required_oid = "1.3.6.1.4.1.99999.1.2"
-
-[listeners.acl]
-mode = "ca"
-ca_file = "./ca.crt"
-required_oid = "1.3.6.1.4.1.99999.1.2"
 ```
 
 1. Install the script and its one dependency:
@@ -2290,9 +2270,9 @@ required_oid = "1.3.6.1.4.1.99999.1.2"
 
 > `examples/sudo-auth-proxy-server.toml` is a validated configuration: it is
 > parsed and resolved by the same `load_config` + `build_security` path the
-> service uses, and it resolves to `transport = "vsock"`, `cid = 2`,
-> `port = 65012`, `transport_encryption = "none"`, `client_auth = "none"`,
-> `server_auth = "none"`.
+> service uses. It binds three self-contained listeners — a `vsock` callback
+> (`cid = 2`, `port = 65012`, no auth), a `tcp` callback (no auth) and an `unix`
+> mTLS listener.
 
 ### 15.2 Guest
 

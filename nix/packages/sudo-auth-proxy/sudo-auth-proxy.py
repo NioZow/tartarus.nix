@@ -556,9 +556,8 @@ def load_config(path: str) -> dict:
 
     # `[mtls]` paths are resolved against the config file's own directory, so a
     # hand-written config can use paths relative to itself. In the
-    # multi-listener schema the same table appears inside every `[[listeners]]`
-    # entry and inside `[listener_defaults]`, so the resolution runs there too --
-    # before `listener_views` merges the two. `[security]` holds no paths any
+    # multi-listener schema the table appears inside every `[[listeners]]`
+    # entry, so the resolution runs there too. `[security]` holds no paths any
     # more, and the client `[acl]` holds no paths either (fingerprints and
     # names only): the removed ssh/x509/signature methods owned every key
     # reference, and mTLS carries its own `[mtls]` section.
@@ -570,9 +569,6 @@ def load_config(path: str) -> dict:
                     mtls[key] = resolve(mtls[key])
 
     resolve_tables(config)
-    defaults = config.get("listener_defaults")
-    if isinstance(defaults, dict):
-        resolve_tables(defaults)
     entries = config.get("listeners")
     if isinstance(entries, list):
         for entry in entries:
@@ -582,39 +578,24 @@ def load_config(path: str) -> dict:
     return config
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge `override` onto `base`, returning a new dict.
-
-    Lists and scalars are replaced wholesale (a listener's `security`/`mtls`
-    sub-table is merged field by field so an entry can override just the one
-    knob it cares about, but its scalars never concatenate with the defaults').
-    """
-    merged = dict(base)
-    for key, value in override.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
 def listener_views(config: dict) -> list[dict]:
     """Return the flat, legacy-shaped config for each server listener.
 
     A document with a non-empty `listeners` list expands to one view per entry,
-    each the entry deep-merged over `[listener_defaults]`, with `type` renamed
-    to the `transport` key every reader already uses, the global keys carried
-    down and `_listener_index` stamped on it. A flat document (no `listeners`)
-    is one implicit listener -- the document itself, unchanged -- so every
-    existing hand-written and shipped config keeps working with zero edits.
+    each entry's own fields with `type` renamed to the `transport` key every
+    reader already uses, the global keys carried down and `_listener_index`
+    stamped on it. An entry is **self-contained**: values it does not set fall
+    back to the built-in defaults in the flat readers, never to a shared
+    defaults block. A flat document (no `listeners`) is one implicit listener --
+    the document itself, unchanged -- so every existing hand-written and shipped
+    config keeps working with zero edits.
     """
     entries = config.get("listeners")
     if not isinstance(entries, list) or not entries:
         return [config]
-    defaults = config.get("listener_defaults") or {}
     views: list[dict] = []
     for index, entry in enumerate(entries):
-        view = _deep_merge(defaults, entry)
+        view = dict(entry)
         if "type" in view:
             view["transport"] = view["type"]
             del view["type"]
@@ -714,12 +695,11 @@ CONFIG_TABLE_KEYS = {
     "mtls": CONFIG_MTLS_KEYS,
 }
 
-# The keys a `[[listeners]]` entry (or the `[listener_defaults]` block) may
-# carry: the flat server key set minus the non-transport globals (`mode`,
-# `dialog_program`, `debug`, `rule`, `labels`, the client metadata), which stay
-# at the document top level, plus `type` -- the wire key `listener_views` renames
-# to `transport` -- and `name`, the optional listener label `match.listeners`
-# matches. There is no per-listener `[acl]`.
+# The keys a `[[listeners]]` entry may carry: the flat server key set minus the
+# non-transport globals (`mode`, `dialog_program`, `debug`, `rule`, `labels`,
+# the client metadata), which stay at the document top level, plus `type` -- the
+# wire key `listener_views` renames to `transport` -- and `name`, the optional
+# listener label `match.listeners` matches. There is no per-listener `[acl]`.
 CONFIG_LISTENER_KEYS = frozenset(
     {
         "type",
@@ -741,10 +721,11 @@ CONFIG_LISTENER_KEYS = frozenset(
     }
 )
 
-# The top level of a multi-listener document: the global keys plus the
-# document-level tables. A flat transport/security/mtls key alongside `listeners`
-# is ambiguous and refused (`validate_document_schema`). The rules (`rule`) and
-# `labels` are document-level, never per listener.
+# The top level of a multi-listener document: the global keys plus the `listeners`
+# array. A flat transport/security/mtls key alongside `listeners` is ambiguous
+# and refused (`validate_document_schema`). The rules (`rule`) and `labels` are
+# document-level, never per listener. Each `[[listeners]]` entry is
+# self-contained, so there is no `[listener_defaults]` block.
 CONFIG_DOCUMENT_KEYS = frozenset(
     {
         "mode",
@@ -755,7 +736,6 @@ CONFIG_DOCUMENT_KEYS = frozenset(
         "guest_hint",
         "rule",
         "labels",
-        "listener_defaults",
         "listeners",
     }
 )
@@ -912,17 +892,14 @@ def validate_config_schema(config: dict, *, source: str | None = None) -> None:
         raise SecurityConfigError("; ".join(sentences) + source_suffix)
 
 
-def validate_listener_table(
-    entry: dict, *, where: str, require_type: bool = True
-) -> None:
+def validate_listener_table(entry: dict, *, where: str) -> None:
     """Refuse any key a listener table cannot carry (doc §3).
 
-    Used for each `[[listeners]]` entry (`require_type = True`, it must name
-    its `type`) and for the `[listener_defaults]` block (`require_type =
-    False`). It reuses the flat validator's naming and `did-you-mean` helpers,
-    so a typo inside a listener is reported exactly like a typo at the top level,
-    and the nested `[security]`/`[mtls]` tables are checked against the same key
-    sets as their flat counterparts.
+    Used for each `[[listeners]]` entry (it must name its `type`). It reuses the
+    flat validator's naming and `did-you-mean` helpers, so a typo inside a
+    listener is reported exactly like a typo at the top level, and the nested
+    `[security]`/`[mtls]` tables are checked against the same key sets as their
+    flat counterparts.
     """
     if not isinstance(entry, dict):
         raise SecurityConfigError(f"'{where}' must be a table")
@@ -932,7 +909,7 @@ def validate_listener_table(
         raise SecurityConfigError(
             _unknown_keys_sentence(f"in {where}", unknown, CONFIG_LISTENER_KEYS)
         )
-    if require_type and "type" not in entry:
+    if "type" not in entry:
         raise SecurityConfigError(f"{where} is missing the required 'type' key")
     if entry.get("type") is not None and entry["type"] not in ("vsock", "tcp", "unix"):
         raise SecurityConfigError(
@@ -958,20 +935,25 @@ def validate_document_schema(config: dict, *, source: str | None = None) -> None
     """Validate a whole document, multi-listener or legacy flat (doc §4.6).
 
     A document that carries `listeners` is the new schema: its top level may
-    only hold the global keys plus the two new tables (a flat
-    transport/security/mtls/acl key alongside `listeners` is ambiguous and
-    refused), `listeners` must be a non-empty array and `listener_defaults`,
-    when present, a table. Every entry is then checked by
-    `validate_listener_table`, and listener `name`s must be unique. A document
-    without `listeners` is the legacy flat form and is validated by
-    `validate_config_schema`, unchanged. The old `transports`/
-    `transport_defaults` names are refused loudly.
+    only hold the global keys (a flat transport/security/mtls/acl key alongside
+    `listeners` is ambiguous and refused) and `listeners` must be a non-empty
+    array. Every entry is then checked by `validate_listener_table`, and
+    listener `name`s must be unique. A document without `listeners` is the
+    legacy flat form and is validated by `validate_config_schema`, unchanged.
+    The old `transports`/`transport_defaults` names and the removed
+    `[listener_defaults]` block are refused loudly.
     """
     if "transports" in config or "transport_defaults" in config:
         raise SecurityConfigError(
             "the 'transports'/'transport_defaults' keys were renamed to "
-            "'listeners'/'listener_defaults' (one [[listeners]] entry is one "
-            "listener); update the configuration"
+            "'listeners' (one [[listeners]] entry is one listener); update the "
+            "configuration"
+        )
+    if "listener_defaults" in config:
+        raise SecurityConfigError(
+            "'[listener_defaults]' was removed: every [[listeners]] entry is "
+            "self-contained (move its values into the entry, or rely on the "
+            "built-in defaults)"
         )
     if "listeners" not in config:
         validate_config_schema(config, source=source)
@@ -984,9 +966,6 @@ def validate_document_schema(config: dict, *, source: str | None = None) -> None
         )
     if not isinstance(config["listeners"], list) or not config["listeners"]:
         raise SecurityConfigError("'listeners' must be a non-empty array of tables")
-    defaults = config.get("listener_defaults")
-    if "listener_defaults" in config and not isinstance(defaults, dict):
-        raise SecurityConfigError("'[listener_defaults]' must be a table")
     seen_names: set[str] = set()
     for index, entry in enumerate(config["listeners"]):
         validate_listener_table(entry, where=f"listeners[{index}]")
@@ -999,15 +978,6 @@ def validate_document_schema(config: dict, *, source: str | None = None) -> None
             if name in seen_names:
                 raise SecurityConfigError(f"duplicate listener name: {name!r}")
             seen_names.add(name)
-    if isinstance(defaults, dict):
-        if "name" in defaults:
-            raise SecurityConfigError(
-                "'name' is per listener; set it on each [[listeners]] entry, "
-                "not in [listener_defaults]"
-            )
-        validate_listener_table(
-            defaults, where="listener_defaults", require_type=False
-        )
 
 
 # --- security model: validation, keyrings, auth blocks (doc §7) -----------

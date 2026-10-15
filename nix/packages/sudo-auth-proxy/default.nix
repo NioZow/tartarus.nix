@@ -53,120 +53,104 @@
       inherit lib isDarwin username homeManager;
     };
 
-  # A field option that is `null` by default in the sparse (entry) variant and
-  # carries its real default in the defaults variant. `pkgs.formats.toml`
-  # cannot serialise `null`, so sparse entries are pruned before generation
-  # (`mkPruneNulls`, below). Reused by every listener field option.
-  nullableOpt = {
-    lib,
-    nullable,
-  }: type: default: {
-    type =
-      if nullable
-      then lib.types.nullOr type
-      else type;
-    default =
-      if nullable
-      then null
-      else default;
-  };
-
   # Reusable `[security]` option set. The client's top-level
   # `tartarus.sudo-auth-proxy.security` and every server listener share this
-  # exact shape (doc §7). `nullable = true` yields the sparse entry variant used
-  # inside `listeners`: every knob defaults to `null` and is pruned before TOML
-  # generation, so an entry only overrides what it sets and the Python
-  # deep-merges the defaults block into the rest (including `response_ttl`/
-  # `clock_skew`).
+  # exact shape (doc §7); every knob carries its real default, so a listener
+  # entry that omits it is self-contained.
   #
   # mTLS is the ONLY authentication/signature mechanism (doc §7). The removed
   # `ssh` / `x509` requester methods and the `signature` host-signing method
   # took every key reference with them; mTLS carries its own `[mtls]` section.
-  mkSecurityOptions = {
-    lib,
-    nullable ? false,
-  }: let
+  mkSecurityOptions = {lib}: let
     inherit (lib) mkOption types;
-    o = nullableOpt {inherit lib nullable;};
   in {
-    transportEncryption = mkOption ((o (types.enum ["auto" "none" "mtls"]) "auto")
-      // {
-        description = ''
-          Whether the byte stream is encrypted and integrity-protected (doc
-          §7.4). `auto` (default) follows the listener's `type`: `tcp` → `mtls`,
-          `vsock`/`unix` → `none`. `mtls` is an explicit choice and never a
-          runtime fallback.
-        '';
-      });
-    clientAuth = mkOption ((o (types.enum ["transport" "none"]) "transport")
-      // {
-        description = ''
-          How the server authenticates the requester (doc §7.3). `transport`
-          means the identity comes from the mTLS handshake; `none` disables
-          requester authentication entirely: it is an explicit, warned choice
-          and is rejected under `transportEncryption = "mtls"`. Use it only on a
-          transport that is private by construction (vsock, SSH tunnel, local
-          Unix socket). Setting it to `none` is required — with
-          `transport_encryption = "none"` the Python refuses to run without an
-          explicit `none` on both auth knobs rather than silently disabling
-          authentication.
-        '';
-      });
-    serverAuth = mkOption ((o (types.enum ["transport" "none"]) "transport")
-      // {
-        description = ''
-          How the client authenticates the server's messages (doc §7.2).
-          `transport` requires `transportEncryption = "mtls"` (and is then
-          forced); `none` means nothing authenticates the response and is only
-          accepted alongside `clientAuth = "none"`.
-        '';
-      });
-    responseTtl = mkOption ((o types.int 30)
-      // {
-        description = "Seconds a response remains valid (doc §6.6).";
-      });
-    clockSkew = mkOption ((o types.int 5)
-      // {
-        description = "Clock-skew allowance, in seconds, when checking response freshness.";
-      });
+    transportEncryption = mkOption {
+      type = types.enum ["auto" "none" "mtls"];
+      default = "auto";
+      description = ''
+        Whether the byte stream is encrypted and integrity-protected (doc
+        §7.4). `auto` (default) follows the listener's `type`: `tcp` → `mtls`,
+        `vsock`/`unix` → `none`. `mtls` is an explicit choice and never a
+        runtime fallback.
+      '';
+    };
+    clientAuth = mkOption {
+      type = types.enum ["transport" "none"];
+      default = "transport";
+      description = ''
+        How the server authenticates the requester (doc §7.3). `transport`
+        means the identity comes from the mTLS handshake; `none` disables
+        requester authentication entirely: it is an explicit, warned choice
+        and is rejected under `transportEncryption = "mtls"`. Use it only on a
+        transport that is private by construction (vsock, SSH tunnel, local
+        Unix socket). Setting it to `none` is required — with
+        `transport_encryption = "none"` the Python refuses to run without an
+        explicit `none` on both auth knobs rather than silently disabling
+        authentication.
+      '';
+    };
+    serverAuth = mkOption {
+      type = types.enum ["transport" "none"];
+      default = "transport";
+      description = ''
+        How the client authenticates the server's messages (doc §7.2).
+        `transport` requires `transportEncryption = "mtls"` (and is then
+        forced); `none` means nothing authenticates the response and is only
+        accepted alongside `clientAuth = "none"`.
+      '';
+    };
+    responseTtl = mkOption {
+      type = types.int;
+      default = 30;
+      description = "Seconds a response remains valid (doc §6.6).";
+    };
+    clockSkew = mkOption {
+      type = types.int;
+      default = 5;
+      description = "Clock-skew allowance, in seconds, when checking response freshness.";
+    };
   };
 
-  # Reusable `[mtls]` option set (extracted from the old inline server block so
-  # it can be instantiated in both `listenerDefaults` and each `listeners`
-  # entry). `requiredOid`/`peerOid` carry the sudo-specific EKU OIDs.
+  # Reusable `[mtls]` option set for one listener. `requiredOid`/`peerOid`
+  # carry the sudo-specific EKU OIDs; every field carries its real default so a
+  # listener is self-contained.
   mkMtlsOptions = {
     lib,
-    nullable ? false,
     requiredOid,
     peerOid,
   }: let
     inherit (lib) mkOption types;
-    o = nullableOpt {inherit lib nullable;};
   in {
-    enable = mkOption ((o types.bool false)
-      // {
-        description = "Enable mutual TLS for this listener. Equivalent to `security.transportEncryption = \"mtls\"`.";
-      });
-    caFile = mkOption ((o types.str "./ca.crt")
-      // {
-        description = "Path to the CA certificate. Relative to the config file directory.";
-      });
-    certFile = mkOption ((o types.str "./server.crt")
-      // {
-        description = "Path to the server certificate. Relative to the config file directory.";
-      });
-    keyFile = mkOption ((o types.str "./server.key")
-      // {
-        description = "Path to the server private key. Relative to the config file directory.";
-      });
-    requiredOid = mkOption ((o types.str requiredOid)
-      // {
-        description = "EKU OID the local server certificate must contain.";
-      });
-    peerOid = mkOption ((o types.str peerOid)
-      // {
-        description = "EKU OID the peer (client) certificate must contain.";
-      });
+    enable = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Enable mutual TLS for this listener. Equivalent to `security.transportEncryption = \"mtls\"`.";
+    };
+    caFile = mkOption {
+      type = types.str;
+      default = "./ca.crt";
+      description = "Path to the CA certificate. Relative to the config file directory.";
+    };
+    certFile = mkOption {
+      type = types.str;
+      default = "./server.crt";
+      description = "Path to the server certificate. Relative to the config file directory.";
+    };
+    keyFile = mkOption {
+      type = types.str;
+      default = "./server.key";
+      description = "Path to the server private key. Relative to the config file directory.";
+    };
+    requiredOid = mkOption {
+      type = types.str;
+      default = requiredOid;
+      description = "EKU OID the local server certificate must contain.";
+    };
+    peerOid = mkOption {
+      type = types.str;
+      default = peerOid;
+      description = "EKU OID the peer (client) certificate must contain.";
+    };
   };
 
   # The document-level approval rules (`[[rule]]`) and `[labels]` display map —
@@ -263,126 +247,128 @@
     };
   };
 
-  # One per-listener option set, instantiated twice:
-  #   `nullable = false; withType = false` → the `listenerDefaults` block (real
-  #                                          defaults, no `type`);
-  #   `nullable = true;  withType = true`  → a `listeners` entry (requires
-  #                                          `type`; every other field is a
-  #                                          sparse `nullOr` override).
+  # One per-listener option set. Every entry is **self-contained**: each field
+  # carries its real default, so an entry that omits it is complete on its own
+  # and there is no shared `[listener_defaults]` block. `type` is required and
+  # `name` is the optional label `rule.*.match.listeners` selects on.
   mkListenerOptions = {
     lib,
-    pkgs,
-    nullable,
-    withType,
     requiredOid,
     peerOid,
   }: let
     inherit (lib) mkOption types;
-    o = nullableOpt {inherit lib nullable;};
-  in
-    {
-      # Address / bind target. Each is meaningful only for its own `type`, but
-      # all are accepted on every listener (the old flat options had the same
-      # shape), so one entry can be retargeted without knowing the `type`.
-      port = mkOption ((o types.port 65001)
-        // {
-          description = "Port the listener binds. Used with tcp/vsock.";
-        });
-      cid = mkOption ((o types.int 2)
-        // {
-          description = "VSOCK context ID to bind to (2 = host). Only used with vsock.";
-        });
-      host = mkOption ((o types.str "127.0.0.1")
-        // {
-          description = "TCP address to bind to. Only used with tcp.";
-        });
-      socket = mkOption ((o types.str "%t/sudo-auth-proxy/server.sock")
-        // {
-          description = ''
-            Unix socket the listener binds. Guest identity comes from the request
-            credentials, never the socket path.
-          '';
-        });
-      socketDirMode = mkOption ((o types.str "0700")
-        // {
-          description = "Mode of the unix socket's parent directory.";
-        });
-      socketMode = mkOption ((o types.str "0600")
-        // {
-          description = "Mode of the unix server socket.";
-        });
-      # Timeouts and pre-auth resource bounds.
-      connectTimeout = mkOption ((o types.float 0.2)
-        // {
-          description = "Seconds to wait for the transport connect before failing fast.";
-        });
-      decisionTimeout = mkOption ((o types.int 120)
-        // {
-          description = "Seconds to wait for the human decision (0 = wait indefinitely).";
-        });
-      recvTimeout = mkOption ((o types.float 0.5)
-        // {
-          description = "Seconds to wait for the first response bytes.";
-        });
-      maxConnections = mkOption ((o types.ints.positive 64)
-        // {
-          description = ''
-            Maximum number of handler threads the listener runs at once (audit
-            A3). An over-cap connection is refused before a handler thread is
-            spawned; the cap also bounds stalled TLS handshakes. Emitted as
-            `max_connections`; the default matches the Python
-            `DEFAULT_MAX_CONNECTIONS`.
-          '';
-        });
-      serverReadTimeout = mkOption ((o types.float 10.0)
-        // {
-          description = ''
-            Seconds an accepted connection may stall before authentication --
-            the TLS handshake and the pre-auth request read -- before it is
-            dropped (audit A3/N2). Emitted as `server_read_timeout`; the default
-            matches the Python `DEFAULT_SERVER_READ_TIMEOUT`.
-          '';
-        });
-      # Per-listener identity resolution (`unix` cannot do tartarus/mofos).
-      resolution = mkOption ((o (types.nullOr (types.enum ["none" "certificate" "tartarus" "mofos"])) null)
-        // {
-          description = ''
-            How to resolve a connecting client's name shown in the elevation
-            dialog and offered to the `match.machine` selector:
-            `none` (no resolution), `certificate` (verified peer cert CN/SAN),
-            `tartarus` (local VM id/name bookkeeping via the state directory), or
-            `mofos` (`mofos ls --json`, matching the peer's VSOCK CID or
-            `ipv4_address` to a VM name). `null` (the default) leaves the choice
-            to the Python's per-listener fallback.
-          '';
-        });
-      # Per-listener transport security (there is no per-listener ACL: the
-      # document-level `server.rule` list scopes itself with `match.listeners`).
-      security = mkSecurityOptions {inherit lib nullable;};
-      mtls = mkMtlsOptions {inherit lib nullable requiredOid peerOid;};
-    }
-    // lib.optionalAttrs withType {
-      type = mkOption {
-        type = types.enum ["vsock" "tcp" "unix"];
-        description = "Transport this listener binds (required for every entry).";
-      };
-      name = mkOption {
-        type = types.nullOr types.str;
-        default = null;
-        description = ''
-          Optional name for this listener, unique across the server.
-          `rule.*.match.listeners` selects listeners by this name; an unnamed
-          listener matches only an empty selector or one made exclusively of
-          `*` patterns.
-        '';
-      };
+  in {
+    type = mkOption {
+      type = types.enum ["vsock" "tcp" "unix"];
+      description = "Transport this listener binds (required for every entry).";
     };
+    name = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Optional name for this listener, unique across the server.
+        `rule.*.match.listeners` selects listeners by this name; an unnamed
+        listener matches only an empty selector or one made exclusively of
+        `*` patterns.
+      '';
+    };
+    # Address / bind target. Each is meaningful only for its own `type`, but
+    # all are accepted on every listener (the old flat options had the same
+    # shape), so one entry can be retargeted without knowing the `type`.
+    port = mkOption {
+      type = types.port;
+      default = 65001;
+      description = "Port the listener binds. Used with tcp/vsock.";
+    };
+    cid = mkOption {
+      type = types.int;
+      default = 2;
+      description = "VSOCK context ID to bind to (2 = host). Only used with vsock.";
+    };
+    host = mkOption {
+      type = types.str;
+      default = "127.0.0.1";
+      description = "TCP address to bind to. Only used with tcp.";
+    };
+    socket = mkOption {
+      type = types.str;
+      default = "%t/sudo-auth-proxy/server.sock";
+      description = ''
+        Unix socket the listener binds. Guest identity comes from the request
+        credentials, never the socket path.
+      '';
+    };
+    socketDirMode = mkOption {
+      type = types.str;
+      default = "0700";
+      description = "Mode of the unix socket's parent directory.";
+    };
+    socketMode = mkOption {
+      type = types.str;
+      default = "0600";
+      description = "Mode of the unix server socket.";
+    };
+    # Timeouts and pre-auth resource bounds.
+    connectTimeout = mkOption {
+      type = types.float;
+      default = 0.2;
+      description = "Seconds to wait for the transport connect before failing fast.";
+    };
+    decisionTimeout = mkOption {
+      type = types.int;
+      default = 120;
+      description = "Seconds to wait for the human decision (0 = wait indefinitely).";
+    };
+    recvTimeout = mkOption {
+      type = types.float;
+      default = 0.5;
+      description = "Seconds to wait for the first response bytes.";
+    };
+    maxConnections = mkOption {
+      type = types.ints.positive;
+      default = 64;
+      description = ''
+        Maximum number of handler threads the listener runs at once (audit
+        A3). An over-cap connection is refused before a handler thread is
+        spawned; the cap also bounds stalled TLS handshakes. Emitted as
+        `max_connections`; the default matches the Python
+        `DEFAULT_MAX_CONNECTIONS`.
+      '';
+    };
+    serverReadTimeout = mkOption {
+      type = types.float;
+      default = 10.0;
+      description = ''
+        Seconds an accepted connection may stall before authentication --
+        the TLS handshake and the pre-auth request read -- before it is
+        dropped (audit A3/N2). Emitted as `server_read_timeout`; the default
+        matches the Python `DEFAULT_SERVER_READ_TIMEOUT`.
+      '';
+    };
+    # Per-listener identity resolution (`unix` cannot do tartarus/mofos).
+    resolution = mkOption {
+      type = types.nullOr (types.enum ["none" "certificate" "tartarus" "mofos"]);
+      default = null;
+      description = ''
+        How to resolve a connecting client's name shown in the elevation
+        dialog and offered to the `match.machine` selector:
+        `none` (no resolution), `certificate` (verified peer cert CN/SAN),
+        `tartarus` (local VM id/name bookkeeping via the state directory), or
+        `mofos` (`mofos ls --json`, matching the peer's VSOCK CID or
+        `ipv4_address` to a VM name). `null` (the default) leaves the choice
+        to the Python's per-listener fallback.
+      '';
+    };
+    # Per-listener transport security (there is no per-listener ACL: the
+    # document-level `server.rule` list scopes itself with `match.listeners`).
+    security = mkSecurityOptions {inherit lib;};
+    mtls = mkMtlsOptions {inherit lib requiredOid peerOid;};
+  };
 
-  # Reusable `server` option set. `listenerDefaults` is deep-merged
-  # (Python-side) into every `listeners` entry; the genuinely non-transport
-  # options stay flat. The old flat transport/host/port/... options are removed
-  # outright: a partially-migrated config fails evaluation loudly rather than
-  # binding the wrong transport.
+  # Reusable `server` option set. Every `listeners` entry is self-contained;
+  # the genuinely non-transport options stay flat. The old flat
+  # transport/host/port/... options are removed outright: a partially-migrated
+  # config fails evaluation loudly rather than binding the wrong transport.
   mkServerOptions = {
     lib,
     pkgs,
@@ -439,39 +425,27 @@
       description = "Fingerprint (`SHA256:...`) -> display-label map. Display/log only, never an authorization input.";
     };
 
-    listenerDefaults = mkOption {
-      type = types.submodule {
-        options = mkListenerOptions {
-          inherit lib pkgs requiredOid peerOid;
-          nullable = false;
-          withType = false;
-        };
-      };
-      default = {};
-      description = "Default values deep-merged into every entry of `listeners`.";
-    };
-
     listeners = mkOption {
       type = types.listOf (types.submodule {
         options = mkListenerOptions {
-          inherit lib pkgs requiredOid peerOid;
-          nullable = true;
-          withType = true;
+          inherit lib requiredOid peerOid;
         };
       });
       default = [];
       description = ''
         One entry per transport this server binds, all in the single server
-        process. Multiple entries of the same `type` are allowed (e.g. two
-        `unix` listeners with different transport security). Empty means the server binds
-        nothing and, when enabled, the module rejects the configuration.
+        process. Every entry is self-contained (its fields carry real defaults),
+        so there is no shared `[listener_defaults]` block. Multiple entries of
+        the same `type` are allowed (e.g. two `unix` listeners with different
+        transport security). Empty means the server binds nothing and, when
+        enabled, the module rejects the configuration.
       '';
     };
   };
 
   # Recursively drop `null` attributes (the spec's `pruneNulls`). Needed because
-  # `pkgs.formats.toml` (json2toml) refuses `null`, and every sparse
-  # `listeners` entry carries `null` for the fields it does not override.
+  # `pkgs.formats.toml` (json2toml) refuses `null`, and a listener's `name` /
+  # `resolution` are optional (`nullOr`).
   mkPruneNulls = lib: let
     prune = v:
       if builtins.isAttrs v
@@ -483,35 +457,28 @@
     prune;
 
   # Resolve the effective (transport_encryption, client_auth, server_auth)
-  # triple for one listener entry, using the entry's own `type` and the
-  # `listenerDefaults` fallback. This mirrors the Python exactly: the defaults
-  # are `recursiveUpdate`d under the entry *after* the entry's nulls are pruned
-  # (otherwise every sparse entry would clobber the defaults with `null`).
-  # `mtls.enable` forces mTLS; `auto` follows the type (tcp → mtls else none);
-  # and mTLS forces both auths to "transport".
-  mkResolveSecurity = {
-    lib,
-    defaults,
-  }: prune: entry: let
-    merged = lib.recursiveUpdate defaults (prune entry);
-    requested = merged.security.transportEncryption;
+  # triple for one listener entry from the entry alone. This mirrors the Python
+  # exactly: `mtls.enable` forces mTLS; `auto` follows the type (tcp → mtls else
+  # none); and mTLS forces both auths to "transport".
+  resolveListener = entry: let
+    requested = entry.security.transportEncryption;
     effectiveTransportEncryption =
-      if merged.mtls.enable
+      if entry.mtls.enable
       then "mtls"
       else if requested != "auto"
       then requested
-      else if (entry.type or null) == "tcp"
+      else if entry.type == "tcp"
       then "mtls"
       else "none";
     forceTransportAuth = effectiveTransportEncryption == "mtls";
     effectiveClientAuth =
       if forceTransportAuth
       then "transport"
-      else merged.security.clientAuth;
+      else entry.security.clientAuth;
     effectiveServerAuth =
       if forceTransportAuth
       then "transport"
-      else merged.security.serverAuth;
+      else entry.security.serverAuth;
   in {
     inherit
       effectiveTransportEncryption
@@ -521,63 +488,40 @@
   };
 
   # Render the whole server TOML document for one server instance:
-  # `mode`/`dialog_program`/`debug`, the fully-rendered `[listener_defaults]`
-  # block, then a sparse `[[listeners]]` entry per listener. `pkgs.formats.toml`
-  # is fed the already-pruned attrset (json2toml is fatal on `null`).
+  # `mode`/`dialog_program`/`debug`, then one fully-rendered `[[listeners]]`
+  # entry per listener. `pkgs.formats.toml` is fed the already-pruned attrset
+  # (json2toml is fatal on `null`).
   renderServerToml = {
     lib,
     server,
   }: let
     prune = mkPruneNulls lib;
-    defaults = server.listenerDefaults;
-    resolve = mkResolveSecurity {inherit lib defaults;} prune;
 
-    # One listener (or the defaults block). `isEntry = false` renders the
-    # defaults fully: every field has a real value and the `[mtls]` paths are
-    # emitted even with `enable = false`, because the Python needs them when an
-    # entry resolves to mTLS via `auto` on `tcp`.
-    renderListener = {
-      entry,
-      isEntry,
-    }: let
-      resolved = resolve entry;
+    # One self-contained `[[listeners]]` entry: its own type/name, bind target,
+    # timeouts, resolved `[security]` and, when it resolves to mTLS, its own
+    # `[mtls]` block. `enable` is always true in an emitted mTLS block.
+    renderListener = entry: let
+      resolved = resolveListener entry;
 
-      securityValues =
-        if isEntry
-        then {
-          transport_encryption = resolved.effectiveTransportEncryption;
-          client_auth = resolved.effectiveClientAuth;
-          server_auth = resolved.effectiveServerAuth;
-        }
-        else {
-          transport_encryption = defaults.security.transportEncryption;
-          client_auth = defaults.security.clientAuth;
-          server_auth = defaults.security.serverAuth;
-        };
-      security = prune (securityValues
-        // {
-          response_ttl = entry.security.responseTtl;
-          clock_skew = entry.security.clockSkew;
-        });
+      security = prune {
+        transport_encryption = resolved.effectiveTransportEncryption;
+        client_auth = resolved.effectiveClientAuth;
+        server_auth = resolved.effectiveServerAuth;
+        response_ttl = entry.security.responseTtl;
+        clock_skew = entry.security.clockSkew;
+      };
 
-      # Emit `[mtls]` for the defaults block always; for an entry only when it
-      # resolves to mTLS. An entry always advertises `enable = true` (as the old
-      # emitter did); the defaults block carries the literal `enable` value.
       mtls =
-        if isEntry && resolved.effectiveTransportEncryption != "mtls"
+        if resolved.effectiveTransportEncryption != "mtls"
         then null
-        else
-          prune {
-            enable =
-              if isEntry
-              then true
-              else entry.mtls.enable;
-            ca_file = entry.mtls.caFile;
-            cert_file = entry.mtls.certFile;
-            key_file = entry.mtls.keyFile;
-            required_oid = entry.mtls.requiredOid;
-            peer_required_oid = entry.mtls.peerOid;
-          };
+        else {
+          enable = true;
+          ca_file = entry.mtls.caFile;
+          cert_file = entry.mtls.certFile;
+          key_file = entry.mtls.keyFile;
+          required_oid = entry.mtls.requiredOid;
+          peer_required_oid = entry.mtls.peerOid;
+        };
 
       scalars = {
         port = entry.port;
@@ -595,16 +539,11 @@
       };
     in
       prune (
-        (
-          if isEntry
-          then
-            {type = entry.type;}
-            // lib.optionalAttrs (entry.name != null) {name = entry.name;}
-          else {}
-        )
+        {type = entry.type;}
+        // lib.optionalAttrs (entry.name != null) {name = entry.name;}
         // scalars
-        // lib.optionalAttrs (security != {}) {security = security;}
-        // lib.optionalAttrs (mtls != null && mtls != {}) {mtls = mtls;}
+        // {security = security;}
+        // lib.optionalAttrs (mtls != null) {mtls = mtls;}
       );
 
     # One `[[rule]]` entry: `match` (pruned to the selectors that are set) plus
@@ -629,34 +568,20 @@
       // lib.optionalAttrs server.debug {debug = true;}
       // lib.optionalAttrs (server.rule != []) {rule = map renderRule server.rule;}
       // lib.optionalAttrs (server.labels != {}) {labels = server.labels;}
-      // {
-        listener_defaults = renderListener {
-          entry = defaults;
-          isEntry = false;
-        };
-        listeners = map (entry:
-          renderListener {
-            inherit entry;
-            isEntry = true;
-          })
-        server.listeners;
-      }
+      // {listeners = map renderListener server.listeners;}
       // server.extraSettings;
   in
     prune document;
 
   # Per-listener assertions for one server instance (doc §2.4). Every entry must
   # satisfy `transport_encryption = "none" ⇒ client_auth = server_auth = "none"`,
-  # resolving the auths from the merged defaults so a sparse entry that only
-  # sets `transportEncryption = "none"` fails loudly instead of silently
+  # resolving the auths from the entry itself so one that only sets
+  # `transportEncryption = "none"` fails loudly instead of silently
   # disabling authentication. An enabled server with no listeners is rejected.
   mkServerAssertions = {
     lib,
     server,
   }: let
-    prune = mkPruneNulls lib;
-    defaults = server.listenerDefaults;
-    resolve = mkResolveSecurity {inherit lib defaults;} prune;
     namedListeners = lib.filter (n: n != null) (map (e: e.name) server.listeners);
     duplicateNames = lib.unique (
       lib.filter (n: lib.count (m: m == n) namedListeners > 1) namedListeners
@@ -664,7 +589,7 @@
   in
     map (entry: {
       assertion = let
-        resolved = resolve entry;
+        resolved = resolveListener entry;
       in
         resolved.effectiveTransportEncryption
         != "none"
@@ -851,8 +776,8 @@
 
       server = mkServerOptions {inherit lib pkgs;};
 
-      # A second, independent server instance. It has its own `listeners` /
-      # `listenerDefaults` listeners and config file, and runs as a unit named
+      # A second, independent server instance. It has its own `listeners` and
+      # config file, and runs as a unit named
       # `sudo-auth-proxy-<name>`; the `server` above stays the default instance.
       # This lets one host run, for example, the tartarus guest callback server
       # alongside an SSH-forwarded `unix` server for a remote host.
@@ -1218,8 +1143,8 @@
       then server.configPath
       else "${config.home.homeDirectory}/.config/sudo-auth-proxy/config.toml";
 
-    # The generated server TOML: `[listener_defaults]` + `[[listeners]]`, one
-    # listener per entry in `server.listeners`. See `renderServerToml`.
+    # The generated server TOML: one self-contained `[[listeners]]` entry per
+    # entry in `server.listeners`. See `renderServerToml`.
     configFile = tomlFormat.generate "sudo-auth-proxy-server.toml" (renderServerToml {inherit lib server;});
   in {
     imports = [optionsModule namedServersModule];

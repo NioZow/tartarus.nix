@@ -6,27 +6,33 @@
 # `tartarus.sudo-auth-proxy` in the NixOS/home-manager modules, and the MOFOS
 # guest at `hosts/nixos/mofos/default.nix`).
 #
-# It is deliberately written as a plain TOML file so it can run on a machine
-# with no Nix at all — any Linux distribution with Python 3.11+ and the
-# `cryptography` wheel. The full design and threat model live in
-# `docs/technical/sudo-auth-proxy.md`; §15.1 has the step-by-step setup.
+# It is deliberately a plain TOML file so it can run on a machine with no Nix at
+# all — any Linux distribution with Python 3.11+ and the `cryptography` wheel.
+# The full design and threat model live in `docs/technical/sudo-auth-proxy.md`;
+# §15.1 has the step-by-step setup.
 #
 # Copy it to `~/.config/sudo-auth-proxy/config.toml` and run:
 #
 #   sudo-auth-proxy --config ~/.config/sudo-auth-proxy/config.toml
 #
-# This is the **flat** (single-transport) form: a top-level `transport` plus the
-# `[security]`/`[mtls]` tables and the document-level `[[rule]]` list. The server
-# still accepts it and treats the whole document as **one implicit listener**, so
-# existing hand-written configs keep working. To bind several transports in one
-# process (a `vsock` VM *and* a `tcp` container *and* an `ssh -R` forwarded
-# `unix` socket), use the multi-listener form instead:
-# `examples/sudo-auth-proxy-listeners.toml` — a `[listener_defaults]` table plus
-# one `[[listeners]]` entry per listener. This file and that one are the same
-# server, one listener versus many.
+# ONE server binds MANY listeners. A listener is one socket plus its transport,
+# described by one `[[listeners]]` entry; the whole document — the dialog
+# backend, the approval rules — is shared. This example binds three listeners in
+# the one process:
+#
+#   * `vsock`  "vm-callback"   a Linux MicroVM dials the host callback endpoint;
+#   * `tcp`    "tcp-callback"  a container / stand-in VM dials an address:port;
+#   * `unix`   "remote-guest"  the host dials into a guest over SSH and forwards
+#                              a Unix socket (`ssh -R`), authenticated with mTLS.
+#
+# Every `[[listeners]]` entry is **self-contained**: a field it omits simply
+# falls back to the built-in default (documented per field below), so one entry
+# can be retyped without a shared defaults block. The document-level `[[rule]]`
+# list then scopes itself to a listener by name.
 #
 # Paths inside this file are resolved relative to the file's own directory, so
-# `./ca.crt` means "next to this config".
+# `./ca.crt` means "next to this config"; `%t` expands to the per-user runtime
+# directory.
 #
 # ---------------------------------------------------------------------------
 # Read this before editing: the file is validated against an EXACT schema
@@ -38,28 +44,28 @@
 # operator believes it is in force.
 #
 # The trap this schema exists for is a *placement* error. TOML assigns a key to
-# the **nearest preceding `[table]` header**, so the three authentication knobs
-# must sit *under* `[security]`: written above it they are top-level keys, the
-# service sees no `[security]` values at all, and it exits with
+# the **nearest preceding `[table]` header**, so a `[listeners.security]` block
+# belongs to the listener declared just above it, and the three authentication
+# knobs must sit *under* `[listeners.security]`: written above it they are
+# top-level listener keys, the service sees no `[security]` values at all, and it
+# exits with
 #
 #   sudo-auth-proxy: 'client_auth' must be written in [security], but it is
 #   written at the top level
 #
 # ...which is exactly as fatal as leaving them out, because with
-# `transport_encryption = "none"` the service refuses to run rather than
-# disable authentication implicitly (doc §7.5). Everything above the first
-# table header must stay above it; every key below a header belongs to that
-# header's table until the next one.
+# `transport_encryption = "none"` the service refuses to run rather than disable
+# authentication implicitly (§7.5). The `[listener_defaults]` block was removed:
+# there is no shared default table any more, each entry carries its own values.
 #
-# Accepted top-level keys: mode, transport, cid, host, port, socket,
-# socket_dir_mode, socket_mode, connect_timeout, decision_timeout, recv_timeout,
-# max_connections, server_read_timeout, dialog_program, resolution, debug,
-# approver, client_version, guest_hint -- plus the `[security]`/`[mtls]` tables,
-# the `[labels]` map and the `[[rule]]` list. There is no `[acl]` on the server
-# (the client `[acl]` pins the trusted server instead). The full key list is doc
-# §7.9; the `[security]` keys are spelled out below.
-# `tests/test_sudo_auth_proxy.py`
-# (`test_shipped_example_config_matches_the_schema`) validates this file, so it
+# Accepted document-level keys: mode, dialog_program, debug, approver,
+# client_version, guest_hint, the `[[rule]]` list and the `[labels]` map. Every
+# `[[listeners]]` key is `type`, `name`, `port`, `cid`, `host`, `socket`,
+# `socket_dir_mode`, `socket_mode`, `connect_timeout`, `decision_timeout`,
+# `recv_timeout`, `max_connections`, `server_read_timeout`, `resolution`, and
+# the nested `[listeners.security]`/`[listeners.mtls]` tables. The full key list
+# is doc §7.9. `tests/test_sudo_auth_proxy.py`
+# (`test_shipped_multi_listener_example_parses`) loads this exact file, so it
 # cannot drift out of the schema unnoticed.
 
 # ---------------------------------------------------------------------------
@@ -70,74 +76,10 @@
 # ---------------------------------------------------------------------------
 mode = "server"
 
-# ---------------------------------------------------------------------------
-# Transport: how the guest reaches this server.
-#
-#   "vsock"  the guest dials the host over AF_VSOCK (no IP stack, no firewall
-#            port, point-to-point between the VM and its hypervisor)
-#   "tcp"    the guest dials an address:port
-#   "unix"   the host dials into the guest over SSH and forwards a Unix socket
-#            (`ssh -R`); needs no address on the guest side, but only exists
-#            while the SSH session is up
-#
-# This example is the VSOCK callback used by the MOFOS guest.
-# ---------------------------------------------------------------------------
-transport = "vsock"
-
-# The VSOCK CID to bind. `2` is VMADDR_CID_HOST — the hypervisor, from the
-# guest's point of view — and is what the tartarus host module binds. Use `-1`
-# (VMADDR_CID_ANY) to accept on every local CID instead.
-cid = 2
-
-# Both sides must agree on the port. The MOFOS guest is configured with 65012;
-# the tartarus-internal guests use 65001.
-port = 65012
-
-# ---------------------------------------------------------------------------
-# Timeouts (seconds unless noted)
-# ---------------------------------------------------------------------------
-
-# Bound on the client's connect + TLS handshake. Must be small: this process
-# backs a PAM hook that runs on *every* `sudo`, and an unreachable peer must
-# not stall the stack.
-connect_timeout = 0.2
-
-# The human window. `0` waits indefinitely; `120` is the shipped default.
-decision_timeout = 120
-
-# Bound on the first frame after the connection (the pre-dialog
-# `auth_pending` acknowledgement), so a stale/half-open peer fails fast
-# without bounding the human's time to answer.
-recv_timeout = 0.5
-
-# Pre-authentication resource bounds: at most this many handler threads run at
-# once, and an accepted connection may stall at most this long (this bounds a
-# TCP connect that never finishes its TLS handshake) before it is dropped.
-max_connections = 64
-server_read_timeout = 10.0
-
-# ---------------------------------------------------------------------------
 # The dialog backend. One of "zenity" (Linux), "osascript"/"swiftdialog" (macOS).
-#
 # It is never auto-detected: a wrong guess would either fail every prompt or,
-# worse, show a dialog on the wrong session. The prompt is a two-line summary on
-# every backend; the full detail block (identity, TTY, CWD, request id) sits
-# behind a "Details" affordance: an info button on swiftDialog, a third button on
-# osascript, and zenity's `--extra-button` -- offered only when the installed
-# zenity advertises it, which is probed once per process. "Details" is never a
-# decision on any backend; it opens a second dialog and only an explicit
-# "Authorize" there allows. `debug = true` below still logs the whole block.
-# ---------------------------------------------------------------------------
+# worse, show a dialog on the wrong session.
 dialog_program = "zenity"
-
-# `socket` is the single Unix socket for the `unix` transport (`%t` = the
-# per-user runtime directory). Unused for `vsock`/`tcp`, but harmless — and it
-# is where a `unix`-transport server would listen. It must be written BEFORE
-# the `[security]`/`[mtls]` tables below: in TOML, every key after a table
-# header belongs to that table.
-socket = "%t/sudo-auth-proxy/server.sock"
-socket_dir_mode = "0700"
-socket_mode = "0600"
 
 # Log connection/handshake/request timing and the sanitised request fields to
 # stderr. The full detail block (the one the dialog summarises) is logged here
@@ -145,68 +87,123 @@ socket_mode = "0600"
 # affordance.
 debug = false
 
-# How to resolve the connecting client's friendly name shown in the dialog:
+# ===========================================================================
+# LISTENER 1 — the VSOCK callback, named "vm-callback".
 #
-#   "none"         show the transport's raw label (address/CID)
-#   "certificate"  verified peer certificate CN (mTLS only)
+# A Linux MicroVM dials the host over AF_VSOCK: a point-to-point link between
+# the guest and its hypervisor with no network path for a third party, so this
+# listener leaves authentication explicitly off. It shows every listener key
+# written out; the two listeners below only show the keys that differ.
+# ===========================================================================
+[[listeners]]
+# Required. The transport this listener binds: "vsock" | "tcp" | "unix".
+type = "vsock"
+# Optional label, unique across the server. `[[rule]] match.listeners` selects
+# listeners by it; an unnamed listener matches only an empty/`*`-only selector.
+name = "vm-callback"
+# VSOCK CID to bind. `2` is VMADDR_CID_HOST (the hypervisor, from the guest's
+# point of view); `-1` (VMADDR_CID_ANY) accepts on every local CID.
+cid = 2
+# Port the peer dials. Both sides must agree (the MOFOS guest uses 65012).
+port = 65012
+
+# How the connecting client's friendly name (shown in the dialog, matched by
+# `rule.*.match.machine`) is resolved:
+#   "none"         the transport's raw label (address/CID)
+#   "certificate"  verified peer certificate CN/SAN (mTLS only)
 #   "tartarus"     the local VM bookkeeping state directory
-#   "mofos"        `mofos ls --json`, matching the peer's VSOCK CID or
-#                  `ipv4_address` to a VM name
-#
-# The resolved name is also what a `[[rule]]` `match.machine` selector matches.
-# For the MOFOS guest callback this example resolves the VM name via `mofos`.
+#   "mofos"        `mofos ls --json`, mapping the peer's CID or `ipv4_address`
 resolution = "mofos"
 
-# ---------------------------------------------------------------------------
-# [security] — the three authentication knobs.
-#
-# mTLS is the ONLY authentication mechanism this service has. There is no
-# message signing, no SSH-key signature, and no application-layer certificate
-# signature: either the TLS channel authenticates both peers
-# (`transport_encryption = "mtls"`, which forces both auths to "transport"),
-# or authentication is explicitly switched off on all three knobs.
-#
-# Never leave a knob out: with `transport_encryption = "none"` the service
-# refuses to start unless `client_auth` and `server_auth` are both written as
-# "none". Disabling authentication is a decision, not a default.
-# ---------------------------------------------------------------------------
-[security]
-# "none" | "mtls". A VSOCK connection is point-to-point between the guest and
-# its hypervisor, with no network path for a third party, so this example
-# leaves it unencrypted. Use "mtls" for anything that crosses a network you do
-# not control, and see docs/technical/sudo-auth-proxy.md §7 for the `[mtls]` block.
+# Timeouts and pre-auth resource bounds (seconds unless noted). `connect_timeout`
+# must be small: this backs a PAM hook that runs on *every* `sudo`, and an
+# unreachable peer must not stall the stack. `decision_timeout = 0` waits for the
+# human indefinitely. `max_connections` caps the handler threads; an accepted
+# connection may stall at most `server_read_timeout` before it is dropped.
+connect_timeout = 0.2
+decision_timeout = 120
+recv_timeout = 0.5
+max_connections = 64
+server_read_timeout = 10.0
+
+# [listeners.security] — the three authentication knobs for THIS listener.
+# mTLS is the ONLY authentication mechanism: either the TLS channel
+# authenticates both peers (`transport_encryption = "mtls"`, which forces both
+# auths to "transport"), or authentication is explicitly switched off. With
+# `transport_encryption = "none"` the service refuses to start unless
+# `client_auth` and `server_auth` are both written as "none": disabling
+# authentication is a decision, not a default.
+[listeners.security]
 transport_encryption = "none"
-
-# "transport" | "none". Does not authenticate the requester: any process inside
-# the guest that can reach CID 2 port 65012 can raise a prompt here.
 client_auth = "none"
-
-# "transport" | "none". Nothing authenticates the response, so a compromised
-# guest could feed itself an `allow`. Acceptable only because the guest is the
-# machine being *granted* privilege, and the guest cannot reach this server
-# except over the private VSOCK link.
 server_auth = "none"
 
-# Seconds a response stays valid (`issued_at` .. `expires_at`) and the clock
-# skew tolerated when checking it. Only meaningful with mTLS, but harmless.
-response_ttl = 30
-clock_skew = 5
+# ===========================================================================
+# LISTENER 2 — the TCP callback, named "tcp-callback".
+#
+# A container or stand-in VM dials an address:port. `host` is the gateway
+# address the guests reach; here it is the loopback. Like the VSOCK callback
+# this listener runs unauthenticated (a private bridge), so it names only the
+# keys that differ from the defaults.
+# ===========================================================================
+[[listeners]]
+type = "tcp"
+name = "tcp-callback"
+host = "127.0.0.1"
+port = 65001
 
-# ---------------------------------------------------------------------------
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+# ===========================================================================
+# LISTENER 3 — the SSH-forwarded unix socket, named "remote-guest".
+#
+# The host dials into the guest over SSH and forwards a Unix socket (`ssh -R`),
+# which this server binds. Unlike the callback listeners this one crosses a
+# guest the host does not fully trust with the host keyring, so it uses mTLS:
+# the TLS channel authenticates both peers and the certificate chain (against
+# `[listeners.mtls] ca_file`) is what admits the guest.
+# ===========================================================================
+[[listeners]]
+type = "unix"
+name = "remote-guest"
+socket = "%t/sudo-auth-proxy/server.sock"
+socket_dir_mode = "0700"
+socket_mode = "0600"
+resolution = "certificate"
+
+[listeners.security]
+transport_encryption = "mtls"
+client_auth = "transport"
+server_auth = "transport"
+
+# [listeners.mtls] — required when transport_encryption = "mtls". `./ca.crt`,
+# `./server.crt` and `./server.key` are the host's X.509 material; the EKU OIDs
+# separate the two roles (see the standalone setup in doc §15.1).
+[listeners.mtls]
+enable = true
+ca_file = "./ca.crt"
+cert_file = "./server.crt"
+key_file = "./server.key"
+required_oid = "1.3.6.1.4.1.99999.1.1"      # this (server) certificate
+peer_required_oid = "1.3.6.1.4.1.99999.1.2" # the peer (client) certificate
+
+# ===========================================================================
 # [[rule]] — the approval policy. A single ordered, document-level list; there
-# is no per-listener ACL and no separate authorization table. The mTLS
-# transport authenticates the requester (when `client_auth = "transport"`), and
-# the rules decide the outcome.
+# is no per-listener ACL and no separate authorization table. The mTLS transport
+# authenticates the requester (when `client_auth = "transport"`), and the rules
+# decide the outcome.
 #
 # **First match wins; there is no merging between rules.** A permissive rule
 # written above a restrictive one therefore takes precedence: rule order is a
-# security decision.
+# security decision. No rule matching means `ask`.
 #
-# Each rule has an optional `[rule.match]` table and an optional `policy`
-# (`allow` = reply without a dialog, `deny` = reply without a dialog, `ask` =
-# show the prompt; the default with no match is `ask`). Every selector is a glob
-# (`fnmatch`) written as a bare string or a list of patterns; an empty/absent
-# selector matches anything.
+# Each rule has an optional `[rule.match]` table and a `policy` (`allow` = reply
+# without a dialog, `deny` = reply without a dialog, `ask` = show the prompt).
+# Every selector is a glob (`fnmatch`) written as a bare string or a list of
+# patterns; an empty/absent selector matches anything.
 #
 #   match.machine        resolved name / label / verified credential fingerprint
 #   match.listeners      accepting listener name (empty matches any)
@@ -216,13 +213,24 @@ clock_skew = 5
 #
 # `target_user`/`invoking_user`/`service` are self-reported by the guest, so
 # they refine the decision but can never authorize a request the transport did
-# not authenticate. Uncomment to auto-allow a known VM and prompt otherwise:
-#
-#   [[rule]]
-#   match.machine = "template-nixos"
-#   match.target_user = "root"
-#   match.service = "sudo"
-#   policy = "allow"
-#
-#   [[rule]]
-#   policy = "ask"
+# not authenticate.
+# ===========================================================================
+
+# The SSH-forwarded remote guest: prompt before every elevation. Only this named
+# listener is affected; the unnamed-but-listed callbacks are covered by the
+# catch-all below.
+[[rule]]
+match.listeners = ["remote-guest"]
+policy = "ask"
+
+# Uncomment to auto-allow a known VM (matched by its resolved name) and prompt
+# otherwise. Keep it above the catch-all: the first match wins.
+# [[rule]]
+# match.machine = "template-nixos"
+# match.target_user = "root"
+# match.service = "sudo"
+# policy = "allow"
+
+# Everything else: prompt. (`allow`/`deny` answer without a dialog.)
+[[rule]]
+policy = "ask"
