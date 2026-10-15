@@ -176,17 +176,24 @@
   # inside the SSH tunnel -- the only authentication mechanism left (doc §7);
   # the guest presents its tartarus CA-chained client certificate, the host its
   # server certificate. Callback transports (`vsock`/`tcp`) are private by
-  # construction and run with no crypto and no authentication (their
-  # `security` defaults live in `listenerDefaults` below).
+  # construction and run with no crypto and no authentication, so every callback
+  # listener carries this `security` block explicitly. (`auto` would resolve a
+  # `tcp` listener to mTLS, so the callback listeners must say `none`.)
   unixSecurity = {
     transportEncryption = "mtls";
     clientAuth = "transport";
     serverAuth = "transport";
   };
+  callbackSecurity = {
+    transportEncryption = "none";
+    clientAuth = "none";
+    serverAuth = "none";
+  };
 
   sudoVsockListener = {
     type = "vsock";
     cid = 2;
+    security = callbackSecurity;
   };
   # One tcp listener per bridge address the tcp-using guests actually dial (see
   # `mkTcpHosts`): a vsock VM is excluded, so on a mixed host the container
@@ -198,6 +205,7 @@
         type = "tcp";
         inherit host;
         port = 65001;
+        security = callbackSecurity;
       })
       (mkTcpHosts sudoTcpEntries));
   sudoUnixListener = {
@@ -215,7 +223,7 @@
     # The mTLS handshake verifies the CA-chained guest certificate (no separate
     # ACL any more: authorization is the ordered `[[rule]]` list, and no rule
     # matching means `ask`). The callback listeners run with
-    # `client_auth = none` (set in `listenerDefaults`).
+    # `client_auth = none` (their explicit `callbackSecurity`).
   };
   # Stable, deterministic listener order: vsock, tcp, unix.
   sudoListeners =
@@ -239,6 +247,7 @@
     type = "vsock";
     cid = 2;
     resolution = "tartarus";
+    security = callbackSecurity;
   };
   # One tcp listener per bridge address the tcp-using guests actually dial (see
   # `mkTcpHosts`); a vsock VM is excluded so the container listener binds the
@@ -251,6 +260,7 @@
         inherit host;
         port = 65000;
         resolution = "tartarus";
+        security = callbackSecurity;
       })
       (mkTcpHosts sshTcpReq));
   sshUnixListener = {
@@ -314,46 +324,28 @@ in {
       (mkIf needsSudo {
         tartarus.sudo-auth-proxy.server = {
           enable = mkDefault true;
-          # One `{ type, ...; }` per distinct requesting transport, all bound by
-          # the single server process.
+          # One self-contained `{ type, ...; }` per distinct requesting
+          # transport, all bound by the single server process. Callback
+          # transports (`vsock`/`tcp`) run with no crypto and no authentication
+          # -- the tartarus-internal channel is private by construction, so each
+          # carries `callbackSecurity` -- while the `unix` listener overrides
+          # both with mTLS. The document-level `[[rule]]` list decides
+          # allow/ask/deny; with no rules every request is prompted.
           listeners = mkDefault sudoListeners;
-          # Shared defaults for every listener. Callback transports
-          # (`vsock`/`tcp`) run with no crypto and no authentication -- the
-          # tartarus-internal channel is private by construction -- while the
-          # `unix` listener overrides both with mTLS. The document-level
-          # `[[rule]]` list decides allow/ask/deny; with no rules every request
-          # is prompted.
-          listenerDefaults = {
-            port = mkDefault 65001;
-            # A2: the first frame (the pre-dialog ack) is bounded by the
-            # client's recvTimeout; the human decision is bounded by
-            # decisionTimeout. Keep the server values in the same shape.
-            recvTimeout = mkDefault 0.5;
-            decisionTimeout = mkDefault 120;
-            security.transportEncryption = mkDefault "none";
-            security.clientAuth = mkDefault "none";
-            security.serverAuth = mkDefault "none";
-          };
         };
       })
 
       (mkIf needsSsh {
         tartarus.ssh-agent-proxy.server = {
           enable = mkDefault true;
+          # Every listener is self-contained: the module's defaults cover
+          # connect/handshake/decision timeouts, each entry names its own bind
+          # target and security. Callback transports (`vsock`/`tcp`) are private
+          # by construction and run with no crypto and no authentication
+          # (mirrors the sudo block); the `unix` listener overrides with mTLS.
           listeners = mkDefault sshListeners;
-          # Defaults from the module cover connect/handshake/decision timeouts;
-          # only the shared bind port and the callback security are overridden
-          # here. Callback transports (`vsock`/`tcp`) are private by construction
-          # and run with no crypto and no authentication (mirrors the sudo
-          # block); the `unix` listener overrides with mTLS.
-          listenerDefaults = {
-            port = mkDefault 65000;
-            security.transportEncryption = mkDefault "none";
-            security.clientAuth = mkDefault "none";
-            security.serverAuth = mkDefault "none";
-          };
-          # `vm`/`tcp_vm` feed `resolution = "tartarus"`. A server can now have
-          # a unix listener *and* a vsock/tcp listener, so the CID/IP maps are
+          # `vm`/`tcp_vm` feed `resolution = "tartarus"`. A server can have a
+          # unix listener *and* a vsock/tcp listener, so the CID/IP maps are
           # always emitted (the old omit-on-unix hack is gone).
           settings = {
             vm = mkDefault sshVmEntries;

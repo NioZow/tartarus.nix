@@ -116,10 +116,11 @@ key-bearing shares set `snapshot = false`. Full detail in
 
 ## Service listener schemas
 
-The standalone services each render a TOML config with a `[listener_defaults]`
-block and a `[[listeners]]` array (one per bound transport), plus per-listener
-`[security]`, `[mtls]` and server-only `[acl]` blocks. The exact schema and
-generation rules are pinned in
+The standalone services each render a TOML config with a `[[listeners]]` array
+(one per bound transport), each entry self-contained and carrying its own
+`[security]`/`[mtls]` blocks (the server-only `[acl]` is the client's server
+pin). There is no `[listener_defaults]` block. The exact schema and generation
+rules are pinned in
 [Design: multi-transport server listeners](./design/transport-listeners.md),
 and the runtime semantics in [ssh-agent-proxy](./ssh-agent-proxy.md) and
 [sudo-auth-proxy](./sudo-auth-proxy.md).

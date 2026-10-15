@@ -13,7 +13,7 @@ changes to Tartarus.
 ## Documents
 
 - [Multi-transport server listeners](transport-listeners.md) — the
-  `listeners`/`listenerDefaults` schema shared by the sudo-auth-proxy and
+  self-contained `listeners` schema shared by the sudo-auth-proxy and
   ssh-agent-proxy servers.
 - [Removing the ssh-agent-proxy merge mode](remove-merge-mode.md) — why merge
   mode was removed and the replacement recipe.

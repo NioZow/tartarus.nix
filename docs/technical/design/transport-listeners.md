@@ -1,12 +1,20 @@
 # Design: multi-transport server listeners
 
-Status: proposed · Scope: `packages/tartarus.nix` (the `tartarus` submodule)
+Status: implemented · Scope: `packages/tartarus.nix` (the `tartarus` submodule)
 Touches: `nix/host/services.nix`, `nix/packages/sudo-auth-proxy/*`,
 `nix/packages/ssh-agent-proxy/*`, `tests/*`, `examples/*`, `docs/*`, `README.md`
 
 This document is a technical specification, not code. It is written so that
 independently assignable engineer tasks (§9) can implement it in parallel with
 disjoint file ownership.
+
+> **Update: the shared defaults block was removed after implementation.** The
+> original design carried a `listenerDefaults` Nix option and a
+> `[listener_defaults]` TOML block deep-merged into every entry. That block is
+> gone: **every `[[listeners]]` entry is self-contained**, so a field it omits
+> falls back to the built-in default and the Python refuses a
+> `listener_defaults` table at load time. The sections below have been updated
+> to the final shape; `listenerDefaults` should be read everywhere as "gone".
 
 ---
 
@@ -54,13 +62,13 @@ for different hosts).
   `clipboard-bridge` and every guest-side **client/bridge** keep a single
   transport and are **unchanged**.
 - The guest client still dials exactly one transport.
-- The server option surface becomes a **list** (`listeners`) plus a **defaults
-  block** (`listenerDefaults`) that is deep-merged into every entry.
+- The server option surface becomes a **list** (`listeners`) of **self-contained
+  entries**; a field an entry omits falls back to the built-in default.
 - The **old flat server options are removed outright** — no deprecated aliases —
   for both the default `server` and the `extraServer` instance.
-- The generated server TOML becomes a defaults table plus an array of listener
-  tables. The **Python deep-merges** defaults into each listener and spawns one
-  listener per entry inside the single server process.
+- The generated server TOML is an array of listener tables. The **Python
+  resolves each entry on its own** and spawns one listener per entry inside the
+  single server process.
 - The Python additionally keeps accepting a **legacy flat server config** as a
   single implicit listener (documented compatibility fallback, **not** a Nix
   option).
@@ -75,117 +83,87 @@ All options keep the repo conventions already in use: `lib.mkEnableOption`,
 
 ### 2.1 Shared helpers and the listener option builder
 
-Two new helpers are introduced in each service module (kept local to the module,
-matching the existing `mkSecurityOptions` locality):
+The reusable builders are kept local to each service module.
 
 ```nix
-# A field option that is `null` by default in the sparse (entry) variant and
-# carries its real default in the defaults variant. `pkgs.formats.toml` cannot
-# serialize `null`, so sparse entries are pruned before generation (§3.3).
-nullableOpt = {lib, nullable}: type: default: {
-  type = if nullable then lib.types.nullOr type else type;
-  default = if nullable then null else default;
-};
-```
-
-```nix
-# Reusable `[security]` builder. Same key set as today; `nullable = true`
-# yields the sparse entry variant used inside `listeners`.
-mkSecurityOptions = {lib, nullable ? false}: let
+# Reusable `[security]` builder. Every knob carries its real default, so a
+# `listeners` entry that omits it is self-contained.
+mkSecurityOptions = {lib}: let
   inherit (lib) mkOption types;
-  o = nullableOpt {inherit lib nullable;};
 in {
-  transportEncryption = mkOption ((o (types.enum ["auto" "none" "mtls"]) "auto") // {
+  transportEncryption = mkOption {
+    type = types.enum ["auto" "none" "mtls"];
+    default = "auto";
     description = ''
       Whether the byte stream is encrypted and integrity-protected. `auto`
       follows the listener's `type`: `tcp` → `mtls`, `vsock`/`unix` → `none`.
     '';
-  });
-  clientAuth  = mkOption ((o (types.enum ["transport" "none"]) "transport") // { /* … */ });
-  serverAuth  = mkOption ((o (types.enum ["transport" "none"]) "transport") // { /* … */ });
-  responseTtl = mkOption { type = types.int; default = 30; };   # never nullable
-  clockSkew   = mkOption { type = types.int; default = 5; };    # never nullable
+  };
+  clientAuth  = mkOption { type = types.enum ["transport" "none"]; default = "transport"; };
+  serverAuth  = mkOption { type = types.enum ["transport" "none"]; default = "transport"; };
+  responseTtl = mkOption { type = types.int; default = 30; };
+  clockSkew   = mkOption { type = types.int; default = 5; };
 };
 ```
 
 ```nix
-# Reusable `[mtls]` builder (extracted from today's inline server block so it can
-# be instantiated in both `listenerDefaults` and each `listeners` entry).
-mkMtlsOptions = {lib, nullable ? false, requiredOid, peerOid}: let
+# Reusable `[mtls]` builder for one listener. Every field carries its real
+# default so the listener is self-contained.
+mkMtlsOptions = {lib, requiredOid, peerOid}: let
   inherit (lib) mkOption types;
-  o = nullableOpt {inherit lib nullable;};
 in {
-  enable    = mkOption ((o types.bool false) // { /* … */ });
-  caFile    = mkOption ((o types.str "./ca.crt") // { /* … */ });
-  certFile  = mkOption ((o types.str "./server.crt") // { /* … */ });
-  keyFile   = mkOption ((o types.str "./server.key") // { /* … */ });
-  requiredOid = mkOption ((o types.str requiredOid) // { /* … */ });
-  peerOid     = mkOption ((o types.str peerOid) // { /* … */ });
+  enable    = mkOption { type = types.bool; default = false; };
+  caFile    = mkOption { type = types.str; default = "./ca.crt"; };
+  certFile  = mkOption { type = types.str; default = "./server.crt"; };
+  keyFile   = mkOption { type = types.str; default = "./server.key"; };
+  requiredOid = mkOption { type = types.str; default = requiredOid; };
+  peerOid     = mkOption { type = types.str; default = peerOid; };
 };
 ```
 
-```nix
-# Reusable `[acl]` builder — server-only, so it exists only in the sudo module.
-# `rule` reuses today's `[[acl.rule]]` submodule verbatim.
-mkAclOptions = {lib, nullable ? false}: let
-  inherit (lib) mkOption types;
-  o = nullableOpt {inherit lib nullable;};
-in {
-  mode = mkOption ((o (types.enum ["list" "ca" "none"]) "list") // { /* … */ });
-  trustedFingerprints = mkOption ((o (types.listOf types.str) []) // { /* … */ });
-  caFile = mkOption ((o (types.nullOr types.str) null) // { /* … */ });  # already nullOr
-  requiredOid = mkOption ((o (types.nullOr types.str) null) // { /* … */ });
-  rule = mkOption ((o (types.listOf (types.submodule { /* identity/targetUser/invokingUser/service/policy */ })) []) // { /* … */ });
-};
-```
-
-The per-listener option set is one builder, instantiated twice:
+The per-listener option set is one builder used for the `listeners` array:
 
 ```nix
-# `withType = false` → the `listenerDefaults` block (no `type`; real defaults
-#                     via nullable = false).
-# `withType = true`  → a `listeners` entry (requires `type`; every other field
-#                     is nullable, default null, so the entry is sparse).
-mkListenerOptions = {lib, pkgs, nullable, withType, requiredOid, peerOid}: let
+mkListenerOptions = {lib, pkgs, requiredOid, peerOid}: let
   inherit (lib) mkOption types;
-  o = nullableOpt {inherit lib nullable;};
 in {
-  # Address / bind target. Each is meaningful only for its own `type`, but all
-  # are accepted on every listener (the old flat options had the same shape).
-  port        = mkOption ((o types.port 65001) // { /* … */ });
-  cid         = mkOption ((o types.int 2) // { /* … */ });
-  host        = mkOption ((o types.str "127.0.0.1") // { /* … */ });
-  socket      = mkOption ((o types.str "%t/sudo-auth-proxy/server.sock") // { /* … */ });
-  socketDirMode = mkOption ((o types.str "0700") // { /* … */ });
-  socketMode    = mkOption ((o types.str "0600") // { /* … */ });
-  # Timeouts and pre-auth resource bounds.
-  connectTimeout   = mkOption ((o types.float 0.2) // { /* … */ });
-  decisionTimeout  = mkOption ((o types.int 120) // { /* … */ });
-  recvTimeout      = mkOption ((o types.float 0.5) // { /* … */ });
-  maxConnections   = mkOption ((o types.ints.positive 64) // { /* … */ });
-  serverReadTimeout = mkOption ((o types.float 10.0) // { /* … */ });
-  # Per-listener identity resolution (`unix` cannot do tartarus/mofos).
-  resolution = mkOption ((o (types.nullOr (types.enum ["none" "certificate" "tartarus" "mofos"])) null) // { /* … */ });
-  # Per-listener security / mTLS / ACL.
-  security = mkSecurityOptions {inherit lib nullable;};
-  mtls     = mkMtlsOptions {inherit lib nullable requiredOid peerOid;};
-  acl      = mkAclOptions {inherit lib nullable;};   # sudo only
-} // lib.optionalAttrs (withType) {
   type = mkOption {
     type = types.enum ["vsock" "tcp" "unix"];
     description = "Transport this listener binds (required for every entry).";
   };
+  name = mkOption { type = types.nullOr types.str; default = null; };
+  # Address / bind target. Each is meaningful only for its own `type`, but all
+  # are accepted on every listener (the old flat options had the same shape).
+  port        = mkOption { type = types.port; default = 65001; };
+  cid         = mkOption { type = types.int; default = 2; };
+  host        = mkOption { type = types.str; default = "127.0.0.1"; };
+  socket      = mkOption { type = types.str; default = "%t/sudo-auth-proxy/server.sock"; };
+  socketDirMode = mkOption { type = types.str; default = "0700"; };
+  socketMode    = mkOption { type = types.str; default = "0600"; };
+  # Timeouts and pre-auth resource bounds.
+  connectTimeout   = mkOption { type = types.float; default = 0.2; };
+  decisionTimeout  = mkOption { type = types.int; default = 120; };
+  recvTimeout      = mkOption { type = types.float; default = 0.5; };
+  maxConnections   = mkOption { type = types.ints.positive; default = 64; };
+  serverReadTimeout = mkOption { type = types.float; default = 10.0; };
+  # Per-listener identity resolution (`unix` cannot do tartarus/mofos).
+  resolution = mkOption {
+    type = types.nullOr (types.enum ["none" "certificate" "tartarus" "mofos"]);
+    default = null;
+  };
+  # Per-listener security / mTLS. There is no per-listener ACL: the
+  # document-level `[[rule]]` list scopes itself with `match.listeners`.
+  security = mkSecurityOptions {inherit lib;};
+  mtls     = mkMtlsOptions {inherit lib requiredOid peerOid;};
 };
-# `listenerDefaults` = mkListenerOptions {nullable=false; withType=false; inherit requiredOid peerOid;};
-# `listeners`        = types.listOf (types.submodule {
-#     options = mkListenerOptions {nullable=true; withType=true; inherit requiredOid peerOid;};
+# `listeners` = types.listOf (types.submodule {
+#     options = mkListenerOptions {inherit lib pkgs requiredOid peerOid;};
 #   });
 ```
 
-> Note on `null` and `nullable` defaults: an entry that sets nothing is a
-> submodule with every field `null`. That is intentional — the entry is a
-> **sparse override** and the real value comes from `listenerDefaults` (merged
-> by the Python, §4.1). The TOML emitter prunes `null` fields (§3.3).
+> Note on `null`: only `name` and `resolution` are `nullOr`; every other field
+> has a real default. The TOML emitter still prunes `null` fields before
+> generation (§3.3).
 
 ### 2.2 `sudo-auth-proxy` server schema (`mkServerOptions`)
 
@@ -207,38 +185,31 @@ in {
   debug         = mkOption { type = types.bool; default = false; };
   extraSettings = mkOption { type = types.attrs; default = {}; };
 
-  # ---- defaults deep-merged into every listener (Python-side) ----
-  listenerDefaults = mkOption {
-    type = types.submodule { options = mkListenerOptions {inherit lib pkgs requiredOid peerOid; nullable = false; withType = false;}; };
-    default = {};
-    description = "Default values for every field of every entry in `listeners`.";
-  };
-
-  # ---- the listeners ----
+  # ---- the listeners (each self-contained) ----
   listeners = mkOption {
     type = types.listOf (types.submodule {
-      options = mkListenerOptions {inherit lib pkgs requiredOid peerOid; nullable = true; withType = true;};
+      options = mkListenerOptions {inherit lib pkgs requiredOid peerOid;};
     });
     default = [];
     description = ''
       One entry per transport this server binds, all in the single server
-      process. Multiple entries of the same `type` are allowed (e.g. two `unix`
-      listeners with different ACLs). Empty means the server binds nothing and
-      the module rejects the configuration (see the assertion in §2.4).
+      process. Each entry is self-contained (a field it omits uses the built-in
+      default). Multiple entries of the same `type` are allowed (e.g. two `unix`
+      listeners). Empty means the server binds nothing and the module rejects
+      the configuration (see the assertion in §2.4).
     '';
   };
 };
 ```
 
-Defaults chosen for `listenerDefaults` (so an out-of-the-box server is
-byte-identical in *effective* terms to today's single-listener defaults):
-`port = 65001`, `connectTimeout = 0.2`, `decisionTimeout = 120`,
-`recvTimeout = 0.5`, `maxConnections = 64`, `serverReadTimeout = 10.0`,
-`resolution = null`, `cid = 2`, `host = "127.0.0.1"`,
+Field defaults (so an out-of-the-box server is byte-identical in *effective*
+terms to the historical single-listener defaults): `port = 65001`,
+`connectTimeout = 0.2`, `decisionTimeout = 120`, `recvTimeout = 0.5`,
+`maxConnections = 64`, `serverReadTimeout = 10.0`, `resolution = null`,
+`cid = 2`, `host = "127.0.0.1"`,
 `socket = "%t/sudo-auth-proxy/server.sock"`, `socketDirMode = "0700"`,
 `socketMode = "0600"`, `security = mkSecurityOptions {…}` (defaults as today),
-`mtls = mkMtlsOptions {…}` (defaults as today), `acl = mkAclOptions {…}`
-(default `mode = "list"`).
+`mtls = mkMtlsOptions {…}` (defaults as today).
 
 `extraServer` = `mkServerOptions {inherit lib pkgs;} // { name = mkOption {type = types.str; default = "extra";}; }`.
 The old `withSecurity` parameter and the `extraServer.security` block are gone.
@@ -268,15 +239,14 @@ server = {
   dialogProgram = mkOption { type = types.enum ["swiftdialog" "osascript" "zenity"]; default = …; };
   debug = mkOption { type = types.bool; default = false; };
   settings = mkOption { type = types.submodule { freeformType = tomlFormat.type; options = { … }; }; default = {}; };
-  listenerDefaults = mkOption { type = types.submodule { options = sshListenerOptions {nullable = false; withType = false;}; }; default = {}; };
-  listeners = mkOption { type = types.listOf (types.submodule { options = sshListenerOptions {nullable = true;  withType = true;}; }); default = []; };
+  listeners = mkOption { type = types.listOf (types.submodule { options = sshListenerOptions {inherit lib;}; }); default = []; };
 };
 ```
 
-`sshListenerOptions` = `mkListenerOptions` minus `acl`, plus these per-listener
-fields (all `nullable`-aware like the rest):
+`sshListenerOptions` is the per-listener builder (no ACL table). Its fields and
+built-in defaults:
 
-| Nix option | TOML key | default (`listenerDefaults`) |
+| Nix option | TOML key | default |
 | --- | --- | --- |
 | `type` | `type` | *(entry only)* |
 | `port` | `port` | `65000` |
@@ -302,14 +272,14 @@ client options of `tartarus.sudo-auth-proxy.*` and
 `tartarus.ssh-agent-proxy.bridge.*` are **untouched** (see §2.5).
 
 **`extraServer`** keeps only its `name` option on top of the same
-`mkServerOptions`, exactly as today, but with the new `listenerDefaults` /
-`listeners` shape. There is no `extraServer.security` any more; a second
-instance configures its own `listeners`.
+`mkServerOptions`, exactly as today, but with the `listeners` shape. There is no
+`extraServer.security` any more; a second instance configures its own
+`listeners`.
 
 **Assertions.** The existing eval-time assertions that reference the flat
-transport/security must be rewritten per listener:
+transport/security are rewritten per listener:
 
-- sudo, for every `listenerDefaults`-merged entry, the eval-time guard
+- sudo, for every entry, the eval-time guard
   `effectiveTransportEncryption != "none" || (clientAuth == "none" && serverAuth == "none")`
   is evaluated per entry. Concretely:
   ```nix
@@ -326,14 +296,12 @@ transport/security must be rewritten per listener:
   };
   ```
   where `effectiveEncryption`/`effectiveClientAuth`/`effectiveServerAuth` resolve
-  an entry exactly as the old emitter did (`mtls.enable` → mtls; `auto` → mtls
-  on `tcp` else none; mtls forces both auths to `transport`), but using the
-  entry's own `type` and the `listenerDefaults` fallback. The merge here is a
-  plain `lib.recursiveUpdate defaults entry` because the assertion must see the
+  an entry from the entry itself (`mtls.enable` → mtls; `auto` → mtls on `tcp`
+  else none; mtls forces both auths to `transport`), so the assertion sees the
   same effective values the Python will.
 - ssh: `mtls.enable` vs explicit `transportEncryption` conflict and the
-  `unix`+`resolution` restriction become **per-entry**. No `transport` list
-  means no conflict at all.
+  `unix`+`resolution` restriction are **per-entry**. No `transport` list means
+  no conflict at all.
 
 ### 2.5 Client and bridge options are untouched
 
@@ -361,41 +329,20 @@ mode = "server"                 # ssh: mode = "proxy"
 dialog_program = "zenity"
 debug = true                    # omitted when false (existing behaviour)
 
-[listener_defaults]
-port = 65001
+[[listeners]]
+type = "vsock"
 cid = 2
-host = "127.0.0.1"
-socket = "%t/sudo-auth-proxy/server.sock"
-socket_dir_mode = "0700"
-socket_mode = "0600"
+resolution = "mofos"            # only when non-null
 connect_timeout = 0.2
 decision_timeout = 120
 recv_timeout = 0.5
 max_connections = 64
 server_read_timeout = 10.0
-resolution = "mofos"            # only when non-null
 
-[listener_defaults.security]
-transport_encryption = "auto"
-client_auth = "transport"
-server_auth = "transport"
-response_ttl = 30
-clock_skew = 5
-
-[listener_defaults.mtls]
-enable = false
-ca_file = "./ca.crt"
-cert_file = "./server.crt"
-key_file = "./server.key"
-required_oid = "1.3.6.1.4.1.99999.1.1"
-peer_required_oid = "1.3.6.1.4.1.99999.1.2"
-
-[listener_defaults.acl]
-mode = "list"
-
-[[listeners]]
-type = "vsock"
-cid = 2
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
 
 [[listeners]]
 type = "tcp"
@@ -407,12 +354,10 @@ transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
-[listeners.acl]
-mode = "none"
-
 [[listeners]]
 type = "unix"
 socket = "%t/sudo-auth-proxy/server.sock"
+resolution = "certificate"
 
 [listeners.security]
 transport_encryption = "mtls"
@@ -426,16 +371,12 @@ cert_file = "/etc/tartarus/x509/host.crt"
 key_file = "/etc/tartarus/x509/host.key"
 required_oid = "1.3.6.1.4.1.99999.1.1"
 peer_required_oid = "1.3.6.1.4.1.99999.1.2"
-
-[listeners.acl]
-mode = "ca"
-ca_file = "/etc/tartarus/x509/ca.crt"
-required_oid = "1.3.6.1.4.1.99999.1.2"
-
-[[listeners.acl.rule]]
-identity = "*"
-policy = "ask"
 ```
+
+Every entry is self-contained; a field it omits is simply absent from the
+emitted TOML and the Python applies its built-in default. There is no
+`[listener_defaults]` block. There is no per-listener `[acl]` either: the
+document-level `[[rule]]` list scopes itself with `match.listeners`.
 
 Top-level keys for the **ssh** server additionally include the global `settings`
 freeform keys (`vm`, `tcp_vm`, `libvirt_uri`, `agent_sockets`,
@@ -444,40 +385,37 @@ after `mode`/`dialog_program`/`debug`, as today. These stay global because the
 Python parses them once on the shared `Config`, not per listener.
 
 **Emission algorithm (Nix).** Define a recursive `pruneNulls` and a
-`renderListener` that returns only non-null fields:
+`renderListener` that renders one self-contained entry:
 
 ```nix
 renderListener = lib: entry: let
   prune = v:
     if builtins.isAttrs v then lib.mapAttrs (_: prune) (lib.filterAttrs (_: x: x != null) v)
     else if builtins.isList v then map prune v else v;
-  security = renderSecurity entry.security;              # keys set in the entry only
-  mtls     = lib.optionalAttrs (effectiveMtls entry) (renderMtls entry.mtls);
-  acl      = renderAcl entry.acl;
+  security = renderSecurity (resolveTransportEncryption entry);  # resolved per entry
+  mtls     = lib.optionalAttrs (resolvesToMtls entry) (renderMtls entry.mtls);
 in prune ({
-  type = entry.type;                                      # entries only
+  type = entry.type;
+  name = entry.name;
   port = entry.port; cid = entry.cid; host = entry.host;
   socket = entry.socket; socket_dir_mode = entry.socketDirMode; socket_mode = entry.socketMode;
   connect_timeout = entry.connectTimeout; decision_timeout = entry.decisionTimeout;
   recv_timeout = entry.recvTimeout; max_connections = entry.maxConnections;
   server_read_timeout = entry.serverReadTimeout; resolution = entry.resolution;
-} // lib.optionalAttrs (security != {}) {security = security;}
-  // lib.optionalAttrs (mtls != null)  {mtls = mtls;}
-  // lib.optionalAttrs (acl != {})     {acl = acl;});
+} // {security = security;}
+  // lib.optionalAttrs (mtls != null)  {mtls = mtls;});
 
 serverToml = {
   mode = "server";
   dialog_program = server.dialogProgram;
   debug = lib.optionalAttrs server.debug true;
-  listener_defaults = renderListener {type = null;} server.listenerDefaults;
   listeners = map renderListener server.listeners;
 } // server.extraSettings;
 configFile = tomlFormat.generate "…" (pruneNulls serverToml);
 ```
 
-`listener_defaults` must include the *defaults* values (not sparse): the
-defaults block is `mkListenerOptions {nullable=false;}`, so its fields have real
-defaults and render fully. Entries are sparse.
+Every entry renders its own values; only `name`/`resolution` (which are `nullOr`)
+are pruned when unset.
 
 ### 3.2 TOML subtleties (verified)
 
@@ -490,12 +428,6 @@ defaults and render fully. Entries are sparse.
 ```toml
 mode = "server"
 
-[listener_defaults]
-port = 65001
-
-[listener_defaults.security]
-transport_encryption = "auto"
-
 [[listeners]]
 cid = 2
 type = "vsock"
@@ -503,9 +435,6 @@ type = "vsock"
 [[listeners]]
 host = "10.200.0.1"
 type = "tcp"
-
-[listeners.acl]
-mode = "none"
 
 [listeners.security]
 client_auth = "none"
@@ -516,31 +445,31 @@ transport_encryption = "none"
 socket = "%t/x.sock"
 type = "unix"
 
-[listeners.acl]
-mode = "ca"
+[listeners.security]
+client_auth = "transport"
+server_auth = "transport"
+transport_encryption = "mtls"
 
-[[listeners.acl.rule]]
-identity = "*"
-policy = "ask"
+[listeners.mtls]
+ca_file = "/etc/tartarus/x509/ca.crt"
+enable = true
 ```
 
 Consequences the implementation relies on:
 
 1. **`null` is fatal.** `json2toml` refuses any `null` ("Cannot convert data to
-   TOML (null values are not supported)"). Every sparse entry and
-   `extraSettings` must be pruned. This is why entries are `nullOr`/`null`.
+   TOML (null values are not supported)"). `name`/`resolution` (the only
+   `nullOr` fields) and `extraSettings` must be pruned before generation.
 2. **Sub-tables attach to the last array element.** `[listeners.security]` /
-   `[listeners.acl]` after a `[[listeners]]` bind to that element, exactly as
+   `[listeners.mtls]` after a `[[listeners]]` bind to that element, exactly as
    intended, and the next `[[listeners]]` starts a fresh element. remarshal
    emits an element's scalar keys **before** its sub-tables even though JSON key
    order is alphabetical, so the result is always valid TOML.
-3. **Ordering is deterministic.** `listener_defaults` sorts before `listeners`
-   (`_` = 0x5f < `s` = 0x73) and remarshal emits top-level scalars first, so
-   `mode`/`dialog_program`/`debug` precede the tables and the defaults block
-   precedes the array. A golden test (§7) pins this.
-4. **Nested arrays of tables** (`[[listeners.acl.rule]]`) are emitted correctly.
-5. **Key order inside a table is alphabetical** (e.g. `cid` before `type`,
-   `acl` before `security`). No code may depend on field order.
+3. **Ordering is deterministic.** remarshal emits top-level scalars first, so
+   `mode`/`dialog_program`/`debug` precede the `[[listeners]]` array. A golden
+   test (§7) pins this.
+4. **Key order inside a table is alphabetical** (e.g. `cid` before `type`,
+   `security` before `mtls`). No code may depend on field order.
 
 ### 3.3 Python detection of legacy vs new
 
@@ -550,19 +479,18 @@ purely structural:
 ```
 new_schema  := isinstance(config.get("listeners"), list) and len(config["listeners"]) > 0
 legacy_flat := not new_schema
-defaults    := config.get("listener_defaults") or {}
 ```
 
-- `new_schema`: expand `len(listeners)` listeners by deep-merging `defaults`
-  into each entry (§4.1). The top-level document must not also carry the flat
+- `new_schema`: expand `len(listeners)` listeners, each entry self-contained
+  (§4.1). The top-level document must not also carry the flat
   transport/security keys (rejected — §4.6).
 - `legacy_flat`: the whole parsed top-level dict is the single implicit
-  listener, exactly as today. This makes `examples/sudo-auth-proxy-server.toml`,
-  `examples/ssh-agent-proxy-server.toml`, and every existing hand-written config
-  keep working with zero edits.
+  listener, exactly as today. This makes a hand-written flat config keep working
+  with zero edits.
 
-A config with BOTH `listeners` and flat `transport`/`security`/`mtls`/`acl` at
-the top level is rejected (ambiguous).
+A config with BOTH `listeners` and flat `transport`/`security`/`mtls` at the top
+level is rejected (ambiguous), and a `listener_defaults` block is refused
+outright.
 
 ---
 
@@ -574,30 +502,20 @@ available (Python ≥ 3.11).
 ### 4.1 Shared helpers
 
 ```
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge `override` onto `base`. Lists and scalars are replaced
-    wholesale (a listener's `acl.rule` is a single list, never concatenated)."""
-    out = dict(base)
-    for key, value in override.items():
-        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-```
-
-```
 GLOBAL_KEYS = ("mode", "dialog_program", "debug", "approver", "client_version", "guest_hint")
 
 def listener_views(config: dict) -> list[dict]:
-    """Flat, legacy-shaped per-listener configs, or [config] for a flat config."""
+    """Flat, legacy-shaped per-listener configs, or [config] for a flat config.
+
+    Each view carries the entry's own fields; a field the entry omits is simply
+    absent and the flat readers apply their built-in default.
+    """
     entries = config.get("listeners")
     if not isinstance(entries, list) or not entries:
         return [config]                       # legacy fallback: one implicit listener
-    defaults = config.get("listener_defaults") or {}
     views = []
     for index, entry in enumerate(entries):
-        view = _deep_merge(defaults, entry)
+        view = dict(entry)
         # `type` is the wire key; downstream code reads `transport`.
         if "type" in view:
             view["transport"] = view["type"]
@@ -729,9 +647,8 @@ where it currently resolves the single `self.transport`:
 ```
 raw_listeners = data.get("listeners")
 if isinstance(raw_listeners, list) and raw_listeners:
-    defaults = data.get("listener_defaults") or {}
     self.listeners = [
-        self._parse_listener(_deep_merge(defaults, entry)) for entry in raw_listeners
+        self._parse_listener(entry, resolve) for entry in raw_listeners
     ]
 else:
     self.listeners = [self._parse_listener_from_flat(data)]   # legacy fallback
@@ -826,33 +743,32 @@ expanded view). A new `validate_document_schema(config)` wraps it:
 
 ```
 def validate_document_schema(config: dict, *, source=None) -> None:
+    if "listener_defaults" in config:
+        raise SecurityConfigError(
+            "'[listener_defaults]' was removed: every [[listeners]] entry is "
+            "self-contained")
     if "listeners" in config:
-        # New schema: the top level may only carry the global keys plus the two
-        # new tables. A flat transport/security/mtls/acl key alongside
-        # `listeners` is ambiguous and rejected.
+        # New schema: the top level may only carry the global keys plus
+        # `listeners`. A flat transport/security/mtls key alongside `listeners`
+        # is ambiguous and rejected.
         allowed = {"mode", "dialog_program", "debug", "approver", "client_version",
-                   "guest_hint", "listener_defaults", "listeners"}
+                   "guest_hint", "listeners"}
         reject_unknown(config, allowed, where="at the top level")   # existing machinery
         if not isinstance(config["listeners"], list) or not config["listeners"]:
             raise SecurityConfigError("'listeners' must be a non-empty array of tables")
-        if "listener_defaults" in config and not isinstance(config["listener_defaults"], dict):
-            raise SecurityConfigError("'[listener_defaults]' must be a table")
         for i, entry in enumerate(config["listeners"]):
             validate_listener_table(entry, where=f"listeners[{i}]")   # per-listener keys
-        if isinstance(config.get("listener_defaults"), dict):
-            validate_listener_table(config["listener_defaults"], where="listener_defaults",
-                                    require_type=False)
         return
     # Legacy flat schema, unchanged (also reached for every expanded view).
     validate_config_schema(config, source=source)
 ```
 
 - `validate_listener_table` accepts the per-listener key set
-  (`type`, `port`, `cid`, `host`, `socket`, `socket_dir_mode`, `socket_mode`,
-  `connect_timeout`, `decision_timeout`, `recv_timeout`, `max_connections`,
-  `server_read_timeout`, `resolution`, `security`, `acl`, `mtls`) and reuses the
-  existing table/`did-you-mean` machinery for nested `[security]`/`[mtls]`/
-  `[acl]`. It requires `type` for entries (not for defaults).
+  (`type`, `name`, `port`, `cid`, `host`, `socket`, `socket_dir_mode`,
+  `socket_mode`, `connect_timeout`, `decision_timeout`, `recv_timeout`,
+  `max_connections`, `server_read_timeout`, `resolution`, `security`, `mtls`)
+  and reuses the existing table/`did-you-mean` machinery for nested
+  `[security]`/`[mtls]`. It requires `type` for every entry.
 - Duplicate **types are allowed** (two unix listeners). Duplicate **socket
   paths** are a runtime bind error (the second bind unlinks/fails), not a schema
   error.
@@ -890,14 +806,13 @@ the `lib.warn` and the `throw` are **removed**. `transportOf`, `mkTcpHost`,
 sapGuestTransport = g: if sapMarker g == "unix" then "unix" else transportOf g;
 sudoKinds = lib.unique (map (e: sapGuestTransport e.g) (listOf sudoReq));
 
-sudoVssockListener = { type = "vsock"; cid = 2; security = callbackSecurity; acl.mode = "none"; };
+sudoVsockListener = { type = "vsock"; cid = 2; security = callbackSecurity; };
 sudoTcpListener   = { type = "tcp"; host = mkTcpHost sudoReq; port = 65001;
-                      security = callbackSecurity; acl.mode = "none"; };
+                      security = callbackSecurity; };
 sudoUnixListener  = { type = "unix"; socket = "%t/sudo-auth-proxy/server.sock";
                       security = unixSecurity;
                       mtls = { enable = true; caFile = x509Ca; certFile = x509HostCert; keyFile = x509HostKey;
-                               requiredOid = "1.3.6.1.4.1.99999.1.1"; peerOid = sudoClientOid; };
-                      acl = { mode = "ca"; caFile = x509Ca; requiredOid = sudoClientOid; }; };
+                               requiredOid = "1.3.6.1.4.1.99999.1.1"; peerOid = sudoClientOid; }; };
 
 sudoListeners =
   lib.optional (builtins.elem "vsock" sudoKinds) sudoVsockListener
@@ -907,12 +822,7 @@ sudoListeners =
 # homepage config:
 tartarus.sudo-auth-proxy.server = {
   enable = mkDefault true;
-  listeners = mkDefault sudoListeners;         # {type,…} per listener
-  listenerDefaults = {                         # shared defaults, once
-    port = mkDefault 65001;
-    recvTimeout = mkDefault 0.5;
-    decisionTimeout = mkDefault 120;
-  };
+  listeners = mkDefault sudoListeners;         # {type,…} per listener, self-contained
 };
 ```
 
@@ -951,9 +861,10 @@ sshKinds = lib.unique (map (e: sshGuestTransport e.g) (listOf sshReq));
 sshListener type = { inherit type; resolution = …; security = …; mtls = …; };
 ```
 
-- `vsock` entry: `{ type = "vsock"; cid = 2; resolution = "tartarus"; }`.
+- `vsock` entry: `{ type = "vsock"; cid = 2; resolution = "tartarus";
+  security = callbackSecurity; }`.
 - `tcp` entry: `{ type = "tcp"; host = mkTcpHost sshReq; port = 65000;
-  resolution = "tartarus"; }`.
+  resolution = "tartarus"; security = callbackSecurity; }`.
 - `unix` entry: `{ type = "unix"; socket = "%t/ssh-agent-proxy/server.sock";
   resolution = "certificate"; security = unixSecurity;
   mtls = { enable = true; caFile = x509Ca; certFile = x509HostCert;
@@ -995,10 +906,9 @@ guests). This is a cross-check task (§9 T9), not a code change expected here.
   that set `tartarus.sudo-auth-proxy.server.transport` / `.security` / `.mtls` /
   `.acl` / `.host` / `.port` / `.cid` / `.socket*` / timeouts, or
   `tartarus.ssh-agent-proxy.server.transport` / `.security` / `.mtls` /
-  `.resolution`, must migrate to `server.listeners = [ { type = …; … } ]`
-  (with `server.listenerDefaults` for shared values). This is a deliberate hard
-  break: a partially-migrated config should fail evaluation loudly, not silently
-  bind the wrong transport.
+  `.resolution`, must migrate to `server.listeners = [ { type = …; … } ]`, each
+  entry **self-contained**. This is a deliberate hard break: a partially-migrated
+  config should fail evaluation loudly, not silently bind the wrong transport.
 - The automatic host wiring (`nix/host/services.nix`) is updated in the same
   change, so `nixcfg` and any tartarus-managed host need no action.
 - Consumer `nixosModules`/`homeManagerModules` imports are unchanged.
@@ -1028,9 +938,9 @@ All Python tests run from the package root:
 
 New tests (helpers `_transport_server` etc. already exist):
 
-- `test_listener_expansion_deep_merges_defaults` — `listener_views` merges
-  `listener_defaults` into each entry; entry wins; nested `security`/`mtls`/
-  `acl` merge field-by-field.
+- `test_listener_views_keep_each_entry_self_contained` — each view carries only
+  the entry's own fields; a field the entry omits is absent (the flat readers
+  apply their built-in default).
 - `test_listener_views_map_type_to_transport` — each view has `transport` set
   from `type` and no `type` key; globals (`dialog_program`) are carried.
 - `test_legacy_flat_config_is_single_listener` — a flat server config yields one
@@ -1051,8 +961,8 @@ New tests (helpers `_transport_server` etc. already exist):
 - `test_per_listener_security_isolation` — two listeners resolve different
   `transport_encryption` (one `none`, one `mtls` with test certs); each server's
   `_security.transport_encryption` matches its listener.
-- `test_shipped_multi_listener_example_parses` — a new
-  `examples/sudo-auth-proxy-listeners.toml` (see §8) loads, expands to ≥ 3
+- `test_shipped_multi_listener_example_parses` — the shipped
+  `examples/sudo-auth-proxy-server.toml` (see §8) loads, expands to 3
   listeners, and passes `validate_document_schema`.
 
 ### 7.2 `tests/test_ssh_agent_proxy.py` (extend)
@@ -1104,13 +1014,14 @@ Add fixtures and checks (all pure evaluation; no builds):
   their intent (standalone eval, mTLS conflict, unix+bad-resolution) is
   preserved per-listener.
 
-Golden TOML shape check (build-forcing, outside the pure eval suite): add a
+Golden TOML shape check (build-forcing, outside the pure eval suite): the
 `checks.<system>."tartarus-sudo-auth-proxy-toml-shape"` derivation in
-`nix/default.nix` that builds a standalone HM config's generated
-`sudo-auth-proxy-server.toml` and greps for `[listener_defaults]` and two
-`[[listeners]]` headers. (Equivalently, a Python test that re-renders the same
-attrset via `pkgs.formats.toml`; the Nix check is preferred because it pins
-exactly what the module emits.)
+`nix/default.nix` builds a standalone HM config's generated
+`sudo-auth-proxy-server.toml` and asserts two `[[listeners]]` headers, no
+`[listener_defaults]` block, and both `transport_encryption = "mtls"` and
+`"none"`. (Equivalently, a Python test that re-renders the same attrset via
+`pkgs.formats.toml`; the Nix check is preferred because it pins exactly what the
+module emits.)
 
 ### 7.4 Commands
 
@@ -1124,25 +1035,23 @@ exactly what the module emits.)
 ## 8. Docs plan
 
 - **`docs/technical/sudo-auth-proxy.md`** — §3 (Transports, call direction) gains a
-  "multiple listeners" subsection; §7.9 (schema keys) lists
-  `listener_defaults`/`listeners` and per-listener keys; §14 (compatibility &
-  migration) documents the flat-option removal and the Python legacy fallback;
-  §15 (operations) examples show a `listeners` array. The old "single socket /
-  mixed transports" language is removed.
-- **`docs/technical/ssh-agent-proxy.md`** — the server section describes `listeners` /
-  `listenerDefaults`, per-listener `resolution`, and the always-present
-  `vm`/`tcp_vm` maps; the bridge section is unchanged.
+  "multiple listeners" subsection; §7.9 (schema keys) lists the self-contained
+  `listeners` entries and their keys; §14 (compatibility & migration) documents
+  the flat-option removal and the Python legacy fallback; §15 (operations)
+  examples show a `listeners` array. The old "single socket / mixed transports"
+  language is removed.
+- **`docs/technical/ssh-agent-proxy.md`** — the server section describes
+  self-contained `listeners` entries, per-listener `resolution`, and the
+  always-present `vm`/`tcp_vm` maps; the bridge section is unchanged.
 - **`README.md`** — §"Standalone use of the services" server row mentions
   `server.listeners` (a list) instead of a single `transport`; the packaging
   example gains a two-listener snippet; a note that the mixed-transport warning
   is gone.
-- **`examples/`** — add
-  `examples/sudo-auth-proxy-listeners.toml` (vsock + tcp + unix) and
-  `examples/ssh-agent-proxy-listeners.toml`; update the existing
-  `examples/sudo-auth-proxy-server.toml` /
-  `examples/ssh-agent-proxy-server.toml` header comments to mention that the
-  legacy flat form still works (single implicit listener) while the list form is
-  preferred for multi-transport hosts.
+- **`examples/`** — one complete multi-listener
+  `examples/sudo-auth-proxy-server.toml` (vsock + tcp + unix) and one
+  `examples/ssh-agent-proxy-server.toml`; entries are self-contained and the
+  legacy flat form still works (single implicit listener) for hand-written
+  configs.
 - Option-description strings in both `default.nix` files are part of the docs
   surface and must be updated with the options.
 
@@ -1157,11 +1066,11 @@ listed; parallel groups are noted. Acceptance commands are exact.
 - **Owns:** `nix/packages/sudo-auth-proxy/sudo-auth-proxy.py`,
   `tests/test_sudo_auth_proxy.py`.
 - **Depends on:** none.
-- **Work:** implement `_deep_merge`, `listener_views`, `validate_document_schema`,
-  the new `run_server` (bind-all-then-serve, `_close_listener`), path resolution
-  for `listeners[*].mtls`/`acl` and `listener_defaults.*` in `load_config`;
-  keep `make_transport`/`build_security`/`create_ssl_context`/`Handler` as
-  described. Add the §7.1 tests.
+- **Work:** implement `listener_views`, `validate_document_schema`, the new
+  `run_server` (bind-all-then-serve, `_close_listener`), and path resolution for
+  `listeners[*].mtls` in `load_config`; keep
+  `make_transport`/`build_security`/`create_ssl_context`/`Handler` as described.
+  Add the §7.1 tests.
 - **Acceptance:** `python -m pytest tests/test_sudo_auth_proxy.py -q` passes;
   the existing single-listener and legacy tests still pass; the new
   multi-listener tests pass.
@@ -1180,12 +1089,10 @@ listed; parallel groups are noted. Acceptance commands are exact.
 ### T3 — sudo-auth-proxy Nix schema + emission
 - **Owns:** `nix/packages/sudo-auth-proxy/default.nix`.
 - **Depends on:** none (schema-only; the Python reads the emitted TOML).
-- **Work:** add `nullableOpt`, refactor `mkSecurityOptions` (nullable),
-  extract `mkMtlsOptions`/`mkAclOptions`, add `mkListenerOptions` and
-  `mkServerOptions` (`listenerDefaults` + `listeners`), remove the flat server
-  options and `withSecurity`, update both `mkServerFiles`/`homeManagerModule`
-  TOML emission to `[listener_defaults]` + `[[listeners]]` with `pruneNulls`,
-  update the assertions per §2.4.
+- **Work:** add `mkMtlsOptions`, add `mkListenerOptions` and `mkServerOptions`
+  (`listeners`), remove the flat server options and `withSecurity`, update both
+  `mkServerFiles`/`homeManagerModule` TOML emission to self-contained
+  `[[listeners]]` entries with `pruneNulls`, update the assertions per §2.4.
 - **Acceptance:** `nix eval --impure --file tests/default.nix --json` evaluates
   the updated standalone HM fixture (T6, if landed) — until then, a local
   `nix eval` of the module renders the expected TOML. The generated TOML parses
@@ -1221,23 +1128,24 @@ listed; parallel groups are noted. Acceptance commands are exact.
   new checks in `passed` and fails otherwise.
 
 ### T7 — examples + golden TOML
-- **Owns:** `examples/sudo-auth-proxy-listeners.toml`,
-  `examples/ssh-agent-proxy-listeners.toml`, the two existing server example
-  headers, and the golden-shape derivation in `nix/default.nix`.
+- **Owns:** `examples/sudo-auth-proxy-server.toml`,
+  `examples/ssh-agent-proxy-server.toml`, and the golden-shape derivation in
+  `nix/default.nix`.
 - **Depends on:** T1, T2, T3, T4.
-- **Work:** write the new examples; add the
-  `checks.<system>."tartarus-sudo-auth-proxy-toml-shape"` derivation; add
+- **Work:** write the new multi-listener examples (self-contained entries); add
+  the `checks.<system>."tartarus-sudo-auth-proxy-toml-shape"` derivation; add
   `test_shipped_multi_listener_example_parses` cross-references.
 - **Acceptance:** the example configs load in Python (T1/T2 tests) and the
-  golden check finds `[listener_defaults]` and two `[[listeners]]` headers.
+  golden check finds two `[[listeners]]` headers and no `[listener_defaults]`.
 
 ### T8 — documentation
 - **Owns:** `docs/technical/sudo-auth-proxy.md`, `docs/technical/ssh-agent-proxy.md`, `README.md`,
   the option descriptions.
 - **Depends on:** T3, T4, T5, T7 (to document the final shape).
 - **Work:** apply §8.
-- **Acceptance:** docs describe `listenerDefaults`/`listeners` and the Python
-  legacy fallback; no remaining "single socket / mixed transport" claims.
+- **Acceptance:** docs describe self-contained `listeners` entries and the
+  Python legacy fallback; no remaining "single socket / mixed transport" claims
+  and no `listener_defaults` presented as current.
 
 ### T9 — verification
 - **Owns:** none (read-only + reports).
@@ -1245,8 +1153,9 @@ listed; parallel groups are noted. Acceptance commands are exact.
 - **Work:** run the full gates; trace every acceptance criterion in this spec to
   a test or a checked command; explicitly verify that (a) the warn and throw are
   gone, (b) mixed `vsock`+`tcp` and `unix`+callback hosts evaluate, (c) two unix
-  listeners with different ACLs run in one process, (d) the legacy flat Python
-  config still serves, (e) client/bridge behaviour is unchanged, and (f)
+  listeners with different `[[rule]]` scope run in one process, (d) the legacy
+  flat Python config still serves, (e) client/bridge behaviour is unchanged, and
+  (f)
   `nix/host/firewall.nix` still opens the tcp port for a tcp listener.
 - **Acceptance:**
   `python -m pytest -q` **and**
