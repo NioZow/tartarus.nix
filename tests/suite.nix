@@ -1551,10 +1551,11 @@
   proxyHostOf = guests: namespace:
     guests.nixosConfigurations.${namespace}.config.environment.variables.TARTARUS_PROXY_HOST;
 
-  # The guest-side ssh-agent-proxy wiring: a local allow-all proxy server that
-  # merges the guest-local agent with the host-forwarded bridge. Forcing the
-  # generated server TOML and its `SSH_AUTH_SOCK` env file exercises the whole
-  # guest configuration.
+  # The guest-side ssh-agent-proxy wiring: a single local allow-all proxy
+  # server whose upstreams are the guest-local agent and the host's agent
+  # (reached directly over vsock/tcp, or the SSH-forwarded unix socket) -- no
+  # separate bridge process. Forcing the generated server TOML and its
+  # `SSH_AUTH_SOCK` env file exercises the whole guest configuration.
   sshAgentGuestVmHome =
     (mkGuestsFromHost hostSshMixedTransports)
     .nixosConfigurations."vm-vsockVm".config.home-manager.users.user;

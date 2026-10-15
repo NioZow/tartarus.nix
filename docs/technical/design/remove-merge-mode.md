@@ -228,7 +228,7 @@ keys without prompting. `auth = "allow"` is silent (`ssh-agent-proxy.py:1813`);
 `data_signing = "allow"` matches merge's blind forwarding; `notify = false`
 avoids a notification per use.
 
-### 3.1 Standalone TOML (`examples/ssh-agent-proxy-merge.toml`)
+### 3.1 Standalone TOML (the `"merge"` listener of `examples/ssh-agent-proxy-server.toml`)
 
 ```toml
 # Merge several agents into one local socket: a proxy server whose transport is
@@ -384,7 +384,8 @@ does not collide with the bridge's default `…/config.toml`.
 3. `docs/technical/smoke.md:241`: drop `merge` from the module list.
 4. `docs/design/transport-listeners.md`: update the "`run_merge`/`.merge.*`
    unchanged" notes (343, 820, 1176).
-5. Add `examples/ssh-agent-proxy-merge.toml` (§3.1) and reference it in README.
+5. Ship the merge recipe as the `"merge"` listener of the single
+   `examples/ssh-agent-proxy-server.toml` (§3.1) and reference it in README.
 
 ### Phase 5 — Tests
 1. Retarget the merge bullet (`tests/test_ssh_agent_proxy.py:19-20`) and
@@ -400,7 +401,8 @@ does not collide with the bridge's default `…/config.toml`.
    per connection on a `unix` listener, and that they are rejected on a
    `vsock`/`tcp` listener (eval + load).
 4. Add a test that `mode="merge"` (and a `merge_sockets` key) is rejected.
-5. Add a shipped-example test that `examples/ssh-agent-proxy-merge.toml` loads.
+5. Add a shipped-example test that the `"merge"` listener in
+   `examples/ssh-agent-proxy-server.toml` loads.
 6. `tests/suite.nix`: add/extend an eval check that the new guest local-proxy
    config evaluates and that the `.merge.*` option no longer exists.
 

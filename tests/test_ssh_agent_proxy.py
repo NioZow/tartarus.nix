@@ -20,12 +20,11 @@ Behaviours covered:
    ``scan_dirs``), non-socket children ignored, absent entries skipped, realpath
    de-duplication, and the per-session socket short-circuit;
 8. a real ``unix`` server/client round-trip over AF_UNIX (no mTLS);
-9. the multi-listener server schema -- ``Config.load`` expands a
-   ``[listener_defaults]`` + ``[[listeners]]`` document into one
-   ``ListenerConfig`` per entry (per-listener resolution/security), keeps a flat
-   config as a single implicit listener, rejects an ambiguous mix, allows
-   duplicate types, binds several ``unix`` listeners at once, and builds one
-   TLS context per listener.
+9. the multi-listener server schema -- ``Config.load`` builds one
+   ``ListenerConfig`` per self-contained ``[[listeners]]`` entry (per-listener
+   resolution/security), keeps a flat config as a single implicit listener,
+   rejects an ambiguous mix, allows duplicate types, binds several ``unix``
+   listeners at once, and builds one TLS context per listener.
 
 Run from the package root::
 
@@ -41,7 +40,7 @@ import threading
 import time
 import types
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -571,23 +570,26 @@ def test_load_builds_listeners_from_listeners(
         '''mode = "proxy"
 agent_sockets = ["/tmp/agent"]
 
-[listener_defaults]
-resolution = "tartarus"
-
-[listener_defaults.security]
-transport_encryption = "none"
-client_auth = "none"
-server_auth = "none"
-
 [[listeners]]
 type = "vsock"
 cid = 3
+resolution = "tartarus"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
 
 [[listeners]]
 type = "tcp"
 host = "10.0.0.1"
 port = 65000
 resolution = "mofos"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
 ''',
     )
     assert len(cfg.listeners) == 2
@@ -616,22 +618,26 @@ def test_load_parses_listener_names_and_match_listener(
         '''mode = "proxy"
 agent_sockets = ["/tmp/agent"]
 
-[listener_defaults]
+[[listeners]]
+type = "unix"
+socket = "/tmp/merge.sock"
+name = "merge"
 resolution = "none"
 
-[listener_defaults.security]
+[listeners.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
 [[listeners]]
 type = "unix"
-socket = "/tmp/merge.sock"
-name = "merge"
-
-[[listeners]]
-type = "unix"
 socket = "/tmp/other.sock"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
 
 [[rule]]
 key = "*"
@@ -662,23 +668,27 @@ def test_duplicate_listener_name_rejected(
             '''mode = "proxy"
 agent_sockets = ["/tmp/agent"]
 
-[listener_defaults]
+[[listeners]]
+type = "unix"
+socket = "/tmp/a.sock"
+name = "dup"
 resolution = "none"
 
-[listener_defaults.security]
+[listeners.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
 [[listeners]]
 type = "unix"
-socket = "/tmp/a.sock"
-name = "dup"
-
-[[listeners]]
-type = "unix"
 socket = "/tmp/b.sock"
 name = "dup"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
 ''',
         )
 
@@ -735,6 +745,20 @@ def test_old_transports_key_rejected(sap: types.ModuleType, tmp_path: Path) -> N
         )
 
 
+def test_listener_defaults_key_rejected(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    """The removed `[listener_defaults]` block fails loudly."""
+    with pytest.raises(ValueError, match="listener_defaults"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\nagent_sockets = ["/tmp/agent"]\n'
+            "[listener_defaults]\nresolution = \"none\"\n"
+            '[[listeners]]\ntype = "vsock"\ncid = 2\n',
+        )
+
+
 def test_duplicate_transport_types_allowed(
     sap: types.ModuleType, tmp_path: Path
 ) -> None:
@@ -744,21 +768,25 @@ def test_duplicate_transport_types_allowed(
         '''mode = "proxy"
 agent_sockets = ["/tmp/agent"]
 
-[listener_defaults]
+[[listeners]]
+type = "unix"
+socket = "/tmp/a.sock"
 resolution = "none"
 
-[listener_defaults.security]
+[listeners.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
 [[listeners]]
 type = "unix"
-socket = "/tmp/a.sock"
-
-[[listeners]]
-type = "unix"
 socket = "/tmp/b.sock"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
 ''',
     )
     assert len(cfg.listeners) == 2
@@ -813,13 +841,13 @@ resolution = "tartarus"
 def test_shipped_multi_listener_example_parses(sap: types.ModuleType) -> None:
     """The shipped multi-listener example loads and builds three listeners.
 
-    `examples/ssh-agent-proxy-listeners.toml` is the file the multi-transport
+    `examples/ssh-agent-proxy-server.toml` is the file the multi-transport
     setup tells an operator to install, so it must load and expand to one
     `ListenerConfig` per `[[listeners]]` entry, each with its own `name`,
     `resolution`/`security`. Loading the shipped file (rather than an inline
     copy) keeps the example and the parser in sync.
     """
-    path = EXAMPLES_DIR / "ssh-agent-proxy-listeners.toml"
+    path = EXAMPLES_DIR / "ssh-agent-proxy-server.toml"
 
     config = sap.Config()
     config.load(str(path), mode="proxy")
@@ -885,21 +913,25 @@ def test_run_proxy_binds_two_unix_listeners(
         f'''mode = "proxy"
 agent_sockets = ["{upstream}"]
 
-[listener_defaults]
+[[listeners]]
+type = "unix"
+socket = "{sock_a}"
 resolution = "none"
 
-[listener_defaults.security]
+[listeners.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
 [[listeners]]
 type = "unix"
-socket = "{sock_a}"
-
-[[listeners]]
-type = "unix"
 socket = "{sock_b}"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
 ''',
     )
     assert len(cfg.listeners) == 2
@@ -1005,19 +1037,18 @@ def test_create_ssl_context_is_per_listener(
         '''mode = "proxy"
 agent_sockets = ["/tmp/agent"]
 
-[listener_defaults]
+[[listeners]]
+type = "vsock"
 resolution = "none"
 
-[listener_defaults.security]
+[listeners.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
 [[listeners]]
-type = "vsock"
-
-[[listeners]]
 type = "tcp"
+resolution = "none"
 
 [listeners.security]
 transport_encryption = "mtls"
@@ -1238,26 +1269,660 @@ def test_scan_flags_rejected_on_non_unix(
     assert cfg.listeners[0].resolve_session_socket is True
 
 
-def test_shipped_merge_example_parses(sap: types.ModuleType) -> None:
-    """`examples/ssh-agent-proxy-merge.toml` is the documented merge recipe."""
-    path = EXAMPLES_DIR / "ssh-agent-proxy-merge.toml"
+# --- add/remove (key mutation) policy --------------------------------------
 
-    config = sap.Config()
-    config.load(str(path), mode="proxy")
+ADD_IDENTITY = 17
+REMOVE_IDENTITY = 18
+REMOVE_ALL_IDENTITIES = 19
+ADD_ID_CONSTRAINED = 25
+SUCCESS = 6
 
-    assert len(config.listeners) == 1
-    listener = config.listeners[0]
-    assert listener.transport == "unix"
-    assert listener.resolution == "none"
-    assert (listener.transport_encryption, listener.client_auth, listener.server_auth) == (
-        "none",
-        "none",
-        "none",
+
+def _add_msg(
+    keytype: bytes = b"ssh-ed25519",
+    pub: bytes = b"\x01" * 32,
+    comment: bytes = b"gram",
+    mtype: int = ADD_IDENTITY,
+    suffix: bytes = b"",
+) -> bytes:
+    """An SSH_AGENTC_ADD_IDENTITY (_CONSTRAINED) frame body (private half
+    ignored by the proxy)."""
+    return (
+        bytes([mtype])
+        + _frame(keytype)
+        + _frame(pub)
+        + _frame(b"\x02" * 64)
+        + _frame(comment)
+        + suffix
     )
-    assert config.agent_sockets == ["%t/ssh-agent", "%t/gnupg/S.gpg-agent.ssh"]
-    assert len(config.rules) == 1
-    rule = config.rules[0]
-    assert rule.key == "*"
-    assert rule.auth == "allow"
-    assert rule.data_signing == "allow"
-    assert rule.notify is False
+
+
+def _public_blob(keytype: bytes, pub: bytes) -> bytes:
+    return _frame(keytype) + _frame(pub)
+
+
+def _fake_mutating_agent(
+    path: Path, stop: threading.Event, seen: list[bytes]
+) -> threading.Thread:
+    """An upstream agent that records every message and accepts add/remove."""
+
+    def serve() -> None:
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(path))
+        server.listen(8)
+        server.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            conn.settimeout(0.2)
+            try:
+                while not stop.is_set():
+                    try:
+                        msg = _recv_frame(conn)
+                    except socket.timeout:
+                        continue
+                    except (OSError, struct.error):
+                        break
+                    if not msg:
+                        break
+                    seen.append(msg)
+                    if msg[0] == REQUEST_IDENTITIES:
+                        conn.sendall(_frame(struct.pack(">BI", IDENTITIES_ANSWER, 0)))
+                    elif msg[0] in (
+                        ADD_IDENTITY,
+                        ADD_ID_CONSTRAINED,
+                        REMOVE_IDENTITY,
+                        REMOVE_ALL_IDENTITIES,
+                    ):
+                        conn.sendall(_frame(bytes([SUCCESS])))
+                    else:
+                        conn.sendall(_frame(bytes([FAILURE])))
+            except OSError:
+                pass
+            finally:
+                conn.close()
+        server.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
+def _mutation_config(
+    sap: types.ModuleType,
+    tmp_path: Path,
+    a: Path,
+    b: Path,
+    server_sock: Path,
+    rule_extra: str,
+) -> Any:
+    return _load_proxy(
+        sap,
+        tmp_path,
+        f'''mode = "proxy"
+transport = "unix"
+socket = "{server_sock}"
+resolution = "none"
+agent_sockets = ["{a}", "{b}"]
+[security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+[[rule]]
+key = "*"
+auth = "allow"
+data_signing = "allow"
+{rule_extra}
+notify = false
+''',
+    )
+
+
+def _start_server(
+    sap: types.ModuleType, cfg: Any, server_sock: Path
+) -> threading.Thread:
+    thread = threading.Thread(target=sap.run_proxy, args=(cfg,), daemon=True)
+    thread.start()
+    _wait_for_socket(server_sock)
+    return thread
+
+
+def _mutate(
+    server_sock: Path, msg: bytes
+) -> bytes:
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5.0)
+    try:
+        client.connect(str(server_sock))
+        client.sendall(_frame(msg))
+        return _recv_frame(client)
+    finally:
+        client.close()
+
+
+def test_rule_add_remove_parse_and_default(sap: types.ModuleType, tmp_path: Path) -> None:
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        'mode = "proxy"\nagent_sockets = ["/tmp/a"]\n'
+        '[[rule]]\nkey = "*"\nadd = "ask"\nremove = "allow"\n',
+    )
+    rule = cfg.rules[0]
+    assert rule.add == "ask"
+    assert rule.remove == "allow"
+    assert rule.auth == "ask"  # untouched default
+    assert rule.data_signing == "deny"
+
+
+def test_rule_add_invalid_rejected(sap: types.ModuleType, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="add must be deny"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\nagent_sockets = ["/tmp/a"]\n'
+            '[[rule]]\nkey = "*"\nadd = "yes"\n',
+        )
+
+
+def test_public_blob_from_private_ed25519(sap: types.ModuleType) -> None:
+    pub = b"\x01" * 32
+    key_type, blob, comment = sap._public_blob_from_private(_add_msg(pub=pub, comment=b"gram"))
+    assert key_type == "ssh-ed25519"
+    assert blob == _public_blob(b"ssh-ed25519", pub)
+    assert comment == "gram"
+    assert sap._fingerprint(blob).startswith("SHA256:")
+
+
+def test_public_blob_from_private_unknown_type(sap: types.ModuleType) -> None:
+    msg = bytes([ADD_IDENTITY]) + _frame(b"ssh-frobnicate") + _frame(b"junk")
+    key_type, blob, comment = sap._public_blob_from_private(msg)
+    assert key_type == "ssh-frobnicate"
+    assert blob is None
+    assert comment == ""
+
+
+def test_add_denied_by_default(sap: types.ModuleType, tmp_path: Path) -> None:
+    a, b = tmp_path / "a.sock", tmp_path / "b.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    seen_a: list[bytes] = []
+    seen_b: list[bytes] = []
+    _fake_mutating_agent(a, stop, seen_a)
+    _fake_mutating_agent(b, stop, seen_b)
+    _wait_for_socket(a)
+    _wait_for_socket(b)
+    cfg = _mutation_config(sap, tmp_path, a, b, server_sock, "")
+    _start_server(sap, cfg, server_sock)
+    try:
+        assert _mutate(server_sock, _add_msg()) == bytes([FAILURE])
+        assert all(
+            m[0] not in (ADD_IDENTITY, ADD_ID_CONSTRAINED) for m in seen_a + seen_b
+        )
+    finally:
+        stop.set()
+
+
+def test_add_allowed_forwarded_to_first_agent(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    a, b = tmp_path / "a.sock", tmp_path / "b.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    seen_a: list[bytes] = []
+    seen_b: list[bytes] = []
+    _fake_mutating_agent(a, stop, seen_a)
+    _fake_mutating_agent(b, stop, seen_b)
+    _wait_for_socket(a)
+    _wait_for_socket(b)
+    cfg = _mutation_config(sap, tmp_path, a, b, server_sock, 'add = "allow"')
+    _start_server(sap, cfg, server_sock)
+    try:
+        assert _mutate(server_sock, _add_msg())[0] == SUCCESS
+        # the default agent is agent_sockets[0]; the second is untouched
+        assert any(m[0] == ADD_IDENTITY for m in seen_a)
+        assert all(m[0] != ADD_IDENTITY for m in seen_b)
+    finally:
+        stop.set()
+
+
+def test_add_constrained_allowed(sap: types.ModuleType, tmp_path: Path) -> None:
+    a, b = tmp_path / "a.sock", tmp_path / "b.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    seen_a: list[bytes] = []
+    _fake_mutating_agent(a, stop, seen_a)
+    _fake_mutating_agent(b, stop, [])
+    _wait_for_socket(a)
+    _wait_for_socket(b)
+    cfg = _mutation_config(sap, tmp_path, a, b, server_sock, 'add = "allow"')
+    _start_server(sap, cfg, server_sock)
+    try:
+        constrained = _add_msg(
+            mtype=ADD_ID_CONSTRAINED, suffix=bytes([1]) + struct.pack(">I", 60)
+        )
+        assert _mutate(server_sock, constrained)[0] == SUCCESS
+        assert any(m[0] == ADD_ID_CONSTRAINED for m in seen_a)
+    finally:
+        stop.set()
+
+
+def test_add_ask_declined_returns_failure(
+    sap: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sap, "prompt_for_confirmation", lambda *a, **k: False)
+    a, b = tmp_path / "a.sock", tmp_path / "b.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    seen_a: list[bytes] = []
+    _fake_mutating_agent(a, stop, seen_a)
+    _fake_mutating_agent(b, stop, [])
+    _wait_for_socket(a)
+    _wait_for_socket(b)
+    cfg = _mutation_config(sap, tmp_path, a, b, server_sock, 'add = "ask"')
+    _start_server(sap, cfg, server_sock)
+    try:
+        assert _mutate(server_sock, _add_msg()) == bytes([FAILURE])
+        assert all(m[0] != ADD_IDENTITY for m in seen_a)
+    finally:
+        stop.set()
+
+
+def test_add_ask_accepted_forwards(
+    sap: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sap, "prompt_for_confirmation", lambda *a, **k: True)
+    a, b = tmp_path / "a.sock", tmp_path / "b.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    seen_a: list[bytes] = []
+    _fake_mutating_agent(a, stop, seen_a)
+    _fake_mutating_agent(b, stop, [])
+    _wait_for_socket(a)
+    _wait_for_socket(b)
+    cfg = _mutation_config(sap, tmp_path, a, b, server_sock, 'add = "ask"')
+    _start_server(sap, cfg, server_sock)
+    try:
+        assert _mutate(server_sock, _add_msg())[0] == SUCCESS
+        assert any(m[0] == ADD_IDENTITY for m in seen_a)
+    finally:
+        stop.set()
+
+
+def test_remove_denied_by_default(sap: types.ModuleType, tmp_path: Path) -> None:
+    a, b = tmp_path / "a.sock", tmp_path / "b.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    seen_a: list[bytes] = []
+    _fake_mutating_agent(a, stop, seen_a)
+    _fake_mutating_agent(b, stop, [])
+    _wait_for_socket(a)
+    _wait_for_socket(b)
+    cfg = _mutation_config(sap, tmp_path, a, b, server_sock, "")
+    _start_server(sap, cfg, server_sock)
+    try:
+        assert _mutate(server_sock, bytes([REMOVE_ALL_IDENTITIES])) == bytes([FAILURE])
+        assert all(m[0] != REMOVE_ALL_IDENTITIES for m in seen_a)
+    finally:
+        stop.set()
+
+
+def test_remove_all_and_identity_allowed(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    a, b = tmp_path / "a.sock", tmp_path / "b.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    seen_a: list[bytes] = []
+    _fake_mutating_agent(a, stop, seen_a)
+    _fake_mutating_agent(b, stop, [])
+    _wait_for_socket(a)
+    _wait_for_socket(b)
+    cfg = _mutation_config(sap, tmp_path, a, b, server_sock, 'remove = "allow"')
+    _start_server(sap, cfg, server_sock)
+    try:
+        assert _mutate(server_sock, bytes([REMOVE_ALL_IDENTITIES]))[0] == SUCCESS
+        assert any(m[0] == REMOVE_ALL_IDENTITIES for m in seen_a)
+        blob = _public_blob(b"ssh-ed25519", b"\x01" * 32)
+        assert _mutate(server_sock, bytes([REMOVE_IDENTITY]) + _frame(blob))[0] == SUCCESS
+        assert any(m[0] == REMOVE_IDENTITY for m in seen_a)
+    finally:
+        stop.set()
+
+
+# --- 12. upstreams (unified listeners + outbound sources) ------------------
+
+
+def test_upstream_tables_parse_transports(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        '''mode = "proxy"
+
+[[upstream]]
+transport = "unix"
+socket = "/tmp/local.sock"
+
+[[upstream]]
+transport = "vsock"
+cid = 3
+port = 65000
+
+[[upstream]]
+transport = "tcp"
+host = "10.0.0.1"
+port = 7000
+
+[[listeners]]
+type = "unix"
+socket = "/tmp/srv.sock"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+''',
+    )
+    assert [u.transport for u in cfg.upstreams] == ["unix", "vsock", "tcp"]
+    assert cfg.agent_sockets == ["/tmp/local.sock"]
+    assert cfg.remote_ids == ["vsock:3:65000", "tcp:10.0.0.1:7000"]
+    assert cfg.upstream_order == [
+        "/tmp/local.sock",
+        "vsock:3:65000",
+        "tcp:10.0.0.1:7000",
+    ]
+    assert cfg.upstreams[0].is_local is True
+    assert cfg.upstreams[1].is_local is False
+    # A remote upstream with no [security] resolves plaintext (lenient).
+    assert cfg.upstreams[1].transport_encryption == "none"
+    assert cfg.upstreams[1].uses_tls is False
+
+
+def test_upstream_array_precedes_legacy_agent_sockets(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        '''mode = "proxy"
+agent_sockets = ["/tmp/legacy.sock"]
+
+[[upstream]]
+transport = "vsock"
+cid = 2
+port = 65000
+''',
+    )
+    # `[[upstream]]` entries come first so a local agent listed there is the
+    # default `key.socket` / add/remove target.
+    assert cfg.upstream_order == ["vsock:2:65000", "/tmp/legacy.sock"]
+    assert cfg.agent_sockets == ["/tmp/legacy.sock"]
+    assert cfg.remote_ids == ["vsock:2:65000"]
+
+
+def test_agent_sockets_accepts_table_entries(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        '''mode = "proxy"
+agent_sockets = [
+  "/tmp/local.sock",
+  { transport = "vsock", cid = 4, port = 65000 },
+]
+''',
+    )
+    assert cfg.upstream_order == ["/tmp/local.sock", "vsock:4:65000"]
+    assert cfg.agent_sockets == ["/tmp/local.sock"]
+    assert cfg.remote_ids == ["vsock:4:65000"]
+
+
+def test_upstream_named_id_overrides_default(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        '''mode = "proxy"
+
+[[upstream]]
+name = "host"
+transport = "vsock"
+cid = 2
+port = 65000
+''',
+    )
+    assert cfg.upstream_order == ["host"]
+    assert cfg.remote_ids == ["host"]
+
+
+def test_upstream_duplicate_id_rejected(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="duplicate upstream id"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\nagent_sockets = ["/tmp/a.sock", "/tmp/a.sock"]\n',
+        )
+
+
+def test_unix_upstream_requires_socket(sap: types.ModuleType, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unix upstream requires 'socket'"):
+        _load_proxy(
+            sap,
+            tmp_path,
+            'mode = "proxy"\n[[upstream]]\ntransport = "unix"\n',
+        )
+
+
+def test_client_mode_deprecated_translates(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    listen_socket = tmp_path / "host.sock"
+    path = _write_config(
+        tmp_path,
+        f'''transport = "vsock"
+cid = 2
+port = 65000
+listen_socket = "{listen_socket}"
+
+[security]
+transport_encryption = "none"
+''',
+    )
+    cfg = sap.Config()
+    cfg.load(str(path), mode="client")
+    # One local unix listener exposing the merged/forwarded identities ...
+    assert len(cfg.listeners) == 1
+    assert cfg.listeners[0].transport == "unix"
+    assert cfg.listeners[0].socket == str(listen_socket)
+    # ... fed by exactly one remote upstream.
+    assert [u.transport for u in cfg.upstreams] == ["vsock"]
+    assert cfg.upstreams[0].id == "vsock:2:65000"
+    # A deprecated bridge is a transparent forwarder: allow-all, no prompt.
+    assert cfg.rules[0].auth == "allow"
+    assert cfg.rules[0].data_signing == "allow"
+    assert cfg.rules[0].add == "allow"
+    assert cfg.rules[0].remove == "allow"
+    assert cfg.rules[0].notify is False
+
+
+def _fake_tcp_key_agent(
+    host: str, port: int, stop: threading.Event, blob: bytes, comment: bytes
+) -> threading.Thread:
+    """A TCP upstream agent exposing one identity and answering sign requests."""
+
+    def serve() -> None:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen(8)
+        server.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            conn.settimeout(0.5)
+            try:
+                while not stop.is_set():
+                    try:
+                        msg = _recv_frame(conn)
+                    except socket.timeout:
+                        continue
+                    except (OSError, struct.error):
+                        break
+                    if not msg:
+                        break
+                    if msg[0] == REQUEST_IDENTITIES:
+                        payload = struct.pack(">BI", IDENTITIES_ANSWER, 1)
+                        payload += struct.pack(">I", len(blob)) + blob
+                        payload += struct.pack(">I", len(comment)) + comment
+                        conn.sendall(_frame(payload))
+                    elif msg[0] == SIGN_REQUEST:
+                        conn.sendall(_frame(bytes([SIGN_RESPONSE]) + b"sig"))
+                    else:
+                        conn.sendall(_frame(bytes([FAILURE])))
+            except OSError:
+                pass
+            finally:
+                conn.close()
+        server.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_remote_tcp_upstream_merged_over_unix_listener(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    """A single process merges a *remote* (TCP) upstream into a local unix
+    listener -- the capability the old client/bridge split could not express."""
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + b"RR"
+    stop = threading.Event()
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    _fake_tcp_key_agent("127.0.0.1", port, stop, blob, b"remote-key")
+    server_sock = tmp_path / "srv.sock"
+
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        f'''mode = "proxy"
+
+[[upstream]]
+transport = "tcp"
+host = "127.0.0.1"
+port = {port}
+
+[[rule]]
+key = "*"
+auth = "allow"
+data_signing = "allow"
+notify = false
+
+[[listeners]]
+type = "unix"
+socket = "{server_sock}"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+''',
+    )
+    thread = threading.Thread(target=sap.run_proxy, args=(cfg,), daemon=True)
+    thread.start()
+    _wait_for_socket(server_sock)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5.0)
+    try:
+        client.connect(str(server_sock))
+        client.sendall(_frame(bytes([REQUEST_IDENTITIES])))
+        resp = _recv_frame(client)
+        assert resp[0] == IDENTITIES_ANSWER
+        assert struct.unpack(">I", resp[1:5])[0] == 1
+
+        sign = bytes([SIGN_REQUEST])
+        sign += struct.pack(">I", len(blob)) + blob
+        sign += struct.pack(">I", 4) + b"data"
+        client.sendall(_frame(sign))
+        assert _recv_frame(client)[0] == SIGN_RESPONSE
+    finally:
+        client.close()
+        stop.set()
+
+
+def test_unix_upstream_socket_falls_back_to_session_env(
+    sap: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `unix` upstream with no explicit `socket` dials the per-session
+    `$SSH_AUTH_PROXY_SOCK` (the SSH-forwarded socket), fresh per inbound
+    connection -- the one-process replacement for the client/bridge split on the
+    `unix` ssh-agent-proxy transport."""
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + b"EE"
+    forward = tmp_path / "forwarded.sock"
+    stop = threading.Event()
+    _fake_agent_one_identity(forward, stop, blob, b"forwarded-key")
+    _wait_for_socket(forward)
+    monkeypatch.setenv("SSH_AUTH_PROXY_SOCK", str(forward))
+
+    server_sock = tmp_path / "srv.sock"
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        f'''mode = "proxy"
+
+[[upstream]]
+transport = "unix"
+name = "host"
+
+[[rule]]
+key = "*"
+auth = "allow"
+data_signing = "allow"
+notify = false
+
+[[listeners]]
+type = "unix"
+socket = "{server_sock}"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+''',
+    )
+    assert [u.id for u in cfg.upstreams] == ["host"]
+    assert cfg.upstreams[0].socket is None
+
+    thread = threading.Thread(target=sap.run_proxy, args=(cfg,), daemon=True)
+    thread.start()
+    _wait_for_socket(server_sock)
+    try:
+        # Dialed per connection: two sequential clients both see the identity.
+        for _ in range(2):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.settimeout(5.0)
+            try:
+                client.connect(str(server_sock))
+                client.sendall(_frame(bytes([REQUEST_IDENTITIES])))
+                resp = _recv_frame(client)
+                assert resp[0] == IDENTITIES_ANSWER
+                assert struct.unpack(">I", resp[1:5])[0] == 1
+            finally:
+                client.close()
+    finally:
+        stop.set()

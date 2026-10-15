@@ -27,13 +27,16 @@ same `[security]`/`[mtls]` shape is used.
 
 ### 1.1 What it does
 
-`ssh-agent-proxy` brokers the host's SSH identities to guests. The host side
-(the *server*, `mode = "proxy"`) owns the real agent sockets, applies a
-per-key/per-identity policy and asks the human before a key is used. Guests
-reach it over one of three transports (below), optionally through a guest-side
-*bridge* (`mode = "client"`) that terminates mTLS inside the SSH tunnel. Merging
-several agents into one local socket is **not** a separate mode: it is a normal
-proxy server that binds a local `unix` listener and allows every key (§7).
+`ssh-agent-proxy` is a single-process agent *broker*. One config lists both
+**listeners** (inbound sockets peers connect to) and **upstreams** (outbound key
+sources). It owns the real agent sockets, applies a per-key/per-identity policy
+and asks the human before a key is used. Guests reach it over one of three
+transports (below). There is **no `mode`** and no client/server split: an
+upstream may be a local AF_UNIX agent (`unix`) *or* a remote proxy reached over
+`vsock`/`tcp`, so merging several agents -- including one reached remotely --
+into one local socket is a normal proxy configuration: bind a local `unix`
+listener and list the sources in `[[upstream]]` (§7). The old guest-side
+*bridge* is exactly "a local `unix` listener + one remote upstream".
 
 ### 1.2 Goals
 
@@ -56,12 +59,21 @@ proxy server that binds a local `unix` listener and allows every key (§7).
 
 ## 2. Roles and topologies
 
-| Role | Process | Where |
-| ---- | ------- | ----- |
-| Server | `ssh-agent-proxy` `mode = "proxy"` | host (owns the keys) |
-| Bridge | `ssh-agent-proxy` `mode = "client"` | guest (`unix + mtls`) |
-| Merge | `ssh-agent-proxy` `mode = "proxy"` (local `unix` listener, allow-all) | guest (or host) |
-| Agent | `ssh-agent` | host and/or guest |
+One process is a broker; its config has two kinds of endpoint:
+
+| Kind | Direction | What it is |
+| ---- | --------- | ---------- |
+| *listener* (`[[listeners]]`) | inbound | an accepted socket (`vsock`/`tcp`/`unix`); the peer has an *identity* and `rule`s decide what it may do |
+| *upstream* (`[[upstream]]`) | outbound | a key source the process dials (a unix agent socket, or a remote proxy over `vsock`/`tcp`); its identities are merged for every connection |
+
+Every historical role is a special case of this (there is no `mode`):
+
+| Role | Endpoints |
+| ---- | --------- |
+| Server | several listeners + local unix upstreams |
+| Bridge (deprecated) | one unix listener + one remote upstream, allow-all |
+| Merge | one unix listener + N unix upstreams, allow-all |
+| Agent | the real `ssh-agent` (a unix upstream) |
 
 A guest can reach the server two ways:
 
@@ -74,7 +86,9 @@ A guest can reach the server two ways:
 
 The server may expose **several listeners at once** — one per `listeners` entry
 (§3) — so a single host can offer callback to a container and `unix` to a remote
-guest at the same time.
+guest at the same time. It may also dial **several upstreams at once** (of any
+transport), which is what lets one guest-side process merge its own local agent
+with the host's agent reached over vsock (§7) — no separate bridge service.
 
 ---
 
@@ -82,19 +96,25 @@ guest at the same time.
 
 Each **listener** is an entry in `tartarus.ssh-agent-proxy.server.listeners`;
 its `type` selects the transport, and the server binds one listener per entry —
-any mix, any number. A `listenerDefaults` block supplies per-field defaults that
-the Python deep-merges into every entry.
+any mix, any number. Every entry is **self-contained**: a field it omits falls
+back to the built-in default (there is no `[listener_defaults]` block).
 
 | `type` | direction | listener binds | guest side | identity sources |
 | ------ | --------- | -------------- | ---------- | ---------------- |
-| `vsock` | guest → host | AF_VSOCK port | bridge | `none`/`certificate`/`tartarus`/`mofos` |
-| `tcp` | guest → host | TCP host:port | bridge | `none`/`certificate`/`tartarus`/`mofos` |
-| `unix` | host → guest | AF_UNIX socket | forwarded socket or bridge | `none`/`certificate` only |
+| `vsock` | guest → host | AF_VSOCK port | `upstream` (dialed) | `none`/`certificate`/`tartarus`/`mofos` |
+| `tcp` | guest → host | TCP host:port | `upstream` (dialed) | `none`/`certificate`/`tartarus`/`mofos` |
+| `unix` | host → guest | AF_UNIX socket | forwarded socket or `upstream` | `none`/`certificate` only |
 
 No listener names a guest: identity comes from the listener's `resolution` (and
 only `certificate`/`none` are meaningful on `unix`), never from the socket path.
 Multiple listeners of the same `type` are allowed (e.g. two `unix` listeners with
 different `socket` paths).
+
+The same three transports describe an **upstream** (`[[upstream]]` entries share
+the listener transport/`[security]`/`[mtls]` fields): a `unix` upstream dials a
+local agent socket, while a `vsock`/`tcp` upstream dials a *remote* proxy
+listener and merges its identities. An upstream has no inbound identity of its
+own — it only supplies keys.
 
 ### 3.1 Multiple listeners and the shared policy
 
@@ -104,9 +124,10 @@ Unlike the bridge, the server binds a **list** of listeners in one process:
 tartarus.ssh-agent-proxy.server = {
   enable = true;
   settings = { /* vm, tcp_vm, key, rule, agent_sockets, ... -- global */ };
-  listenerDefaults = { connectTimeout = 10.0; decisionTimeout = 120; };
   listeners = [
-    { type = "vsock"; cid = 2; resolution = "tartarus"; }
+    { type = "vsock"; cid = 2; resolution = "tartarus";
+      security = {transportEncryption = "none";
+                  clientAuth = "none"; serverAuth = "none";}; }
     { type = "unix";  socket = "%t/ssh-agent-proxy/server.sock";
       resolution = "certificate";
       security = {transportEncryption = "mtls";
@@ -133,11 +154,12 @@ tartarus.ssh-agent-proxy.server = {
 
 - **`unix + transport_encryption = "none"`** — transparent: the guest's
   `SSH_AUTH_SOCK` points straight at the forwarded socket (or at a local
-  allow-all proxy that merges it with others). No bridge, no crypto. Identity is
-  **unset**, so only wildcard rules match.
-- **`unix + transport_encryption = "mtls"`** — the guest runs the bridge, which
-  wraps the forwarded stream in TLS; the server terminates it. Identity is the
-  verified client-certificate CN, so per-guest `machine` rules keep working.
+  allow-all proxy that merges it with others). No crypto. Identity is **unset**,
+  so only wildcard rules match.
+- **`unix + transport_encryption = "mtls"`** — the guest's proxy server dials the
+  forwarded socket as a `unix` **upstream** and wraps the stream in TLS; the host
+  server terminates it. Identity is the verified client-certificate CN, so
+  per-guest `machine` rules keep working.
 
 ### 3.2 Listeners and their names
 
@@ -188,21 +210,23 @@ there is no firewall change.
 
 ### 4.2 `unix + mtls` — TLS inside the SSH tunnel
 
-`ssh` speaks the raw agent protocol and will never do TLS, so the guest **bridge**
-performs the handshake; the host server performs the other end. The layering is
-**TLS over the SSH channel**.
+`ssh` speaks the raw agent protocol and will never do TLS, so the guest's
+ssh-agent-proxy **server** performs the handshake as an outbound `unix` upstream;
+the host server performs the other end. The layering is **TLS over the SSH
+channel** — no separate bridge process.
 
 ```
-guest: ssh ─connect─▶ bridge.listen (%t/ssh-agent-host, plain)     [socket 1]
-                            │ bridge = ssh-agent-proxy --mode client
-                            ▼
-                      forwarded socket (sshd-created, plain)       [socket 2]
-                            │
-                            ▼  SSH channel (host→guest)
-host:                 ssh ─connect─▶ %t/ssh-agent-proxy/server.sock
-                                          │ server wraps TLS (server_side)
-                                          ▼
-                                     mTLS handshake: client CN = identity
+guest: client (ssh/git) ─connect─▶ %t/ssh-agent-merged (local unix listener)
+                                        │ guest server merges the local agent
+                                        │ with the host upstream
+                                        ▼
+                                  forwarded socket (sshd-created, plain)
+                                        │  unix upstream, TLS client-side
+                                        ▼  SSH channel (host→guest)
+host:                            ssh ─connect─▶ %t/ssh-agent-proxy/server.sock
+                                                  │ server wraps TLS (server_side)
+                                                  ▼
+                                             mTLS handshake: client CN = identity
 ```
 
 Steps:
@@ -213,11 +237,12 @@ Steps:
 2. The operator runs `ssh -R <guest_sock>:%t/ssh-agent-proxy/server.sock` (plus
    `StreamLocalBindUnlink`, `ExitOnForwardFailure`, and
    `SetEnv=SSH_AGENT_PROXY_SOCK=<guest_sock>`).
-3. Guest bridge: `transport = "unix"`, `connect_socket` = the forwarded path (or
-   `$SSH_AGENT_PROXY_SOCK`), `listen_socket = %t/ssh-agent-host`,
-   `transport_encryption = "mtls"`, `[mtls]` with the guest client cert.
-4. `SSH_AUTH_SOCK` points at the bridge listener (or a local allow-all proxy that
-   merges it with the local agent). Identity = client CN → `machine` rules work.
+3. Guest server: a `[[upstream]]` with `transport = "unix"`, no `socket`
+   (it falls back to `$SSH_AUTH_PROXY_SOCK` at connect time),
+   `transport_encryption = "mtls"`, `[mtls]` with the guest client cert, plus a
+   local unix listener. `SSH_AUTH_SOCK` points at that listener, which merges
+   the upstream with the guest-local agent. Identity = client CN → `machine`
+   rules work.
 
 ### 4.3 ControlMaster is safe
 
@@ -281,7 +306,7 @@ against the accepting listener's `name` (§3.2):
 settings.rule = [
   # the local allow-all merge socket: silent, everything allowed
   { key = "*"; match.listeners = ["merge"]; auth = "allow";
-    data_signing = "allow"; notify = false; }
+    data_signing = "allow"; add = "allow"; remove = "allow"; notify = false; }
   # the SSH-forwarded remote guest: prompt, any named peer
   { key = "*"; match.listeners = ["remote-guest"]; match.machine = ["*"];
     auth = "ask"; }
@@ -289,6 +314,27 @@ settings.rule = [
   { key = "*"; auth = "deny"; data_signing = "deny"; }
 ];
 ```
+
+### 5.4 Per-operation policy
+
+A rule carries four independent policies, each `"deny" | "ask" | "allow"`:
+
+| field | governs |
+| ----- | ------- |
+| `auth` | `SSH_AGENTC_SIGN_REQUEST` used for SSH authentication (default `ask`) |
+| `data_signing` | `SSH_AGENTC_SIGN_REQUEST` for arbitrary data (default `deny`) |
+| `add` | `SSH_AGENTC_ADD_IDENTITY` / `_CONSTRAINED` — `ssh-add` (default `deny`) |
+| `remove` | `SSH_AGENTC_REMOVE_IDENTITY` / `REMOVE_ALL_IDENTITIES` — `ssh-add -d`/`-D` (default `deny`) |
+
+`add`/`remove` are matched against the mutated key's id: a configured `key`
+entry's id when the public blob is known, else the key's comment (or, for
+`REMOVE_ALL_IDENTITIES`, the wildcard selector `*`). The proxy stores no keys:
+an authorized add is forwarded to the **first connected `agent_sockets` entry**
+(the documented default agent), which holds the private key in memory for the
+session; removal is forwarded to the same target. `SSH_AGENTC_ADD_IDENTITY`
+transmits the private key over the agent socket — the client reads it from disk,
+the upstream agent keeps it in RAM. Both default to `deny`, so a key can never
+be injected into (or removed from) an agent unless a rule explicitly allows it.
 
 ---
 
@@ -339,9 +385,9 @@ service with `--service`.
 
 ## 7. Merging several agents
 
-Merging N agent sockets into one local socket is a normal proxy-server
-configuration, not a mode: bind a local `unix` listener, list the agents in
-`settings.agent_sockets`, and allow everything with a wildcard rule.
+Merging N agents into one local socket is a normal proxy configuration, not a
+mode: bind a local `unix` listener, list the sources in `[[upstream]]` (or the
+legacy `agent_sockets` string list), and allow everything with a wildcard rule.
 
 ```toml
 mode = "proxy"
@@ -351,6 +397,8 @@ agent_sockets = ["%t/ssh-agent", "%t/gnupg/S.gpg-agent.ssh"]
 key = "*"
 auth = "allow"
 data_signing = "allow"   # matches the old merge's blind forwarding
+add = "allow"            # ssh-add through the merged socket (default deny)
+remove = "allow"         # ssh-add -d / -D through the merged socket
 notify = false
 
 [[listeners]]
@@ -367,7 +415,62 @@ server_auth = "none"
 Then `export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR}/ssh-agent-merged"`. The
 home-manager equivalent (`settings.rule`, one `listeners` entry,
 `setSshAuthSock = true`) is the guest wiring in §3.3 of the design doc; the
-shipped recipe is `examples/ssh-agent-proxy-merge.toml`.
+single shipped example, `examples/ssh-agent-proxy-server.toml`, includes this
+merge socket as its `"merge"` listener.
+
+`ssh-add` through the merged socket needs `add = "allow"` (and `remove` for
+`ssh-add -d`/`-D`) on the wildcard rule — both default to `deny` (§5.4). The
+added key is forwarded to the first upstream (the real `ssh-agent`); the merge
+proxy itself stores nothing, so the key lives in that agent's memory and is gone
+when the agent restarts.
+
+### 7.1 Merging a *remote* agent (no client/server split)
+
+An upstream may also be a **remote** proxy reached over `vsock`/`tcp`, so one
+process can merge its own local agent with the host's agent — the case the old
+`mode = "client"` bridge needed a second service for. There is still no bridge:
+it is one `[[listeners]]` entry plus two `[[upstream]]` entries.
+
+```toml
+[[upstream]]
+transport = "unix"
+socket = "%t/ssh-agent"
+
+[[upstream]]
+transport = "vsock"
+cid = 2
+port = 65000
+
+[upstream.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+[[rule]]
+key = "*"
+auth = "allow"
+data_signing = "allow"
+add = "allow"
+remove = "allow"
+notify = false
+
+[[listeners]]
+type = "unix"
+name = "merge"
+socket = "%t/ssh-agent-merged"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+```
+
+A `unix` upstream is dialed per client connection (so per-session forwarded
+sockets keep resolving); a `vsock`/`tcp` upstream is a single pooled connection
+(one handshake, reused, transparently reconnected on drop). `mode = "client"` is still
+accepted but deprecated (§11), and is translated to exactly this shape: one unix
+listener + one remote upstream + an allow-all rule.
 
 In `unix` mode a per-session host socket cannot be named by a static list, so the
 identity enumeration is resolved **per client connection** when the `unix`
@@ -431,7 +534,7 @@ pid, so there is no `/proc` equivalent — macOS relies on the directory scan.
 
 - **ADV1** A malicious guest user with no host access.
 - **ADV2** A malicious or compromised guest root (owns the guest's key material
-  and the bridge).
+  and the guest-side proxy).
 - **ADV3** A different local host user (blocked by the `0700`/`0600` paths and
   the peer-uid check).
 - **ADV4** A network attacker on a callback transport (blocked by mTLS when
@@ -472,6 +575,8 @@ pid, so there is no `/proc` equivalent — macOS relies on the directory scan.
 | T26 | Enumeration of identities | Only ruled/forwarded keys are listed |
 | T27 | Replay of a forwarded socket | Per-session token + SSH channel binding |
 | T28 | Tampering with the human dialog | The dialog shows display labels only; the decision is on verified material |
+| T29 | Key injection into a host agent (`ssh-add` from a guest) | `rule.add` defaults to `deny`; only an explicit `allow`/`ask` rule for the verified identity + listener forwards the add to the default agent |
+| T30 | Key removal / agent state tampering (`ssh-add -d`/`-D`) | `rule.remove` defaults to `deny`; only an explicit rule forwards the removal |
 
 ### 9.4 Residual risks (accepted)
 
@@ -482,8 +587,9 @@ pid, so there is no `/proc` equivalent — macOS relies on the directory scan.
   any guest reaching the forward can use any wildcard-allowed key. Use
   `unix + mtls` (or a callback transport with `tartarus`/`mofos`/`certificate`)
   when per-guest isolation is required.
-- **R4** `unix + mtls` still has two guest sockets (bridge listener + forwarded);
-  the host binds one `unix` listener socket for that transport.
+- **R4** `unix + mtls` needs two guest sockets — the local listener that
+  `SSH_AUTH_SOCK` points at, and the forwarded socket it dials as a `unix`
+  upstream; the host binds one `unix` listener socket for that transport.
 - **R5** A directory scan on a `unix` listener scans all sockets in the directory
   at connect time; if a directory mixed sockets pointing at different servers the
   union would span them (still allow-all, but broader than one session). Only a
@@ -507,8 +613,9 @@ pid, so there is no `/proc` equivalent — macOS relies on the directory scan.
   `socket = "%t/ssh-agent-proxy/server.sock"`, `resolution = "none"` (or
   `certificate` + `[security]`/`[mtls]`), `agent_sockets`, `key`/`rule`.
 - Guest: `ssh -R /run/ssh-agent-proxy/<tok>.sock:%t/ssh-agent-proxy/server.sock`,
-  and either set `SSH_AUTH_SOCK` to the forwarded path (`none`) or run the bridge
-  with `connect_socket` = that path and `transport_encryption = "mtls"`.
+  then either set `SSH_AUTH_SOCK` to the forwarded path (`none`), or run the proxy
+  server with a `unix` **upstream** (no `socket`, so it reads
+  `$SSH_AUTH_PROXY_SOCK`) and `transport_encryption = "mtls"`.
 - Merging: a local `unix` listener with `agent_sockets = ["%t/ssh-agent",
   "%t/ssh-agent-proxy"]` (local agent + the forwarded-socket directory) and a
   wildcard `rule`; set `scanAgentSocketDirs` (and/or `resolveSessionSocket` on
@@ -516,13 +623,14 @@ pid, so there is no `/proc` equivalent — macOS relies on the directory scan.
 - `resolution = "tartarus"`/`"mofos"` are the only tartarus/mofos-coupled bits
   and are optional; on `unix` they are rejected by design.
 
-The server may instead declare a `[[listeners]]` list (one per listener) with a
-`[listener_defaults]` table shared across them (§3.1); a flat `mode`+`transport`
-document is kept as one implicit listener for compatibility. The **bridge** is
-unchanged and always takes a single `transport`.
+The server may instead declare a `[[listeners]]` list (one self-contained entry
+per listener, §3.1); a flat `mode`+`transport` document is kept as one implicit
+listener for compatibility. The deprecated
+`mode = "client"` bridge is still accepted (it is translated to one `unix`
+listener plus one remote `[[upstream]]`), but the guest side is now just a
+`[[upstream]]` on an ordinary server.
 
-See `examples/ssh-agent-proxy-server.toml` and
-`examples/ssh-agent-proxy-client.toml`.
+See `examples/ssh-agent-proxy-server.toml`.
 
 ---
 
@@ -531,14 +639,15 @@ See `examples/ssh-agent-proxy-server.toml` and
 **Nix (server).** The flat server options are **removed with no aliases**:
 `tartarus.ssh-agent-proxy.server.{transport,host,port,cid,socket,socketDirMode,
 socketMode,connectTimeout,handshakeTimeout,decisionTimeout,resolution,security,
-mtls}` are gone. Migrate to `server.listeners = [ { type = …; … } ]` plus
-`server.listenerDefaults = { … }`; a partially-migrated config fails evaluation
-loudly rather than binding the wrong transport. The bridge/agent options are
-unchanged (one transport each). The **merge role is removed**: the
-`tartarus.ssh-agent-proxy.merge.*` options and the `mode = "merge"` /
-`merge_sockets` / `--merge` / `--listen` CLI are gone and now fail loudly; use
-the allow-all local proxy of §7 instead. The `transports`/`transport_defaults`
-keys were renamed to `listeners`/`listener_defaults` and now fail loudly too.
+mtls}` are gone. Migrate to `server.listeners = [ { type = …; … } ]`, each entry
+**self-contained** (a field it omits falls back to the built-in default); a
+partially-migrated config fails evaluation loudly rather than binding the wrong
+transport. The bridge/agent options are unchanged (one transport each). The
+**merge role is removed**: the `tartarus.ssh-agent-proxy.merge.*` options and
+the `mode = "merge"` / `merge_sockets` / `--merge` / `--listen` CLI are gone and
+now fail loudly; use the allow-all local proxy of §7 instead. The
+`transports`/`transport_defaults` keys were renamed to `listeners` and now fail
+loudly too, and the removed `[listener_defaults]` block is refused as well.
 
 **Python (legacy config).** Existing `config.toml`s keep working: a document
 with no `listeners` array is read as one implicit listener.
@@ -548,6 +657,12 @@ with no `listeners` array is read as one implicit listener.
 - `mtls.*` → alias onto `[security] transport_encryption = "mtls"` + `[mtls]`.
 - `bridge.vsockCid` / `vsockPort` / `host` / `port` keep working;
   `bridge.connectSocket` is the new `unix` dial path.
+- `agent_sockets` (a list of unix socket strings, or tables) stays valid and is
+  the legacy spelling of the `[[upstream]]` array; `[[upstream]]` entries are
+  ordered first, then `agent_sockets`.
+- `mode = "client"` still loads but is **deprecated** and logged: it is
+  translated to a local `unix` listener + one remote `[[upstream]]` + an
+  allow-all rule (§7.1). `mode = "proxy"` (or no `mode`) is the unified form.
 - The Python schema accepts the legacy keys.
 
 ---
@@ -560,10 +675,15 @@ with no `listeners` array is read as one implicit listener.
   is its transport. Optionally named, for `rule.match.listeners`.
 - **host-dials-guest** — the host `ssh` forwards its socket into the guest
   (`unix`), so the server dials the guest through SSH.
-- **bridge** — the guest-side `mode = "client"` process that relays the agent
-  protocol and (with mTLS) terminates the TLS handshake.
-- **merge** — an allow-all local proxy: a `unix` listener whose `agent_sockets`
-  lists several agents and whose wildcard rule allows every key (§7).
+- **upstream** — one outbound key source the broker dials; one `[[upstream]]`
+  entry. A `unix` upstream is a local agent socket; a `vsock`/`tcp` upstream is a
+  remote proxy listener (its identities are merged). `agent_sockets` is the
+  legacy spelling.
+- **bridge** — DEPRECATED: `mode = "client"`, now expressed as a local `unix`
+  listener + one remote upstream (+ an allow-all rule); still accepted and
+  translated (§7.1, §11).
+- **merge** — an allow-all local proxy: a `unix` listener whose upstreams list
+  several agents and whose wildcard rule allows every key (§7).
 - **resolution** — how a connecting peer is named / identified.
 - **display label** — the human string shown in logs/dialogs.
 - **matching identity** — the `Optional[str]` used for rule matching (`None` when

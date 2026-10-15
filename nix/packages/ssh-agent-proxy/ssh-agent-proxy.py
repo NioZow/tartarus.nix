@@ -117,22 +117,6 @@ def _split_bind(bind: str) -> tuple[str, int]:
         raise ValueError(f"invalid tcp_bind {bind!r}, expected 'host:port'") from e
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge `override` onto `base`.
-
-    Nested tables merge field-by-field, so a sparse listener entry overrides
-    only the `[security]`/`[mtls]` fields it actually sets. Lists and scalars
-    are replaced wholesale (a listener's `acl.rule` list is never concatenated).
-    """
-    out = dict(base)
-    for key, value in override.items():
-        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
-            out[key] = _deep_merge(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
 DEFAULT_CONFIG_PATH = "~/.config/ssh-agent-proxy/config.toml"
 # Upper bound on a single agent message coming from an untrusted guest, so a
 # malicious length prefix cannot make the host attempt a huge allocation/read.
@@ -186,6 +170,51 @@ def _fingerprint(blob: bytes) -> str:
     return f"SHA256:{digest}"
 
 
+def _ssh_string(data: bytes) -> bytes:
+    """Length-prefix `data` in the SSH wire (string / mpint) format."""
+    return pack(">I", len(data)) + data
+
+
+def _public_blob_from_private(msg: bytes) -> tuple[str, Optional[bytes], str]:
+    """Reconstruct the public key blob from an `SSH_AGENTC_ADD_IDENTITY` /
+    `ADD_ID_CONSTRAINED` message.
+
+    The private-key message carries the public components (for ed25519 the
+    public key, for RSA `e`/`n`, for ECDSA the point), so the public blob can be
+    rebuilt so a rule can target a key that is already configured by id and the
+    human prompt can show a real fingerprint. Returns `(key_type, blob, comment)`
+    and, when the key type is unsupported or the payload cannot be parsed,
+    `(key_type_or_"", None, "")` -- callers treat a missing blob as "no
+    configured match / no fingerprint", never as authorization.
+    """
+    key_type = ""
+    buf = SSHBuffer(msg)
+    buf.read_byte()  # message type
+    try:
+        key_type = buf.read_string().decode("utf-8", "replace")
+        kt = key_type.encode()
+        if key_type == "ssh-ed25519":
+            pub = buf.read_string()
+            buf.read_string()  # the private half -- not part of the public blob
+            public_blob = _ssh_string(kt) + _ssh_string(pub)
+        elif key_type == "ssh-rsa":
+            n = buf.read_string()
+            e = buf.read_string()
+            for _ in range(4):  # d, iqmp, p, q -- not part of the public blob
+                buf.read_string()
+            public_blob = _ssh_string(kt) + _ssh_string(e) + _ssh_string(n)
+        elif key_type.startswith("ecdsa-sha2-"):
+            curve = buf.read_string()
+            point = buf.read_string()
+            public_blob = _ssh_string(kt) + _ssh_string(curve) + _ssh_string(point)
+        else:
+            return key_type, None, ""
+        comment = buf.read_string().decode("utf-8", "replace")
+    except Exception:
+        return key_type, None, ""
+    return key_type, public_blob, comment
+
+
 # --- Data Modeling ---
 @dataclass(frozen=True)
 class KeyConfig:
@@ -221,6 +250,13 @@ class Rule:
     docs). A listener is allowed to be unnamed: an unnamed listener matches only
     an empty `listeners` selector (or one made exclusively of `*` patterns), so
     `match.listeners = "vm-a"` never applies to an unnamed listener.
+
+    Per-operation policy (each `"deny" | "ask" | "allow"`): `auth` for SSH
+    authentication, `data_signing` for arbitrary data signatures, `add` for
+    `SSH_AGENTC_ADD_IDENTITY`/`_CONSTRAINED`, and `remove` for
+    `SSH_AGENTC_REMOVE_IDENTITY`/`REMOVE_ALL_IDENTITIES`. `add`/`remove` are
+    matched against the added/removed key's id (a configured key id when the
+    blob is known, else its comment) and default to `deny`.
     """
 
     key: str  # a key id, or "*" for any key
@@ -228,6 +264,8 @@ class Rule:
     listeners: list[str] = field(default_factory=list)
     auth: str = "ask"  # "deny" | "ask" | "allow"
     data_signing: str = "deny"  # "deny" | "ask" | "allow"
+    add: str = "deny"  # "deny" | "ask" | "allow"
+    remove: str = "deny"  # "deny" | "ask" | "allow"
     notify: bool = True
     allowed_host_keys: set[bytes] = field(default_factory=set)
 
@@ -413,6 +451,58 @@ class ListenerConfig:
     resolve_session_socket: bool = False
 
 
+@dataclass
+class UpstreamConfig:
+    """One upstream key source the proxy merges for every incoming connection.
+
+    An upstream is the generalized form of a legacy `agent_sockets` entry. A
+    proxy server dials every upstream and offers the union of their identities
+    to the connecting peer (each identity still governed by `rule`s):
+
+      * `transport = "unix"` dials a local AF_UNIX agent socket (`socket`) --
+        the trusted local agent, a `%t/...` per-session forwarded socket, ...;
+      * `vsock`/`tcp` dial a *remote* ssh-agent-proxy listener (`cid`/`port` or
+        `host`/`port`) whose identities are merged exactly the same way.
+
+    That is what lets a single process merge a local agent **and** an agent
+    reached over vsock/tcp, with no separate `mode = "client"` bridge: the
+    outbound remote connection is just another upstream. `[security]`/`[mtls]`
+    apply to the outbound connection exactly as they do to a listener, and
+    `unix + mtls` (TLS inside an SSH RemoteForward) is supported too.
+
+    `id` is the stable identifier used for `key.socket`, de-duplication and the
+    add/remove target. It defaults to the configured socket path (unix) or
+    `transport:address`, and can be overridden with `name`.
+    """
+
+    id: str
+    transport: str  # "unix" | "vsock" | "tcp"
+    socket: Optional[str]
+    host: str
+    port: int
+    cid: int
+    connect_timeout: float
+    handshake_timeout: float
+    transport_encryption: Optional[str]
+    client_auth: Optional[str]
+    server_auth: Optional[str]
+    mtls_enable: bool
+    mtls_ca_file: Optional[str]
+    mtls_cert_file: Optional[str]
+    mtls_key_file: Optional[str]
+    mtls_required_oid: Optional[str]
+    mtls_peer_required_oid: Optional[str]
+
+    @property
+    def uses_tls(self) -> bool:
+        return self.transport_encryption == "mtls"
+
+    @property
+    def is_local(self) -> bool:
+        """A plain AF_UNIX upstream, dialed per connection (no shared pool)."""
+        return self.transport == "unix" and not self.uses_tls
+
+
 class Config:
     def __init__(self) -> None:
         self.mode: Optional[str] = None
@@ -461,12 +551,28 @@ class Config:
         # load() resolves it to "certificate" if transport_encryption is mtls
         # else "none" unless the config sets it explicitly. Proxy-mode only.
         self.resolution: Optional[str] = None
-        # Upstream agent sockets whose identities are forwarded to every VM
+        # Upstream key sources whose identities are merged for every connection
         # (DEFAULT_RULE: ask, no data signing) -- no `key`/`rule` entries
-        # required. Empty until `load()` runs; an unset `agent_sockets`
-        # defaults to `[$SSH_AUTH_SOCK]`. The first entry is the default socket
-        # for `key` entries that omit `socket`.
+        # required. Empty until `load()` runs; with none configured the proxy
+        # defaults to `[$SSH_AUTH_SOCK]`. A unix upstream is dialed per
+        # connection; a vsock/tcp upstream is a shared persistent
+        # `RemoteConnection`, so one process can merge a local agent with a
+        # remote one without a separate client/bridge. The first upstream (in
+        # file order, `[[upstream]]` before legacy `agent_sockets`) is the
+        # default target for `key` entries that omit `socket` and for add/remove.
+        self.upstreams: list[UpstreamConfig] = []
+        self.upstream_by_id: dict[str, UpstreamConfig] = {}
+        # Local unix upstream ids (legacy `agent_sockets` shape), derived from
+        # `upstreams`; kept for per-connection directory/session resolution and
+        # `key.socket` matching.
         self.agent_sockets: list[str] = []
+        # Remote (vsock/tcp or unix+mtls) upstream ids; never session-resolved.
+        self.remote_ids: list[str] = []
+        # Ids in declaration order (the add/remove + `key.socket` default order).
+        self.upstream_order: list[str] = []
+        # Shared, pooled outbound connections for remote upstreams (keyed by id).
+        self.remote_connections: dict[str, "RemoteConnection"] = {}
+        self._remote_lock = Lock()
         self.keys: dict[bytes, KeyConfig] = {}
         self.rules: list[Rule] = []
         # VSOCK CID -> VM name, statically declared in config (e.g. generated
@@ -596,22 +702,88 @@ class Config:
             self.server_auth,
         ) = validate_security_config(data, self.transport)
 
-        # Client mode is a pure forwarder: it needs only the transport,
-        # destination address/path/socket and mTLS material to reach the host's
-        # proxy. Everything below (the listener, SSH_AUTH_SOCK, VM/key/rule
-        # policy) is proxy-only and must not be parsed for a client, so a
-        # minimal client config cannot fail to load (e.g. on SSH_AUTH_SOCK).
+        # `mode = "client"` (the old guest-side bridge) is deprecated: it is
+        # expressed in the unified model as a local unix listener plus one
+        # outbound [[upstream]], and an allow-all wildcard rule so the remote
+        # server keeps doing the filtering/prompting (a transparent forwarder).
+        # This keeps every existing client config loading while the Nix wiring
+        # migrates. A minimal client config carries no policy, so parse nothing
+        # below this point (it must not fail on SSH_AUTH_SOCK, etc.).
         if self.mode == "client":
-            target = (
-                self.connect_socket or environ.get("SSH_AUTH_PROXY_SOCK")
-                if self.transport == "unix"
-                else f"{self.host}:{self.port}"
+            log.warning(
+                "mode = 'client' is deprecated; declare a local unix "
+                "[[listeners]] entry and an [[upstream]] remote endpoint instead"
             )
+            connect_socket = self.connect_socket
+            if self.transport == "unix" and not connect_socket:
+                connect_socket = environ.get("SSH_AUTH_PROXY_SOCK")
+            remote = self._build_upstream(
+                transport=self.transport,
+                data={
+                    "socket": connect_socket,
+                    "host": self.host,
+                    "port": self.port,
+                    "cid": self.cid,
+                    "connect_timeout": self.connect_timeout,
+                    "handshake_timeout": self.handshake_timeout,
+                    "security": {
+                        "transport_encryption": self.transport_encryption,
+                        "client_auth": self.client_auth,
+                        "server_auth": self.server_auth,
+                    },
+                    "mtls": {
+                        "enable": self.mtls_enable,
+                        "ca_file": self.mtls_ca_file,
+                        "cert_file": self.mtls_cert_file,
+                        "key_file": self.mtls_key_file,
+                        "required_oid": self.mtls_required_oid,
+                        "peer_required_oid": self.mtls_peer_required_oid,
+                    },
+                },
+                resolve=lambda value: value,
+            )
+            self._register_upstreams([remote])
+            listen_socket = self.listen_socket or "%t/ssh-agent-host"
+            self.listeners = [
+                ListenerConfig(
+                    transport="unix",
+                    host="127.0.0.1",
+                    port=DEFAULT_VSOCK_PORT,
+                    cid=HOST_CID,
+                    socket=listen_socket,
+                    socket_dir_mode=self.socket_dir_mode,
+                    socket_mode=self.socket_mode,
+                    connect_timeout=self.connect_timeout,
+                    handshake_timeout=self.handshake_timeout,
+                    decision_timeout=self.decision_timeout,
+                    resolution="none",
+                    transport_encryption="none",
+                    client_auth="none",
+                    server_auth="none",
+                    mtls_enable=False,
+                    mtls_ca_file=None,
+                    mtls_cert_file=None,
+                    mtls_key_file=None,
+                    mtls_required_oid=None,
+                    mtls_peer_required_oid=None,
+                )
+            ]
+            # Transparent pass-through: the remote server already applies its
+            # own per-guest policy and prompts; the bridge only relays.
+            self.rules = [
+                Rule(
+                    key="*",
+                    auth="allow",
+                    data_signing="allow",
+                    add="allow",
+                    remove="allow",
+                    notify=False,
+                )
+            ]
             log.info(
-                f"Loaded client config from {p}: "
-                f"transport={self.transport}, target={target}, cid={self.cid}, "
-                f"listen_socket={self.listen_socket}, "
-                f"transport_encryption={self.transport_encryption}"
+                f"Loaded deprecated client config from {p}: forwarding "
+                f"{listen_socket} -> {remote.id} "
+                f"(transport={self.transport}, tls={remote.uses_tls})"
             )
             return
 
@@ -620,13 +792,26 @@ class Config:
         if tcp_bind is not None:
             _split_bind(str(tcp_bind))
         self.tcp_bind = tcp_bind
-        agent_sockets = data.get("agent_sockets")
-        if agent_sockets is None:
+        # Upstreams: the canonical `[[upstream]]` array (any transport) plus the
+        # legacy `agent_sockets` shorthand (a list of strings == unix upstreams,
+        # or tables for the general form). `[[upstream]]` entries come first so
+        # the local agent is the default `key.socket` / add/remove target.
+        raw_upstreams = list(data.get("upstream", []) or [])
+        raw_upstreams += list(data.get("agent_sockets", []) or [])
+        if not raw_upstreams:
             # Unset -> default to the ambient agent socket ($SSH_AUTH_SOCK), so
             # the proxy is useful with zero key/rule config.
             env_sock = environ.get("SSH_AUTH_SOCK")
-            agent_sockets = [env_sock] if env_sock else []
-        self.agent_sockets = [resolve(s) for s in agent_sockets]
+            if env_sock:
+                raw_upstreams = [env_sock]
+        self._register_upstreams(
+            [self._parse_upstream(entry, resolve) for entry in raw_upstreams]
+        )
+        if not self.upstreams:
+            raise ValueError(
+                "Failed to load path to the actual SSH agent socket "
+                "(no upstream/agent_sockets configured and SSH_AUTH_SOCK empty)"
+            )
         self.libvirt_uri = data.get("libvirt_uri")
         if self.libvirt_uri and libvirt_open is None:
             raise ValueError(
@@ -656,12 +841,6 @@ class Config:
             f"transport_encryption={self.transport_encryption}"
         )
 
-        if not self.agent_sockets:
-            raise ValueError(
-                "Failed to load path to the actual SSH agent socket "
-                "(no agent_sockets configured and SSH_AUTH_SOCK empty)"
-            )
-
         for entry in data.get("vm", []):
             cid = entry.get("cid")
             name = entry.get("name")
@@ -688,7 +867,7 @@ class Config:
         self.known_hosts.load([resolve(path) for path in data.get("known_hosts_files", [])])
 
         for entry in data.get("key", []):
-            socket_path = resolve(entry.get("socket", self.agent_sockets[0]))
+            socket_path = resolve(entry.get("socket", self.upstream_order[0]))
             k_type, blob, fingerprint = self._parse_pubkey(entry.get("pubkey", ""))
 
             if blob in self.keys:
@@ -728,6 +907,8 @@ class Config:
                     listeners=_as_pattern_list(match.get("listeners"), field="listeners"),
                     auth=self._policy(entry, "auth", "ask"),
                     data_signing=self._policy(entry, "data_signing", "deny"),
+                    add=self._policy(entry, "add", "deny"),
+                    remove=self._policy(entry, "remove", "deny"),
                     notify=entry.get("notify", True),
                     allowed_host_keys=self._parse_host_keys(
                         entry.get("allowed_host_keys", [])
@@ -735,16 +916,23 @@ class Config:
                 )
             )
 
-        # Global policy above is shared by every listener. Now expand the
-        # listener list: the `[[listeners]]` array (a `[listener_defaults]`
-        # table deep-merged into each entry), or a single implicit listener for
-        # a legacy flat config. The old `transports`/`transport_defaults` names
-        # are rejected loudly rather than silently ignored.
+        # Global policy above is shared by every listener. Now build the
+        # listener list: the `[[listeners]]` array (each entry self-contained),
+        # or a single implicit listener for a legacy flat config. The old
+        # `transports`/`transport_defaults` names and the removed
+        # `[listener_defaults]` block are rejected loudly rather than silently
+        # ignored.
         if "transports" in data or "transport_defaults" in data:
             raise ValueError(
                 "the 'transports'/'transport_defaults' keys were renamed to "
-                "'listeners'/'listener_defaults' (one [[listeners]] entry is one "
-                "listener); update the configuration"
+                "'listeners' (one [[listeners]] entry is one listener); update "
+                "the configuration"
+            )
+        if "listener_defaults" in data:
+            raise ValueError(
+                "'[listener_defaults]' was removed: every [[listeners]] entry is "
+                "self-contained (move its values into the entry, or rely on the "
+                "built-in defaults)"
             )
         raw_listeners = data.get("listeners")
         if isinstance(raw_listeners, list) and raw_listeners:
@@ -754,7 +942,6 @@ class Config:
                         f"listeners cannot be combined with the flat "
                         f"{flat_key!r} key (the configuration is ambiguous)"
                     )
-            defaults = data.get("listener_defaults") or {}
             for index, entry in enumerate(raw_listeners):
                 if not isinstance(entry, dict):
                     raise ValueError(
@@ -762,8 +949,7 @@ class Config:
                         f"got {type(entry).__name__}"
                     )
             self.listeners = [
-                self._parse_listener(_deep_merge(defaults, entry), resolve)
-                for entry in raw_listeners
+                self._parse_listener(entry, resolve) for entry in raw_listeners
             ]
         else:
             self.listeners = [self._parse_listener_from_flat(data)]
@@ -792,6 +978,138 @@ class Config:
             )
         return val
 
+    def _register_upstreams(self, upstreams: list[UpstreamConfig]) -> None:
+        """Store the parsed upstreams and derive the id-keyed views.
+
+        `agent_sockets` (local unix ids) drives the per-connection
+        directory/session resolution and `key.socket` matching that predates
+        this refactor; `remote_ids` are the never-session-resolved remote
+        upstreams; `upstream_order` is declaration order, used as the add/remove
+        and default-`key.socket` order.
+        """
+        seen: set[str] = set()
+        for up in upstreams:
+            if up.id in seen:
+                raise ValueError(f"duplicate upstream id: {up.id!r}")
+            seen.add(up.id)
+        self.upstreams = upstreams
+        self.upstream_by_id = {up.id: up for up in upstreams}
+        self.agent_sockets = [up.id for up in upstreams if up.transport == "unix"]
+        self.remote_ids = [up.id for up in upstreams if up.transport != "unix"]
+        self.upstream_order = [up.id for up in upstreams]
+
+    def _parse_upstream(
+        self, entry: Any, resolve: Callable[[Any], Any]
+    ) -> UpstreamConfig:
+        """Build one `UpstreamConfig` from a `[[upstream]]`/`agent_sockets` entry.
+
+        A bare string is the legacy unix shorthand (`"<path>"`); a table is the
+        general form and may name any `transport`.
+        """
+        if isinstance(entry, str):
+            return self._build_upstream(
+                transport="unix", data={"socket": resolve(entry)}
+            )
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "an upstream entry must be a string (unix socket path) or a "
+                f"table, got {type(entry).__name__}"
+            )
+        transport = entry.get("transport") or entry.get("type")
+        if transport is None:
+            transport = "unix" if entry.get("socket") is not None else None
+        if transport not in ("vsock", "tcp", "unix"):
+            raise ValueError(f"invalid upstream transport: {transport!r}")
+        return self._build_upstream(transport=transport, data=entry, resolve=resolve)
+
+    def _build_upstream(
+        self,
+        *,
+        transport: str,
+        data: dict,
+        resolve: Optional[Callable[[Any], Any]] = None,
+    ) -> UpstreamConfig:
+        """Construct an `UpstreamConfig` from a resolved table (or the client
+        deprecation shim's synthesized fields)."""
+        resolve = resolve or (lambda value: value)
+        transport_encryption, client_auth, server_auth = validate_security_config(
+            data, transport
+        )
+        mtls = data.get("mtls", {})
+        if not isinstance(mtls, dict):
+            raise ValueError("'[mtls]' must be a table")
+
+        name = data.get("name")
+        if name is not None and (not isinstance(name, str) or not name):
+            raise ValueError(f"upstream name must be a non-empty string, got {name!r}")
+        socket = resolve(data.get("socket"))
+        host = data.get("host", "127.0.0.1")
+        port = int(data.get("port", DEFAULT_VSOCK_PORT))
+        cid = int(data.get("cid", HOST_CID))
+
+        if name:
+            upstream_id = name
+        elif transport == "unix":
+            if not socket:
+                raise ValueError("a unix upstream requires 'socket'")
+            upstream_id = socket
+        elif transport == "vsock":
+            upstream_id = f"vsock:{cid}:{port}"
+        else:
+            upstream_id = f"tcp:{host}:{port}"
+
+        return UpstreamConfig(
+            id=upstream_id,
+            transport=transport,
+            socket=socket,
+            host=host,
+            port=port,
+            cid=cid,
+            connect_timeout=float(
+                data.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT)
+            ),
+            handshake_timeout=float(
+                data.get("handshake_timeout", DEFAULT_HANDSHAKE_TIMEOUT)
+            ),
+            transport_encryption=transport_encryption,
+            client_auth=client_auth,
+            server_auth=server_auth,
+            mtls_enable=bool(mtls.get("enable", False)),
+            mtls_ca_file=resolve(mtls.get("ca_file")),
+            mtls_cert_file=resolve(mtls.get("cert_file")),
+            mtls_key_file=resolve(mtls.get("key_file")),
+            mtls_required_oid=mtls.get("required_oid"),
+            mtls_peer_required_oid=mtls.get("peer_required_oid"),
+        )
+
+    def shared_remote(self, upstream: UpstreamConfig) -> "RemoteConnection":
+        """Return the process-wide pooled `RemoteConnection` for a remote
+        upstream, creating (and eagerly connecting) it on first use.
+
+        Pooling is what makes a merged remote upstream cheap: one TLS/vsock
+        connection is shared by every incoming connection (serialized by the
+        connection's own lock), instead of a fresh handshake per request.
+        """
+        with self._remote_lock:
+            conn = self.remote_connections.get(upstream.id)
+            if conn is not None:
+                return conn
+            ssl_ctx = create_ssl_context(upstream, server=False)
+            if upstream.transport == "unix":
+                host: Any = upstream.socket
+            elif upstream.transport == "tcp":
+                host = upstream.host
+                if host == "_gateway":
+                    host = resolve_default_gateway()
+            else:
+                host = upstream.cid
+            conn = RemoteConnection(
+                host, upstream.port, upstream.transport, ssl_ctx, upstream
+            )
+            conn.ensure_connected()
+            self.remote_connections[upstream.id] = conn
+            return conn
+
     def _parse_pubkey(self, line: str) -> tuple[str, bytes, str]:
         parts = line.split()
         if len(parts) < 2:
@@ -811,12 +1129,13 @@ class Config:
     def _parse_listener(
         self, data: dict, resolve: Callable[[Any], Any]
     ) -> ListenerConfig:
-        """Build one `ListenerConfig` from a defaults-merged `listeners` entry.
+        """Build one `ListenerConfig` from a self-contained `listeners` entry.
 
         Security and identity are resolved **per listener**: each entry resolves
         its own `[security]`/`[mtls]` through `validate_security_config` and its
-        own `resolution`. Relative mTLS paths are resolved against the config
-        directory by the `resolve` closure.
+        own `resolution`; any field the entry omits falls back to the built-in
+        default. Relative mTLS paths are resolved against the config directory
+        by the `resolve` closure.
         """
         transport = data.get("type") or data.get("transport")
         if transport not in ("vsock", "tcp", "unix"):
@@ -980,6 +1299,10 @@ class AgentMsg(IntEnum):
     IDENTITIES_ANSWER = 12
     SIGN_REQUEST = 13
     SIGN_RESPONSE = 14
+    ADD_IDENTITY = 17
+    REMOVE_IDENTITY = 18
+    REMOVE_ALL_IDENTITIES = 19
+    ADD_ID_CONSTRAINED = 25
     EXTENSION = 27
 
 
@@ -1647,6 +1970,69 @@ class AgentIO:
         t.join()
 
 
+class AgentLink:
+    """A one-request-at-a-time channel to one upstream agent.
+
+    Both the proxy's per-connection AF_UNIX socket and a shared remote
+    `RemoteConnection` are reached through this interface, so the handler
+    (identities / sign / add / remove) is transport-agnostic.
+    """
+
+    def request(self, msg: bytes) -> Optional[bytes]:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        pass
+
+
+class SocketLink(AgentLink):
+    """A per-connection AF_UNIX upstream socket.
+
+    Framing reuses the handler's `AgentIO` helpers so the wire behavior is
+    identical to the pre-refactor inline send/recv.
+    """
+
+    def __init__(self, sock: socket.socket, io: "AgentIO") -> None:
+        self.sock = sock
+        self._io = io
+
+    def request(self, msg: bytes) -> Optional[bytes]:
+        try:
+            self._io._send_msg(self.sock, msg)
+            return self._io._recv_msg(self.sock)
+        except Exception as e:
+            log.debug(f"Upstream socket error: {e}")
+            return None
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class RemoteLink(AgentLink):
+    """A `RemoteConnection` to a remote proxy listener.
+
+    By default the connection is shared and pooled, so `close()` is a no-op: one
+    connection serves every incoming connection and is closed only at process
+    shutdown. `owned=True` marks a per-connection `RemoteConnection` (a
+    unix+mtls upstream) that this link must close when the inbound connection
+    ends.
+    """
+
+    def __init__(self, remote: "RemoteConnection", owned: bool = False) -> None:
+        self.remote = remote
+        self.owned = owned
+
+    def request(self, msg: bytes) -> Optional[bytes]:
+        return self.remote.request(msg)
+
+    def close(self) -> None:
+        if self.owned:
+            self.remote.close()
+
+
 class Handler(AgentIO, BaseRequestHandler):
     def setup(self) -> None:
         t0 = monotonic()
@@ -1727,16 +2113,17 @@ class Handler(AgentIO, BaseRequestHandler):
             if k_cfg.socket not in self.allowed_sockets:
                 self.allowed_sockets.append(k_cfg.socket)
 
-        # agent_sockets are always probed, regardless of whether any
-        # explicit rule matched above -- identities coming back from them are
-        # admitted opportunistically in _handle_identities/_maybe_autoregister,
-        # governed by an explicit rule if one matches or DEFAULT_RULE otherwise.
-        # A listener with `scan_agent_socket_dirs`/`resolve_session_socket` set
-        # replaces this static list per connection in `handle`.
-        for sock_path in self.config.agent_sockets:
-            if sock_path not in self.allowed_sockets:
-                self.allowed_sockets.append(sock_path)
-        self.resolved_agent_sockets: list[str] = list(self.config.agent_sockets)
+        # Upstreams are always probed, regardless of whether any explicit rule
+        # matched above -- identities coming back from them are admitted
+        # opportunistically in _handle_identities/_maybe_autoregister, governed
+        # by an explicit rule if one matches or DEFAULT_RULE otherwise. A
+        # listener with `scan_agent_socket_dirs`/`resolve_session_socket` set
+        # replaces the *local* part of this list per connection in `handle`
+        # (remote upstreams are static and never session-resolved).
+        for upstream_id in self.config.upstream_order:
+            if upstream_id not in self.allowed_sockets:
+                self.allowed_sockets.append(upstream_id)
+        self.resolved_agent_sockets: list[str] = list(self.config.upstream_order)
 
         log.debug(
             f"Client {self.vm_name} initialized with "
@@ -1822,30 +2209,61 @@ class Handler(AgentIO, BaseRequestHandler):
                 scan_dirs=listener.scan_agent_socket_dirs,
                 session_socket=session_socket,
             )
-            self.resolved_agent_sockets = resolved
+            # Remote upstreams are static: never directory-scanned or replaced
+            # by the per-session socket -- always appended unchanged.
+            self.resolved_agent_sockets = resolved + self.config.remote_ids
             key_sockets = [
-                p for p in self.allowed_sockets if p not in self.config.agent_sockets
+                p
+                for p in self.allowed_sockets
+                if p not in self.config.agent_sockets
+                and p not in self.config.remote_ids
             ]
-            self.allowed_sockets = key_sockets + [
-                p for p in resolved if p not in key_sockets
-            ]
+            self.allowed_sockets = key_sockets + resolved + self.config.remote_ids
 
-        real_agents = {}
+        real_agents: dict[str, AgentLink] = {}
         for path in self.allowed_sockets:
-            # `path` stays the configured identifier (also used to key
-            # `real_agents` and match `key.socket`/`resolved_agent_sockets`);
-            # only the AF_UNIX connect expands a `%t/...` runtime-dir
-            # placeholder to $XDG_RUNTIME_DIR (see `_expand_socket_path`).
-            target = _expand_socket_path(path)
+            # `path` is the upstream id (also used to key `real_agents` and to
+            # match `key.socket`). A vsock/tcp upstream goes through one shared,
+            # pooled `RemoteConnection`; every unix upstream is dialed per
+            # connection -- a plain unix socket directly (its path may be a
+            # `%t/...` placeholder, or come from the per-session
+            # `SSH_AUTH_PROXY_SOCK`), a unix+mtls one (TLS inside an SSH
+            # RemoteForward) through a fresh `RemoteConnection` closed with this
+            # connection. A directory/session entry `_resolve_agent_sockets`
+            # produced has no `UpstreamConfig` and is dialed as a plain socket.
+            upstream = self.config.upstream_by_id.get(path)
+            target = path
             try:
+                if upstream is not None and upstream.transport != "unix":
+                    real_agents[path] = RemoteLink(self.config.shared_remote(upstream))
+                    log.debug(f"Connected to upstream {path}")
+                    continue
+                if upstream is not None:
+                    target = upstream.socket or environ.get("SSH_AUTH_PROXY_SOCK")
+                    if not target:
+                        log.error(
+                            f"Could not connect to upstream agent {path}: no "
+                            "socket configured and SSH_AUTH_PROXY_SOCK is unset"
+                        )
+                        continue
+                    if upstream.uses_tls:
+                        ssl_ctx = create_ssl_context(upstream, server=False)
+                        conn = RemoteConnection(
+                            target, upstream.port, "unix", ssl_ctx, upstream
+                        )
+                        conn.ensure_connected()
+                        real_agents[path] = RemoteLink(conn, owned=True)
+                        log.debug(f"Connected to upstream {path}")
+                        continue
+                target = _expand_socket_path(target)
                 sock = Socket(AF_UNIX, SOCK_STREAM)
                 sock.settimeout(UPSTREAM_TIMEOUT)
                 sock.connect(target)
                 sock.settimeout(SOCKET_TIMEOUT)
-                real_agents[path] = sock
+                real_agents[path] = SocketLink(sock, self)
                 log.debug(f"Connected to upstream agent at {target}")
             except Exception as e:
-                log.error(f"Could not connect to real agent at {target}: {e}")
+                log.error(f"Could not connect to upstream agent {path}: {e}")
 
         try:
             while True:
@@ -1866,6 +2284,10 @@ class Handler(AgentIO, BaseRequestHandler):
                         self._handle_identities(client, msg, real_agents)
                     case AgentMsg.SIGN_REQUEST:
                         self._handle_sign_request(client, msg, real_agents)
+                    case AgentMsg.ADD_IDENTITY | AgentMsg.ADD_ID_CONSTRAINED:
+                        self._handle_add(client, msg, real_agents)
+                    case AgentMsg.REMOVE_IDENTITY | AgentMsg.REMOVE_ALL_IDENTITIES:
+                        self._handle_remove(client, msg, real_agents)
                     case AgentMsg.EXTENSION:
                         self._handle_extension(client, msg)
                     case _:
@@ -1873,18 +2295,17 @@ class Handler(AgentIO, BaseRequestHandler):
         except Exception:
             log.exception("Error in client handler loop")
         finally:
-            for s in real_agents.values():
-                s.close()
+            for link in real_agents.values():
+                link.close()
             client.close()
             log.debug(f"Connection with {self.vm_name} closed")
 
     def _handle_identities(
-        self, client: socket, raw_msg: bytes, real_agents: dict[str, socket]
+        self, client: socket, raw_msg: bytes, real_agents: dict[str, "AgentLink"]
     ) -> None:
         aggregated_identities = []
-        for path, sock in real_agents.items():
-            self._send_msg(sock, raw_msg)
-            resp = self._recv_msg(sock)
+        for path, link in real_agents.items():
+            resp = link.request(raw_msg)
             if not resp or resp[0] != AgentMsg.IDENTITIES_ANSWER:
                 continue
 
@@ -1916,7 +2337,7 @@ class Handler(AgentIO, BaseRequestHandler):
         self._send_msg(client, payload)
 
     def _handle_sign_request(
-        self, client: socket, raw_msg: bytes, real_agents: dict[str, socket]
+        self, client: socket, raw_msg: bytes, real_agents: dict[str, "AgentLink"]
     ) -> None:
         buf = SSHBuffer(raw_msg)
         buf.read_byte()
@@ -1971,13 +2392,12 @@ class Handler(AgentIO, BaseRequestHandler):
         )
 
         if is_authorized:
-            target_sock = real_agents.get(k_cfg.socket)
-            if target_sock:
+            target_link = real_agents.get(k_cfg.socket)
+            if target_link:
                 log.info(
                     f"Access granted: VM={self.vm_name}, Key={k_cfg.id}, Fingerprint={k_cfg.fingerprint}, Purpose={purpose}"
                 )
-                self._send_msg(target_sock, raw_msg)
-                resp = self._recv_msg(target_sock)
+                resp = target_link.request(raw_msg)
                 if resp is None:
                     log.warning(
                         f"Upstream agent closed before responding for key {k_cfg.id}"
@@ -1994,6 +2414,139 @@ class Handler(AgentIO, BaseRequestHandler):
             )
 
         self._send_msg(client, bytes([AgentMsg.FAILURE]))
+
+    def _dialog_program(self) -> str:
+        return self.config.dialog_program or (
+            "swiftdialog" if sys_platform == "darwin" else "zenity"
+        )
+
+    def _authorize_mutation(self, policy: str, title: str, prompt: str) -> bool:
+        """Whether a rule's `add`/`remove` policy authorizes a key mutation.
+
+        `deny` and `allow` never prompt; `ask` prompts the human. A declined
+        dialog returns False. The caller logs and replies FAILURE on False.
+        """
+        if policy == "deny":
+            return False
+        if policy == "allow":
+            return True
+        return prompt_for_confirmation(title, prompt, self._dialog_program())
+
+    def _mutation_target(self, real_agents: dict[str, "AgentLink"]) -> Optional[str]:
+        """The upstream agent an add/remove is forwarded to.
+
+        The first upstream (in declaration order: `[[upstream]]` then legacy
+        `agent_sockets`) that is connected -- so a local agent listed first
+        receives the key -- else the first connected upstream. None when no
+        upstream is reachable -> the mutation fails closed. Keys are never
+        stored by the proxy itself: the forwarded agent holds the private key in
+        memory.
+        """
+        for path in self.config.upstream_order:
+            if path in real_agents:
+                return path
+        return next(iter(real_agents), None)
+
+    def _forward_mutation(
+        self, client: socket, raw_msg: bytes, real_agents: dict[str, "AgentLink"]
+    ) -> bool:
+        """Forward one add/remove message to the default upstream and relay its
+        raw response. Returns True only when the upstream answered SUCCESS."""
+        target = self._mutation_target(real_agents)
+        if target is None:
+            log.warning(
+                f"No upstream agent to forward {AgentMsg(raw_msg[0]).name} "
+                f"from {self.vm_name}"
+            )
+            self._send_msg(client, bytes([AgentMsg.FAILURE]))
+            return False
+        resp = real_agents[target].request(raw_msg)
+        if resp is None:
+            log.warning(f"Upstream agent {target} closed before responding")
+            self._send_msg(client, bytes([AgentMsg.FAILURE]))
+            return False
+        ok = bool(resp) and resp[0] == AgentMsg.SUCCESS
+        if ok:
+            log.info(
+                f"Forwarded {AgentMsg(raw_msg[0]).name} for {self.vm_name} to {target}"
+            )
+        self._send_msg(client, resp)
+        return ok
+
+    def _handle_add(
+        self, client: socket, raw_msg: bytes, real_agents: dict[str, "AgentLink"]
+    ) -> None:
+        # `SSH_AGENTC_ADD_IDENTITY` / `_CONSTRAINED`: `ssh-add` transmits the
+        # private key to the agent. The proxy has no storage -- it enforces the
+        # matched rule's `add` policy and forwards to the default upstream,
+        # which holds the key in memory for the session.
+        key_type, public_blob, comment = _public_blob_from_private(raw_msg)
+        named = self.config.keys.get(public_blob) if public_blob else None
+        if named is not None:
+            key_id = named.id
+            fingerprint = named.fingerprint
+        else:
+            fingerprint = _fingerprint(public_blob) if public_blob else "unknown"
+            key_id = comment or fingerprint
+        safe_id = "".join(c for c in key_id if c.isprintable())[:64]
+
+        rule = self._match_rule(key_id) or DEFAULT_RULE
+        title = f"SSH Agent proxy: {self.vm_name}"
+        if not self._authorize_mutation(
+            rule.add,
+            title,
+            f"Allow {self.vm_name} to add key '{safe_id}' to the agent?\n"
+            f"Type: {key_type or 'unknown'}\nFingerprint: {fingerprint}",
+        ):
+            log_msg = (
+                f"{'Refused' if rule.add == 'deny' else 'Denied'} ADD of key "
+                f"'{key_id}' ({fingerprint}) from VM={self.vm_name}"
+            )
+            log.warning(log_msg)
+            notify(title, log_msg, critical=True)
+            self._send_msg(client, bytes([AgentMsg.FAILURE]))
+            return
+
+        if self._forward_mutation(client, raw_msg, real_agents) and rule.notify:
+            notify(title, f"{self.vm_name} added key '{safe_id}' to the agent")
+
+    def _handle_remove(
+        self, client: socket, raw_msg: bytes, real_agents: dict[str, "AgentLink"]
+    ) -> None:
+        title = f"SSH Agent proxy: {self.vm_name}"
+        if raw_msg[0] == AgentMsg.REMOVE_ALL_IDENTITIES:
+            # No key to name, so the wildcard-key rule governs: a rule scoped to
+            # a specific key never authorizes removing every key.
+            rule = self._match_rule("*") or DEFAULT_RULE
+            action = "remove ALL keys from the agent"
+        else:
+            try:
+                buf = SSHBuffer(raw_msg)
+                buf.read_byte()
+                key_blob = buf.read_string()
+            except Exception:
+                self._send_msg(client, bytes([AgentMsg.FAILURE]))
+                return
+            named = self.config.keys.get(key_blob)
+            key_id = named.id if named else _fingerprint(key_blob)
+            rule = self._match_rule(key_id) or DEFAULT_RULE
+            safe_id = "".join(c for c in key_id if c.isprintable())[:64]
+            action = f"remove key '{safe_id}' from the agent"
+
+        if not self._authorize_mutation(
+            rule.remove, title, f"Allow {self.vm_name} to {action}?"
+        ):
+            log_msg = (
+                f"{'Refused' if rule.remove == 'deny' else 'Denied'} REMOVE "
+                f"({action}) from VM={self.vm_name}"
+            )
+            log.warning(log_msg)
+            notify(title, log_msg, critical=True)
+            self._send_msg(client, bytes([AgentMsg.FAILURE]))
+            return
+
+        if self._forward_mutation(client, raw_msg, real_agents) and rule.notify:
+            notify(title, f"{self.vm_name} did {action}")
 
     def _determine_purpose(self, data_to_sign: bytes) -> str:
         try:
@@ -2374,12 +2927,12 @@ class RemoteConnection(AgentIO):
 
     A TLS/mTLS handshake is expensive (asymmetric crypto + cert validation);
     doing a fresh one per agent request would make every `ssh`/`git`
-    invocation pay that cost on top of its own work. Connected eagerly at
-    startup (see `run_client`) so the first real request doesn't pay it
-    either, and transparently reconnected if the remote side drops it.
-    Only one agent request is ever in flight on it at a time -- the SSH
-    agent wire protocol carries no request ID to demultiplex concurrent
-    ones -- enforced by `lock`.
+    invocation pay that cost on top of its own work. One instance is pooled per
+    remote upstream (`Config.shared_remote`), connected eagerly on first use so
+    the first real request doesn't pay the handshake either, and transparently
+    reconnected if the remote side drops it. Only one agent request is ever in
+    flight on it at a time -- the SSH agent wire protocol carries no request ID
+    to demultiplex concurrent ones -- enforced by `lock`.
     """
 
     def __init__(
@@ -2472,36 +3025,15 @@ class RemoteConnection(AgentIO):
                     self.sock = None
             return None
 
-
-class ClientHandler(AgentIO, BaseRequestHandler):
-    """Local Unix socket handler that relays agent protocol messages to the
-    remote proxy over the server's single shared, persistent connection
-    (see RemoteConnection) rather than opening a fresh TCP/TLS connection
-    per local client."""
-
-    def setup(self) -> None:
-        self.remote: RemoteConnection = self.server.remote
-
-    def handle(self) -> None:
-        local = self.request
-        local.settimeout(SOCKET_TIMEOUT)
-        try:
-            while True:
-                msg = self._recv_msg(local)
-                if not msg:
-                    break
-                resp = self.remote.request(msg)
-                if resp is None:
-                    self._send_msg(local, bytes([AgentMsg.FAILURE]))
-                    break
-                self._send_msg(local, resp)
-        except Exception:
-            log.exception("client: error in local handler loop")
-        finally:
+    def close(self) -> None:
+        """Close the underlying socket (used by per-connection, non-pooled
+        `RemoteConnection`s; pooled ones live until process shutdown)."""
+        if self.sock is not None:
             try:
-                local.close()
+                self.sock.close()
             except Exception:
                 pass
+            self.sock = None
 
 
 def _listener_target(listener: ListenerConfig) -> str:
@@ -2599,66 +3131,11 @@ def run_proxy(config: Config) -> None:
                 server.server_close()
             with suppress(Exception):
                 _unlink_listener_socket(listener)
-
-
-def run_client(config: Config) -> None:
-    ssl_ctx = create_ssl_context(config, server=False)
-    listen_path = config.listen_socket or "%t/ssh-agent-host"
-    listen_path = _expand_socket_path(listen_path)
-
-    listen = Path(listen_path)
-    listen.parent.mkdir(parents=True, exist_ok=True)
-    if listen.exists():
-        listen.unlink()
-
-    old_umask = umask(0o177)
-    try:
-        server = ThreadedUnixServer(str(listen), ClientHandler)
-    finally:
-        umask(old_umask)
-
-    if config.transport == "unix":
-        # Dial the per-session forwarded socket (`connect_socket`, or the
-        # SSH_AUTH_PROXY_SOCK selector) through the SSH RemoteForward. SSL, when
-        # enabled, runs over that stream (plan §2.2).
-        remote_path = config.connect_socket or environ.get("SSH_AUTH_PROXY_SOCK")
-        if not remote_path:
-            log.error(
-                "unix transport requires connect_socket or $SSH_AUTH_PROXY_SOCK"
-            )
-            exit(1)
-        remote = RemoteConnection(
-            _expand_socket_path(remote_path), 0, "unix", ssl_ctx, config
-        )
-    elif config.transport == "vsock":
-        remote = RemoteConnection(config.cid, config.port, "vsock", ssl_ctx, config)
-    else:
-        remote_host = config.host
-        if remote_host == "_gateway":
-            try:
-                remote_host = resolve_default_gateway()
-                log.info(f"Resolved _gateway -> {remote_host}")
-            except Exception as e:
-                log.error(f"Failed to resolve default gateway: {e}")
-                exit(1)
-        remote = RemoteConnection(remote_host, config.port, "tcp", ssl_ctx, config)
-    # Connect (and TLS-handshake) now rather than on the first agent
-    # request -- see RemoteConnection's docstring.
-    remote.ensure_connected()
-    server.remote = remote
-
-    try:
-        with server:
-            log.info(
-                f"SSH Agent client listening on {listen} "
-                f"(forwarding to {remote.peer}, tls={ssl_ctx is not None})"
-            )
-            server.serve_forever()
-    except KeyboardInterrupt:
-        log.info("Shutting down...")
-        exit(0)
-    finally:
-        listen.unlink(missing_ok=True)
+        # Close the pooled outbound connections to remote upstreams.
+        for remote in config.remote_connections.values():
+            with suppress(Exception):
+                if getattr(remote, "sock", None):
+                    remote.sock.close()
 
 
 def main() -> None:
@@ -2671,7 +3148,8 @@ def main() -> None:
         "--mode",
         choices=["proxy", "client"],
         default=None,
-        help="Operation mode (default: proxy, or from config)",
+        help="Deprecated: mode comes from the config; there is no client/server "
+        "split (a client is a unix listener + a remote upstream).",
     )
     args = parser.parse_args()
 
@@ -2685,12 +3163,7 @@ def main() -> None:
         log.error(f"Configuration error: {e}")
         exit(1)
 
-    mode = args.mode or config.mode or "proxy"
-
-    if mode == "client":
-        run_client(config)
-    else:
-        run_proxy(config)
+    run_proxy(config)
 
 
 if __name__ == "__main__":

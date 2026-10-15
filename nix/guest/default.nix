@@ -24,6 +24,7 @@
     mkIf
     mkMerge
     optional
+    optionalAttrs
     ;
   g = tartarusGuest;
   p = g.platform;
@@ -142,46 +143,57 @@ in {
 
         (mkIf services.sshAgentProxy {
           tartarus.ssh-agent-proxy = {
-            # Guest -> host proxy bridge. On `unix` it dials the per-session
-            # forwarded socket (`$SSH_AGENT_PROXY_SOCK`) and wraps it with mTLS;
-            # on callback transports it dials the host's vsock/tcp endpoint with
-            # no crypto (the tartarus channel is private by construction).
-            bridge = {
-              enable = true;
-              transport = if sshUnix then "unix" else connection.transport;
-              connectSocket = null;
-              host = connection.host;
-              vsockCid = connection.cid;
-              vsockPort = 65000;
-              port = 65000;
-              listenSocket = "%t/ssh-agent-host";
-              setSshAuthSock = true;
-              security = {
-                transportEncryption = if sshUnix then "mtls" else "none";
-                serverAuth = if sshUnix then "transport" else "none";
-                clientAuth = if sshUnix then "transport" else "none";
-              };
-              mtls =
-                clientMtls "1.3.6.1.4.1.99999.2.2" "1.3.6.1.4.1.99999.2.1"
-                // {enable = sshUnix;};
-            };
-            # Guest-local agent.
+            # Guest-local agent (the keys added inside the guest).
             agent.enable = true;
-            # Merge the local agent with the host-forwarded one: a local
-            # allow-all proxy server whose transport is a unix socket. A
-            # distinct `configPath` keeps it from colliding with the bridge's
-            # default `~/.config/ssh-agent-proxy/config.toml`.
+            # ONE process, no separate `bridge`: a local allow-all proxy server
+            # that merges the guest's agent with the host's. The host agent is
+            # just another `[[upstream]]` -- on callback transports the server
+            # dials the host's vsock/tcp endpoint with no crypto (the tartarus
+            # channel is private by construction); on the SSH-forwarded `unix`
+            # transport it dials the per-session socket (`$SSH_AUTH_PROXY_SOCK`)
+            # with mTLS inside the tunnel. The merged identities are served on a
+            # local unix socket that `setSshAuthSock` points SSH_AUTH_SOCK at.
             server = {
               enable = true;
+              # A distinct `configPath` keeps it from colliding with the
+              # default `~/.config/ssh-agent-proxy/config.toml`.
               configPath = "${g.user.home}/.config/ssh-agent-proxy/server.toml";
               setSshAuthSock = true;
               settings = {
-                agent_sockets = ["%t/ssh-agent" "%t/ssh-agent-host"];
+                upstream = [
+                  # Local agent first: it is the default `key.socket` and the
+                  # `ssh-add`/`ssh-add -d` target.
+                  {transport = "unix"; socket = "%t/ssh-agent";}
+                  ({
+                    name = "host";
+                    transport = if sshUnix then "unix" else connection.transport;
+                    port = 65000;
+                    security = {
+                      transport_encryption = if sshUnix then "mtls" else "none";
+                      server_auth = if sshUnix then "transport" else "none";
+                      client_auth = if sshUnix then "transport" else "none";
+                    };
+                  }
+                  // optionalAttrs (!sshUnix) {
+                    host = connection.host;
+                    cid = connection.cid;
+                  }
+                  // optionalAttrs sshUnix {
+                    # The `unix` transport omits `socket`: the proxy reads the
+                    # per-session `$SSH_AUTH_PROXY_SOCK` at connect time.
+                    mtls = clientMtls "1.3.6.1.4.1.99999.2.2" "1.3.6.1.4.1.99999.2.1";
+                  })
+                ];
                 rule = [
                   {
                     key = "*";
                     auth = "allow";
                     data_signing = "allow";
+                    # Mirror the old merge mode's blind forwarding: `ssh-add`
+                    # through the merged socket adds to the first upstream agent
+                    # (`%t/ssh-agent`), `ssh-add -d` removes from it.
+                    add = "allow";
+                    remove = "allow";
                     notify = false;
                   }
                 ];

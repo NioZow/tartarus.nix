@@ -1,117 +1,176 @@
 # ssh-agent-proxy — standalone host-side server configuration (no Nix required)
 #
 # This is the *host* side: it owns the host's SSH identities and brokers them to
-# guests. Run it on the machine where the keys live; the guest runs either the
-# bridge (`ssh-agent-proxy-client.toml`) or uses the forwarded socket directly.
+# guests. Run it on the machine where the keys live; a guest either runs the
+# bridge (a `unix` upstream pointed at the forwarded socket, see the docs) or
+# uses the forwarded socket directly.
 #
-# Two transports matter here:
-#
-#   "unix" + transport_encryption = "none"  The guest's ssh/git talks plain
-#           agent protocol to the `ssh -R` forwarded socket, which this server
-#           accepts on its single AF_UNIX socket. Identity is unset, so only
-#           wildcard rules match (a specific `machine` never matches).
-#
-#   "unix" + transport_encryption = "mtls"  The guest runs the bridge, which
-#           wraps the forwarded stream in TLS; this server terminates it. The
-#           verified client certificate CN becomes the identity, so per-guest
-#           `machine` rules work. The `[mtls]` block below is for this mode.
-#
-#   "vsock" / "tcp"  The guest dials the host callback endpoint. See the
-#           sudo-auth-proxy example for the callback shape.
+# It is a plain TOML file, so it runs on a machine with no Nix — any Linux
+# distribution with Python 3.11+ and the `cryptography` wheel. The design and
+# threat model live in `docs/technical/ssh-agent-proxy.md`.
 #
 # Copy to ~/.config/ssh-agent-proxy/config.toml and run:
 #
 #   ssh-agent-proxy --config ~/.config/ssh-agent-proxy/config.toml
 #
-# This is the **flat** (single-transport) form: a top-level `transport`. The
-# server still accepts it and treats the whole document as **one implicit
-# listener**, so existing hand-written configs keep working. To bind several
-# transports in one process (a `vsock` VM *and* an `ssh -R` forwarded `unix`
-# socket, with a per-listener `resolution`/`[security]`), use the
-# multi-listener form instead: `examples/ssh-agent-proxy-listeners.toml` — a
-# `[listener_defaults]` table plus one `[[listeners]]` entry per listener.
+# TERMINOLOGY
+#   A server binds one or more LISTENERS. A listener is (a bind to) a socket —
+#   an AF_UNIX path, an AF_VSOCK port, or a TCP host:port. Its `type` is the
+#   listener's *transport* (the "how"); the listener itself is the "where".
+#   Each `[[listeners]]` entry is one listener and is **self-contained**: a field
+#   it omits falls back to the built-in default, never to a shared block.
+#
+#   A listener MAY be given a `name`. Named listeners can be selected by rules
+#   (`[[rule]] match.listeners = ["<name>"]`); an unnamed listener matches only a
+#   rule whose listener selector is empty or made exclusively of `*` patterns.
+#
+# This example binds **three listeners in the one server process**:
+#
+#   * (unnamed) `vsock`  a Linux MicroVM dials the host callback endpoint; the
+#                        peer is named from local VM bookkeeping
+#                        (`resolution = "tartarus"`).
+#   * "remote-guest"     `unix` + mTLS; the host accepts the guest's `ssh -R`
+#                        forwarded socket and the bridge wraps it in mTLS; the
+#                        verified certificate CN names the peer.
+#   * "merge"            `unix`, plaintext, allow-all: a local socket that fans
+#                        several agents together (this is what used to be the
+#                        separate `--merge` mode — now just a listener).
+#
+# The global policy — the `vm`/`tcp_vm` maps, `key`, `rule`, `agent_sockets`,
+# `known_hosts_files`, `libvirt_uri` — is written once at the top level, because
+# every listener shares it; only the bind target, `name`, `resolution` and
+# `[security]`/`[mtls]` are per listener.
 #
 # Paths are resolved relative to this file's directory (`./server.crt` means
 # "next to this config"), except `%t/...` which expands to the runtime dir.
-#
-# The host half of the guest setup is a plain SSH RemoteForward:
-#
-#   ssh -o StreamLocalBindUnlink=yes -o ExitOnForwardFailure=yes \
-#       -o "RemoteForward=/run/ssh-agent-proxy/%r@%h.sock %t/ssh-agent-proxy/server.sock" \
-#       -o "SetEnv=SSH_AGENT_PROXY_SOCK=/run/ssh-agent-proxy/%r@%h.sock" guest
 
 # ---------------------------------------------------------------------------
 mode = "proxy"
 
-# "vsock" | "tcp" | "unix". The single host socket below is the only endpoint.
-transport = "unix"
-
-# The AF_UNIX socket this server binds (transport = "unix"). One per host user;
-# guest identity never comes from the path. `%t` = the user runtime directory.
-socket = "%t/ssh-agent-proxy/server.sock"
-socket_dir_mode = "0700"
-socket_mode = "0600"
-
-# How a connecting peer is named. On `unix` the only valid values are:
-#   "none"         identity unset -> only wildcard rules match
-#   "certificate"  verified mTLS peer certificate CN (requires mtls below)
-# ("tartarus"/"mofos" are rejected on `unix`: there is no CID or IP to map.)
-resolution = "none"
-
-# Wall-clock bounds. `connect_timeout` bounds the dial + TLS handshake.
-connect_timeout = 10.0
-handshake_timeout = 10.0
-# Seconds to wait for a human decision (0 = wait indefinitely).
-decision_timeout = 120
-
-# Upstream agent sockets whose identities are offered to clients; the first
-# entry is also the default socket for `key` entries without an explicit
-# `socket`. Here it is the ssh-agent started by the desktop session (or the
-# guest's own agent).
-agent_sockets = ["%t/ssh-agent"]
+# Dialog backend for the key-use prompt: "zenity" (Linux), "osascript"/
+# "swiftdialog" (macOS). Never auto-detected.
+dialog_program = "zenity"
 
 # Log timing/selection detail to stderr.
 debug = false
 
 # ---------------------------------------------------------------------------
-# [security] — resolved from `transport` unless written explicitly.
+# Global policy, shared by every listener. The upstream agent socket(s) whose
+# identities are forwarded; the first entry is also the default socket for
+# `key` entries without an explicit `socket`.
 #
-#   transport_encryption  "auto" | "none" | "mtls"  (auto: tcp -> mtls,
-#                          vsock/unix -> none)
-#   client_auth           "transport" | "none"
-#   server_auth           "transport" | "none"
-#
-# Under mTLS both auth knobs are forced to "transport". This example is the
-# transparent `unix + none` server, so authentication is explicitly off.
+# For the local `"merge"` listener below we list several local agents: that
+# listener's clients then see their union. (The list is global, so the callback
+# and remote listeners also forward these — scope them with rules if needed.)
 # ---------------------------------------------------------------------------
-[security]
+agent_sockets = [
+  "%t/ssh-agent",
+  "%t/gnupg/S.gpg-agent.ssh",
+]
+
+# ===========================================================================
+# LISTENER #1 — the VSOCK callback, UNNAMED. The guest dials the host over
+# AF_VSOCK (a point-to-point link, private by construction). An unnamed listener
+# can only match rules without a `match.listeners` selector (or one made of
+# `*`). The peer's name comes from the static CID map / libvirt
+# (`"tartarus"`, and `"mofos"` when a `libvirt_uri` is set); the security is
+# unauthenticated.
+# ===========================================================================
+[[listeners]]
+type = "vsock"
+cid = 2
+resolution = "tartarus"
+
+[listeners.security]
 transport_encryption = "none"
 client_auth = "none"
 server_auth = "none"
 
-# ---------------------------------------------------------------------------
-# [mtls] — required when transport_encryption = "mtls" (unix + mtls). Uncomment
-# to switch this server to certificate identity; then set resolution =
-# "certificate" above and have the guest use the bridge with matching material.
-# ---------------------------------------------------------------------------
-# [mtls]
-# enable = true
-# ca_file = "./ca.crt"
-# cert_file = "./server.crt"
-# key_file = "./server.key"
-# required_oid = "1.3.6.1.4.1.99999.2.1"      # this (server) certificate
-# peer_required_oid = "1.3.6.1.4.1.99999.2.2" # the peer (client) certificate
+# ===========================================================================
+# LISTENER #2 — the SSH-forwarded Unix socket, named "remote-guest". The guest
+# runs the bridge, which wraps the forwarded stream in TLS; this server
+# terminates it. The verified client certificate CN becomes the identity, so
+# per-guest rules work. `"tartarus"`/`"mofos"` are invalid on `unix` (there is
+# no CID or IP to map).
+# ===========================================================================
+[[listeners]]
+type = "unix"
+name = "remote-guest"
+socket = "%t/ssh-agent-proxy/server.sock"
+socket_dir_mode = "0700"
+socket_mode = "0600"
+resolution = "certificate"
+connect_timeout = 10.0
+handshake_timeout = 10.0
+decision_timeout = 120
 
-# ---------------------------------------------------------------------------
-# Explicit keys and rules. With `resolution = "none"` only wildcard `machine`
-# rules can match, so a `[[rule]]` with a specific selector is pointless here.
-# ---------------------------------------------------------------------------
-# [[key]]
-# id = "laptop"
-# pubkey = "ssh-ed25519 AAAA... user@laptop"
+[listeners.security]
+transport_encryption = "mtls"
+client_auth = "transport"
+server_auth = "transport"
 
+[listeners.mtls]
+enable = true
+ca_file = "./ca.crt"
+cert_file = "./server.crt"
+key_file = "./server.key"
+required_oid = "1.3.6.1.4.1.99999.2.1"      # this (server) certificate
+peer_required_oid = "1.3.6.1.4.1.99999.2.2" # the peer (client) certificate
+
+# ===========================================================================
+# LISTENER #3 — a local socket that MERGES several agents, named "merge". This
+# is the replacement for the former `--merge` mode: an ordinary `unix` listener
+# whose identity is unset (`resolution = "none"`) and whose rule (below) allows
+# everything, so it needs no prompt. Point `SSH_AUTH_SOCK` at its socket:
+#
+#   export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR}/ssh-agent-merged"
+#
+# Add `scan_agent_socket_dirs = true` / `resolve_session_socket = true` to fan
+# in per-session `ssh -R` sockets that appear and disappear (both are `unix`
+# only; `resolve_session_socket` is Linux only).
+# ===========================================================================
+[[listeners]]
+type = "unix"
+name = "merge"
+socket = "%t/ssh-agent-merged"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+
+# ===========================================================================
+# Global rule policy, evaluated in file order, first match wins. Each rule may
+# scope its key with `key`, its VM with `match.machine` and its listener(s)
+# with `match.listeners` (an fnmatch pattern or list of patterns). `auth`/
+# `data_signing`/`add`/`remove` are each `deny` | `ask` | `allow`.
+# ===========================================================================
+
+# The local merge socket: allow every key for auth and data signing, silently
+# (no desktop notification, no dialog). `add`/`remove` make `ssh-add` work
+# through the merged socket; they default to `deny` and are omitted for the
+# guest-facing listeners.
 [[rule]]
 key = "*"
-match.machine = ["*"]   # required on `unix + none`: identity is unset
+match.listeners = ["merge"]
+auth = "allow"
+data_signing = "allow"
+add = "allow"
+remove = "allow"
+notify = false
+
+# The SSH-forwarded remote guest: prompt before use, any key, any named peer.
+# Only this named listener is affected; the unnamed callback listener is not.
+[[rule]]
+key = "*"
+match.listeners = ["remote-guest"]
+match.machine = ["*"]
 auth = "ask"
+data_signing = "deny"
+
+# Everything else (including the unnamed VSOCK callback listener) is denied.
+[[rule]]
+key = "*"
+auth = "deny"
 data_signing = "deny"
