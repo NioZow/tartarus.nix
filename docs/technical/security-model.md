@@ -75,7 +75,8 @@ CA-authenticated channel.
 - **Container isolation.** A native container can be given its own user
   namespace (`privateUsers`): `"identity"` gives capability isolation, and
   `"pick"`/an int gives real UID isolation (with `idmap` on Tartarus's own bind
-  mounts).
+  mounts, except shares that opt out because their source filesystem — such as
+  agenix's ramfs `/run/agenix` — cannot be ID-mapped).
 - **The enabled-guest guard.** The CLI refuses to act on a guest that is not
   enabled, because a disabled guest has no firewall rules, CA certificate or
   proxy entry — i.e. no host-side enforcement in place.
@@ -97,7 +98,9 @@ CA-authenticated channel.
 - The consumer's `systemConfig`/`userConfig` does not weaken the host
   (Tartarus provides the boundary; content is the consumer's responsibility).
 - For `privateUsers = "pick"`, the bind-mount source filesystems support
-  ID-mapped mounts.
+  ID-mapped mounts, or the share sets `idmap = false` (the files then appear
+  owned by `nobody`/`nogroup` inside the container, so they must be readable
+  through their mode bits — e.g. the `0444` agenix secrets).
 
 ## Residual risks (accepted)
 

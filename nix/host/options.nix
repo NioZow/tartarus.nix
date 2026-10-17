@@ -114,10 +114,11 @@ in {
       number is the real UID isolation but requires the kernel and the
       bind-mount source filesystems to support ID-mapped mounts: tartarus
       attaches the `idmap` mount option to its CA/shares bind mounts so their
-      host ownership stays visible inside the guest. On source filesystems
-      without ID-mapped-mount support those binds fall back to
-      `nobody`/`nogroup` and the guest will not start cleanly. A guest opts out
-      (or picks a different range) with `tartarus.guests.<name>.privateUsers`.
+      host ownership stays visible inside the guest. A share whose source
+      filesystem cannot be ID-mapped (notably agenix's ramfs `/run/agenix`)
+      must set `idmap = false`; otherwise nspawn fails to start the container
+      with `Failed to clone ...: Invalid argument`. A guest opts out (or picks
+      a different range) with `tartarus.guests.<name>.privateUsers`.
     '';
   };
 
@@ -250,6 +251,12 @@ in {
             `docs/technical/shares.md`). Because that copy is world-readable, set
             `snapshot = false` on a read-only share that contains secrets;
             sources under `/nix/store` and `/run` are never copied.
+
+            When the guest is a `privateUsers` container, its share binds are
+            id-mapped so host ownership stays visible. Set `idmap = false` for
+            a source filesystem that does not support ID-mapped mounts (e.g.
+            agenix's ramfs `/run/agenix`), which would otherwise make nspawn
+            fail with `Failed to clone ...: Invalid argument`.
           '';
         };
 

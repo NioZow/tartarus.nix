@@ -161,7 +161,9 @@
   # read-only share is additionally re-sourced from a read-only Nix store
   # snapshot there. `snapshot` is tartarus-internal and stripped before the
   # shares reach `microvm.shares`.
-  shares = map (s: builtins.removeAttrs s ["snapshot"]) (
+  # `idmap` is a container-bind concern only (see ../lib/binds.nix); strip it so
+  # microvm.nix's share submodule never sees an unknown field.
+  shares = map (s: builtins.removeAttrs s ["snapshot" "idmap"]) (
     map (
       s:
         if sharePolicy.needsStoreSnapshot p s

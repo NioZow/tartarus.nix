@@ -374,10 +374,12 @@ in {
               then {
                 hostPath = innerSnapshot s;
                 isReadOnly = true;
+                idmap = s.idmap or true;
               }
               else {
                 hostPath = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
                 isReadOnly = s.readOnly or false;
+                idmap = s.idmap or true;
               }
             ))
           (inner.cfg.shares or []))

@@ -103,6 +103,10 @@
       nameValuePair s.mountPoint {
         hostPath = s.source;
         isReadOnly = s.readOnly or false;
+        # Sources on filesystems without ID-mapped-mount support (notably
+        # agenix's ramfs `/run/agenix`) must opt out: nspawn rejects `:idmap`
+        # with EINVAL and the container fails to start.
+        idmap = s.idmap or true;
       })
     (g.shares or []));
 in {

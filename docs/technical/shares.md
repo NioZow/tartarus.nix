@@ -77,3 +77,27 @@ For anything else that must stay off the store, opt out per share:
 
 `snapshot` is a tartarus-only field; it is stripped before the shares are handed
 to `microvm.shares`.
+
+## ID-mapped container binds
+
+A `privateUsers` container gets its share (and CA) binds as id-mapped nspawn
+mounts, so host ownership stays visible inside the container. The source
+filesystem must support ID-mapped mounts. Agenix's `/run/agenix` is a *ramfs*
+and does not, so a secret share must opt out:
+
+```nix
+{
+  tag = "secrets";
+  source = "/run/agenix/tartarus-litellm";
+  mountPoint = "/etc/tartarus-secrets";
+  readOnly = true;
+  idmap = false;
+}
+```
+
+Without it nspawn fails with `Failed to clone ...: Invalid argument`. With
+`idmap = false` the files appear owned by `nobody`/`nogroup` in the container;
+that is fine when they are world-readable (agenix secrets are `0444`).
+
+`idmap` is a tartarus-only field, like `snapshot`; it is stripped before the
+shares reach `microvm.shares`.

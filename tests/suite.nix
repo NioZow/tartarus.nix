@@ -1074,6 +1074,27 @@
     };
   };
 
+  # A share source whose filesystem cannot be ID-mapped (agenix's ramfs
+  # `/run/agenix`) opts out so nspawn does not reject the bind with EINVAL.
+  hostCtnPrivateShare = mkHost {
+    guests.secrets = {
+      enable = true;
+      kind = "container";
+      id = 5;
+      internet = true;
+      privateUsers = "pick";
+      shares = [
+        {
+          tag = "secrets";
+          source = "/run/agenix/example";
+          mountPoint = "/etc/example-secrets";
+          readOnly = true;
+          idmap = false;
+        }
+      ];
+    };
+  };
+
   # Feature 3: a host-wide `tartarus.containers.privateUsers` default applies to
   # every container (native and nested) unless the guest overrides it. `box` is
   # a VM and must be left untouched by the default.
@@ -2549,6 +2570,21 @@ in {
         in
           lib.any (f: f == expected) flags))
       "privateUsers did not re-express the CA binds as id-mapped extraFlags";
+
+    # A share can opt out of id-mapping when its source filesystem cannot
+    # support it (agenix's ramfs): the bind stays plain while all other binds
+    # remain id-mapped.
+    "host-containers/private-users-share-idmap-optout" =
+      T
+      (let
+        flags = hostCtnPrivateShare.config.containers.secrets.extraFlags;
+        plain = "--bind-ro=/run/agenix/example:/etc/example-secrets";
+        idmapped = "${plain}:idmap";
+      in
+        lib.elem plain flags
+        && !(lib.elem idmapped flags)
+        && lib.any (f: hasInfix ":/etc/tartarus/ssh:idmap" f) flags)
+      "a share with `idmap = false` was still emitted as an id-mapped bind";
 
     # A host-wide `tartarus.containers.privateUsers` default applies to every
     # container, is overridable per guest, and leaves VMs alone.
