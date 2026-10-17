@@ -1490,7 +1490,7 @@ def notify(title: str, message: str, critical: bool = False) -> None:
         interface.Notify(
             "ssh-agent-proxy",
             0,
-            "dialog-information" if not critical else "dialog-warning",
+            "pgp-keys",
             title,
             message,
             [],
