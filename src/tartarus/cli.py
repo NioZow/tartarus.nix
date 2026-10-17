@@ -5,12 +5,12 @@ from __future__ import annotations
 import argparse
 from typing import Sequence
 
-from . import ctn, listing, vm
+from . import ca, ctn, listing, vm
 from .config import Config, load_config
 from .ctn import CTN_CONF_DIR
 from .errors import TartarusError
 from .nix import flake
-from .output import die
+from .output import die, ok
 
 
 def _non_negative_int(value: str) -> int:
@@ -188,6 +188,14 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument("name", help="instance name, with or without a trailing '.trs' (ssh's %%h)")
 
+    p = sub.add_parser("ca", help="manage the shared guest CA material")
+    ca_sub = p.add_subparsers(dest="ca_command", required=True)
+    q = ca_sub.add_parser(
+        "ensure",
+        help="create/refresh a guest's CA-signed SSH host key and X509 client cert without starting it",
+    )
+    q.add_argument("name", help="guest name (template or instance)")
+
 
 def build_parser(config) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -301,6 +309,25 @@ def main(argv: Sequence[str] | None = None) -> None:
             return
 
         resolve_kind(config, args)
+
+        # `ca ensure` only materialises the guest's CA files; it needs neither
+        # the flake nor a running guest, so it is handled before the
+        # build/lifecycle routing. NixOS calls it from `container@<name>`'s
+        # preStart so the CA bind mounts exist before nspawn resolves them.
+        if args.command == "ca":
+            kind = "container" if args.container else "vm"
+            guest = config.require_guest(args.name, kind)
+            if guest.host is not None:
+                raise TartarusError(
+                    f"'{guest.name}' runs inside container-host VM '{guest.host}'; "
+                    "its CA material is provisioned by that VM, not this host"
+                )
+            if kind == "container":
+                ca.ensure_ctn_certs(config, guest.name)
+            else:
+                ca.ensure_vm_certs(config, guest.name)
+            ok(f"CA material for '{guest.name}' is ready.")
+            return
 
         if args.container and args.command in ("cid", "proxy", "proxy-ip"):
             raise TartarusError(
