@@ -21,7 +21,12 @@ Users adding Tartarus to a NixOS or nix-darwin host for the first time.
 Platform-specific:
 
 - **Linux** — QEMU/KVM for VMs (your user must be able to use `/dev/kvm`) and
-  `systemd-nspawn` for containers, both provided by the host module.
+  `systemd-nspawn` for containers, both provided by the host module. When an
+  enabled VM uses a vsock-backed host service (`sudo-auth-proxy`,
+  `ssh-agent-proxy`, `clipboard-bridge`), the host module loads `vhost_vsock`
+  at boot. Using those services standalone (without the host module) requires
+  loading it yourself: `boot.kernelModules = [ "vhost_vsock" ];` on NixOS, or
+  `modprobe vhost_vsock` (see the Debian notes below).
 - **macOS** — vfkit for VMs and `nix.linux-builder` to build the Linux guest
   closures. Tartarus enables the Linux builder by default on Darwin.
 
@@ -151,6 +156,21 @@ packages and as self-contained NixOS **and** home-manager modules. They need
 only their own `tartarus.<service>.*` options and can be used with no guest, no
 VM and no host module at all. See their deep-dive docs and the ready-to-edit
 files in [`examples/`](../../examples).
+
+### Debian (and other non-NixOS hosts)
+
+A `vsock` listener binds the host CID 2 and needs the `vhost_vsock` kernel
+module; without it the service exits with `Errno 99` (`EADDRNOTAVAIL`) until a
+VM happens to load the module. Load it now and persist it across reboots:
+
+```sh
+sudo modprobe vhost_vsock
+printf 'vhost_vsock\n' | sudo tee /etc/modules-load.d/vhost_vsock.conf
+```
+
+`modinfo vhost_vsock` must find the module for the running kernel; if it does
+not, install the matching kernel package for that kernel. Then restart the
+service, for example `systemctl --user restart ssh-agent-proxy`.
 
 Next: [run your first guest](./getting-started.md), or read the full
 [configuration reference](./configuration.md).

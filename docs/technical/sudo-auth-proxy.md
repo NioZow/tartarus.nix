@@ -2248,9 +2248,13 @@ peer_required_oid = "1.3.6.1.4.1.99999.1.2"
    the same file.
 3. Make sure VSOCK is available: the host kernel needs `vhost_vsock` (or
    `vmw_vsock_virtio_transport` under VMware), and the VM must be started with a
-   vsock device and a CID. `modprobe vhost_vsock` and `lsmod | grep vsock`
-   confirm it. A guest that cannot reach CID 2 gets a fast `unavailable` and the
-   PAM stack continues — that is the intended fail-fast behaviour, not a hang.
+   vsock device and a CID. The tartarus NixOS host module loads `vhost_vsock`
+   automatically when an enabled VM requests a vsock host service; on a
+   standalone (non-tartarus) host, `modprobe vhost_vsock` remains the manual
+   path, and `lsmod | grep vsock` confirms it. On Debian, persist it with
+   `printf 'vhost_vsock\n' | sudo tee /etc/modules-load.d/vhost_vsock.conf`.
+   A guest that cannot reach CID 2 gets a fast `unavailable` and the PAM stack
+   continues — that is the intended fail-fast behaviour, not a hang.
 4. Make sure a dialog backend exists and can reach the desktop:
    `zenity` (Linux) or `osascript`/`swiftDialog` (macOS), with `DISPLAY` or
    `WAYLAND_DISPLAY` set in the unit's environment (§11.4).

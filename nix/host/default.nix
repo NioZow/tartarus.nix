@@ -34,6 +34,22 @@
   isLinux = !isDarwin;
   guests = config.tartarus.instances.guests;
 
+  # Host-side `vsock` listeners bind AF_VSOCK CID 2 (VMADDR_CID_HOST), which
+  # only works once `vhost_vsock` is loaded. Until QEMU loads it at VM start,
+  # that bind fails with EADDRNOTAVAIL (errno 99), so load it up front when any
+  # enabled Linux VM actually asks for a host service over vsock.
+  needsHostVsock = any (
+    g:
+      g.enable
+      && g.kind == "vm"
+      && !(g.services.disableVsock or false)
+      && (
+        ((g.services.sudoAuthProxy or false) && ((g.services.sudoAuthProxyTransport or "vsock") != "unix"))
+        || ((g.services.sshAgentProxy or false) && ((g.services.sshAgentProxyTransport or "vsock") != "unix"))
+        || (g.services.clipboardBridge or false)
+      )
+  ) (attrValues guests);
+
   # The tartarus CLI, taken from this flake's own package outputs (built with
   # tartarus's own nixpkgs) so the host module never has to evaluate the
   # consumer's `pkgs` mid-config.
@@ -247,5 +263,10 @@ in {
     description = "Internal: the tartarus-owned assertions, for the test suite.";
   };
 
-  config.assertions = tartarusAssertions;
+  config = lib.mkMerge [
+    {assertions = tartarusAssertions;}
+    (lib.mkIf (isLinux && needsHostVsock) {
+      boot.kernelModules = ["vhost_vsock"];
+    })
+  ];
 }

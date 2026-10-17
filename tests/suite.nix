@@ -2907,6 +2907,17 @@ in {
       T
       (hostServerKinds hostStandInTcpOnly "sudo-auth-proxy" == ["tcp"])
       "the container-host stand-in did not yield exactly one tcp listener";
+    # A vsock host service listener needs `vhost_vsock` loaded on the Linux
+    # host; a stand-in whose real requester is a nested container uses tcp and
+    # must not pull the module in.
+    "hostSshMixedTransports-loads-vhost-vsock" =
+      T
+      (lib.elem "vhost_vsock" hostSshMixedTransports.config.boot.kernelModules)
+      "the host did not load vhost_vsock for a vsock ssh-agent listener";
+    "hostNestedService-omits-vhost-vsock" =
+      T
+      (!(lib.elem "vhost_vsock" hostNestedService.config.boot.kernelModules))
+      "the host loaded vhost_vsock for a tcp-only container-host stand-in";
 
     # ---- Darwin guest firewall: host-service allowances ----------------
     # A proxy-only guest that opts into an in-guest firewall must still reach

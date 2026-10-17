@@ -630,6 +630,14 @@ listener for compatibility. The deprecated
 listener plus one remote `[[upstream]]`), but the guest side is now just a
 `[[upstream]]` on an ordinary server.
 
+Binding a `vsock` listener on the host requires the `vhost_vsock` module. Without
+it, the bind to host CID 2 fails with `EADDRNOTAVAIL` (errno 99) until a VM
+starts and loads it. The tartarus NixOS host module loads `vhost_vsock`
+automatically when an enabled VM requests a vsock host service. On a standalone
+NixOS host, load it at boot with `boot.kernelModules = [ "vhost_vsock" ];`. On a
+Debian host, load it now with `sudo modprobe vhost_vsock` and persist it with
+`printf 'vhost_vsock\n' | sudo tee /etc/modules-load.d/vhost_vsock.conf`.
+
 See `examples/ssh-agent-proxy-server.toml`.
 
 ---
