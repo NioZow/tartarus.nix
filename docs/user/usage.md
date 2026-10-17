@@ -59,6 +59,14 @@ tartarus ssh vault -s         # ... starting it first if needed
 tartarus logs vault           # console log (VM) / journal (container)
 ```
 
+A guest that has just started may not have sshd listening yet (`socat ...
+Connection reset by peer`). `ssh` therefore retries connection failures (ssh
+exit status 255) 5 times, 2 seconds apart. Tune it per invocation with
+`--retry N` / `--retry-delay SECONDS`, or persistently with
+`tartarus.ssh.retries` / `tartarus.ssh.retryDelay` (rendered to `[ssh]` in
+`config.toml`). Retries do not apply to authentication failures or to a remote
+command's exit status.
+
 For a MicroVM, the SSH helpers resolve the transport:
 
 ```bash

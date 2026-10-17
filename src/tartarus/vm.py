@@ -616,13 +616,19 @@ def action_logs(config: Config, name: str) -> None:
     ssh.exec_logs(config, name)
 
 
-def action_ssh(config: Config, name: str, start: bool = False) -> None:
+def action_ssh(
+    config: Config,
+    name: str,
+    start: bool = False,
+    retries: int | None = None,
+    retry_delay: float | None = None,
+) -> None:
     base = flake.base_name(config, "vm", name)
     flake.require_template(config, "vm", base)
     if start and not ssh.is_running(config, name):
         action_start(config, name, mounts=[])
     ca.ensure_vm_certs(config, base)
-    ssh.exec_ssh(config, name)
+    ssh.exec_ssh(config, name, retries=retries, retry_delay=retry_delay)
 
 
 def dispatch(config: Config, args) -> None:
@@ -644,7 +650,7 @@ def dispatch(config: Config, args) -> None:
     elif args.command == "logs":
         action_logs(config, args.name)
     elif args.command == "ssh":
-        action_ssh(config, args.name, args.start)
+        action_ssh(config, args.name, args.start, args.retry, args.retry_delay)
     elif args.command == "cid":
         ssh.action_cid(config, args.name)
     elif args.command == "proxy":

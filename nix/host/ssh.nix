@@ -55,6 +55,27 @@ in {
       default = "${homeDir}/.ssh/known_hosts_trs";
       description = "The per-user known_hosts file carrying the tartarus CA `@cert-authority` line (written by the `tartarus-ca-known-hosts` service).";
     };
+
+    retries = mkOption {
+      type = types.ints.unsigned;
+      default = 5;
+      description = ''
+        How many times `tartarus ssh` retries after a failed connection
+        (ssh exit status 255), e.g. while a freshly started guest is still
+        bringing up sshd. Written to `[ssh].retries` in config.toml and
+        overridable with `tartarus ssh --retry N`.
+      '';
+    };
+
+    retryDelay = mkOption {
+      type = types.numbers.nonnegative;
+      default = 2.0;
+      description = ''
+        Fixed number of seconds between `tartarus ssh` connection retries.
+        Written to `[ssh].retry_delay` in config.toml and overridable with
+        `tartarus ssh --retry-delay SECONDS`.
+      '';
+    };
   };
 
   config = mkIf (cfg.enable && ca.enable && isLinux && caPubExists) {

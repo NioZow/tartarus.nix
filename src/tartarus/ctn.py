@@ -516,8 +516,15 @@ def action_logs(config: Config, name: str) -> NoReturn:
     os.execvp("journalctl", ["journalctl", "-u", f"container@{name}", "-f"])
 
 
-def _ssh_nested(config: Config, base: str, host: str, start: bool) -> NoReturn:
-    """Exec ``ssh`` into a nested container through its container-host VM.
+def _ssh_nested(
+    config: Config,
+    base: str,
+    host: str,
+    start: bool,
+    retries: int | None = None,
+    retry_delay: float | None = None,
+) -> NoReturn:
+    """Run ``ssh`` into a nested container through its container-host VM.
 
     The container has no host-reachable address of its own, so the connection
     is jumped through the VM's sshd:
@@ -550,8 +557,9 @@ def _ssh_nested(config: Config, base: str, host: str, start: bool) -> NoReturn:
             f"tartarus start {host} (or pass --start)"
         )
     ca.ensure_ctn_certs(config, base)
-    os.execvp(
-        "ssh",
+    retries = config.ssh_retries if retries is None else retries
+    retry_delay = config.ssh_retry_delay if retry_delay is None else retry_delay
+    ssh.run_ssh(
         [
             "ssh",
             "-o",
@@ -576,25 +584,36 @@ def _ssh_nested(config: Config, base: str, host: str, start: bool) -> NoReturn:
             "user",
             base,
         ],
+        retries=retries,
+        retry_delay=retry_delay,
     )
 
 
-def action_ssh(config: Config, name: str, start: bool = False) -> NoReturn:
+def action_ssh(
+    config: Config,
+    name: str,
+    start: bool = False,
+    retries: int | None = None,
+    retry_delay: float | None = None,
+) -> NoReturn:
     base = base_name(config, name)
     require_template(config, base)
     guest = config.guest(base, "container")
     if guest is not None and guest.host is not None:
-        _ssh_nested(config, base, guest.host, start)
+        _ssh_nested(config, base, guest.host, start, retries, retry_delay)
     if start and not is_running(name):
         action_start(config, name)
     if not is_running(name):
         die(f"'{name}' is not running. Start it first: tartarus --container start {name}")
 
+    retries = config.ssh_retries if retries is None else retries
+    retry_delay = config.ssh_retry_delay if retry_delay is None else retry_delay
+
     if name == base:
         # Canonical instance: the host's ssh config already routes `ssh <name>`
         # using the CA-trusted host key baked in at rebuild time.
         ca.ensure_ctn_certs(config, base)
-        os.execvp("ssh", ["ssh", name])
+        ssh.run_ssh(["ssh", name], retries=retries, retry_delay=retry_delay)
 
     # Numbered/custom instance: no static ssh_config entry and no CA-signed
     # cert -- connect by IP and trust its freshly-generated host key on first
@@ -603,8 +622,7 @@ def action_ssh(config: Config, name: str, start: bool = False) -> NoReturn:
     if addr is None:
         die(f"no recorded address for '{name}' in {CTN_CONF_DIR}/{name}.conf")
     known_hosts = str(config.ssh_dir / "known_hosts_containers_adhoc")
-    os.execvp(
-        "ssh",
+    ssh.run_ssh(
         [
             "ssh",
             "-o",
@@ -625,6 +643,8 @@ def action_ssh(config: Config, name: str, start: bool = False) -> NoReturn:
             "user",
             addr,
         ],
+        retries=retries,
+        retry_delay=retry_delay,
     )
 
 
@@ -677,6 +697,6 @@ def dispatch(config: Config, args) -> None:
     elif args.command == "logs":
         action_logs(config, args.name)
     elif args.command == "ssh":
-        action_ssh(config, args.name, args.start)
+        action_ssh(config, args.name, args.start, args.retry, args.retry_delay)
     elif args.command == "ip":
         action_ip(config, args.name)

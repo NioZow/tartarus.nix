@@ -20,11 +20,16 @@ from pathlib import Path
 from typing import NoReturn
 
 from . import system
-from .config import Config
+from .config import DEFAULT_SSH_RETRIES, DEFAULT_SSH_RETRY_DELAY, Config
 from .errors import TartarusError
 from .nix import flake
 from .output import die, info, note
 from .process import run_quiet
+
+# ssh's conventional exit status for a transport/connection failure (also
+# what a failing ProxyCommand such as socat/nc surfaces). A guest that is
+# still booting resets the VSOCK/TCP connection and exits with this code.
+SSH_CONNECTION_ERROR = 255
 
 KNOWN_HOSTS_TRS_NAME = "known_hosts_trs"
 USER_SSH_KEY_NAME = "tartarus"
@@ -326,8 +331,43 @@ def action_proxy_ip(config: Config, name: str) -> NoReturn:
     os.execvp("nc", ["nc", ip, "22"])
 
 
-def exec_ssh(config: Config, name: str) -> NoReturn:
-    """Exec ``ssh`` into a running VM instance.
+def run_ssh(
+    argv: list[str],
+    *,
+    retries: int = DEFAULT_SSH_RETRIES,
+    retry_delay: float = DEFAULT_SSH_RETRY_DELAY,
+) -> NoReturn:
+    """Run an ``ssh`` command, retrying transient connection failures.
+
+    ``retries`` counts retries *after* the first attempt. Only ssh's connection
+    error status (255) is retried: a guest that is still booting refuses or
+    resets the VSOCK/TCP connection, while auth failures, a normal logout and a
+    remote command's exit status are all returned immediately.
+
+    The command runs in this process (no ``exec``) so a retry is possible;
+    stdio stays inherited, preserving interactive sessions and remote commands.
+    """
+    attempt = 0
+    while True:
+        result = subprocess.run(argv)
+        if result.returncode != SSH_CONNECTION_ERROR or attempt >= retries:
+            raise SystemExit(result.returncode)
+        attempt += 1
+        note(
+            f"ssh connection failed (exit {result.returncode}); "
+            f"retrying in {retry_delay:g}s ({attempt}/{retries})..."
+        )
+        time.sleep(retry_delay)
+
+
+def exec_ssh(
+    config: Config,
+    name: str,
+    *,
+    retries: int | None = None,
+    retry_delay: float | None = None,
+) -> NoReturn:
+    """Run ``ssh`` into a running VM instance (with bounded retries).
 
     Canonical instances use the host's static ssh config entry; numbered
     instances route over VSOCK by hand with ``HostKeyAlias`` pinned to the
@@ -338,14 +378,16 @@ def exec_ssh(config: Config, name: str) -> NoReturn:
     if not is_running(config, name):
         die(f"'{name}' is not running. Start it first: tartarus start {name}")
 
+    retries = config.ssh_retries if retries is None else retries
+    retry_delay = config.ssh_retry_delay if retry_delay is None else retry_delay
+
     if name == base:
-        os.execvp("ssh", ["ssh", name])
+        run_ssh(["ssh", name], retries=retries, retry_delay=retry_delay)
 
     cid = resolve_cid(config, name)
     known_hosts = config.ssh_dir / "known_hosts"
     static_hosts = config.ssh_dir / "known_hosts_static"
-    os.execvp(
-        "ssh",
+    run_ssh(
         [
             "ssh",
             "-o",
@@ -368,6 +410,8 @@ def exec_ssh(config: Config, name: str) -> NoReturn:
             "user",
             name,
         ],
+        retries=retries,
+        retry_delay=retry_delay,
     )
 
 

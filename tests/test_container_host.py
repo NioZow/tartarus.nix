@@ -54,7 +54,7 @@ BOX = Guest(name="box", kind="container", id=7)
 
 
 class _Exec(Exception):
-    """Raised by the fake ``os.execvp`` so the real one never runs."""
+    """Raised by the fake ``run_ssh`` so the real runner never runs."""
 
 
 # --- config.toml parsing --------------------------------------------------
@@ -507,18 +507,18 @@ def test_nested_ssh_builds_proxyjump_argv(monkeypatch, tmp_path):
     config = _nested_ssh_config(monkeypatch, tmp_path)
     calls: list[tuple] = []
 
-    def _execvp(prog, argv):
-        calls.append((prog, argv))
+    def _run_ssh(argv, **_kwargs):
+        calls.append(argv)
         raise _Exec
 
-    monkeypatch.setattr(ctn.os, "execvp", _execvp)
+    monkeypatch.setattr(ctn.ssh, "run_ssh", _run_ssh)
 
     with pytest.raises(_Exec):
         ctn.action_ssh(config, "inner")
 
     assert len(calls) == 1
-    prog, argv = calls[0]
-    assert prog == "ssh"
+    argv = calls[0]
+    assert argv[0] == "ssh"
     assert "ProxyJump=ch.trs" in argv
     assert "HostKeyAlias=inner.trs" in argv
     assert "HostName=inner" in argv
@@ -530,7 +530,7 @@ def test_nested_ssh_start_starts_container(monkeypatch, tmp_path):
     monkeypatch.setattr(ctn, "nested_state", lambda *_a, **_k: "stopped")
     started: list[str] = []
     monkeypatch.setattr(ctn, "action_start", lambda _c, name, upgrade=False: started.append(name))
-    monkeypatch.setattr(ctn.os, "execvp", lambda *_a: (_ for _ in ()).throw(_Exec))
+    monkeypatch.setattr(ctn.ssh, "run_ssh", lambda *_a, **_k: (_ for _ in ()).throw(_Exec))
 
     with pytest.raises(_Exec):
         ctn.action_ssh(config, "inner", start=True)
@@ -544,7 +544,7 @@ def test_nested_ssh_start_skips_when_container_running(monkeypatch, tmp_path):
     config = _nested_ssh_config(monkeypatch, tmp_path)
     monkeypatch.setattr(ctn, "nested_state", lambda *_a, **_k: "running")
     monkeypatch.setattr(ctn, "action_start", lambda *_a, **_k: pytest.fail("start ran for a running container"))
-    monkeypatch.setattr(ctn.os, "execvp", lambda *_a: (_ for _ in ()).throw(_Exec))
+    monkeypatch.setattr(ctn.ssh, "run_ssh", lambda *_a, **_k: (_ for _ in ()).throw(_Exec))
 
     with pytest.raises(_Exec):
         ctn.action_ssh(config, "inner", start=True)

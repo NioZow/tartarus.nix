@@ -3148,6 +3148,9 @@ in {
     # Schema marker, the VM's `container_host` flag, and the nested
     # container's `host` pointer must all reach config.toml.
     "config/schema-v2" = inStr "schema = 2" containerHostToml;
+    # SSH retry knobs are rendered as their own table.
+    "config/ssh-retries" = inStr "retries = 5" configToml;
+    "config/ssh-retry-delay" = inStr "retry_delay = 2.0" configToml;
     "config/container-host-flag" = inStr "container_host = true" containerHostToml;
     "config/nested-host-pointer" = inStr ''host = "ch"'' containerHostToml;
     # Every VM carries the flag (true or false); native containers do not.

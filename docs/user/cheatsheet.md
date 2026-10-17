@@ -37,6 +37,9 @@ Rebuild with `--impure`; then `tartarus list`.
 tartarus.proxy.enable = true;           # global proxy transport
 tartarus.proxy.location = "host";       # or a guest name
 
+tartarus.ssh.retries = 5;               # ssh connection retries
+tartarus.ssh.retryDelay = 2.0;          # seconds between retries
+
 tartarus.guests.vault = {
   enable = true;                        # makes the guest exist at all
   kind = "vm";                          # or "container"
@@ -71,7 +74,7 @@ tartarus spawn <template> [--name N]
 tartarus stop <name> [--purge]
 tartarus restart <name> [-u]
 tartarus logs <name>
-tartarus ssh <name> [-s]
+tartarus ssh <name> [-s] [-r N] [--retry-delay SECONDS]
 tartarus cid <name>          # MicroVM only
 tartarus ip <name>
 tartarus proxy <name>        # MicroVM only (ProxyCommand)

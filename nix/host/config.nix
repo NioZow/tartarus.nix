@@ -85,6 +85,15 @@
     then "true"
     else "false";
   tInt = i: toString i;
+  # TOML floats must carry a decimal point; Nix renders 2.0 as "2.000000",
+  # so collapse trailing zeros to keep config.toml readable.
+  tFloat = f: let
+    rendered = toString f;
+    whole = builtins.match "([0-9]+)\\.0+" rendered;
+  in
+    if whole != null
+    then "${builtins.head whole}.0"
+    else rendered;
   tArr = xs: "[${concatMapStringsSep ", " tStr xs}]";
   tInline = attrs: "{ ${concatStringsSep ", " (mapAttrsToList (k: v: "${k} = ${v}") attrs)} }";
 
@@ -128,6 +137,10 @@
     x509_ca_dir = ${tStr x509Root}
     log = ${tBool cfg.log}
     schema = 2
+
+    [ssh]
+    retries = ${tInt config.tartarus.ssh.retries}
+    retry_delay = ${tFloat config.tartarus.ssh.retryDelay}
 
     [proxy]
     enable = ${tBool config.tartarus.proxy.enable}

@@ -46,6 +46,35 @@ def test_ssh_parser_accepts_start(monkeypatch, flag: list[str]):
 
     cli.main(["ssh", "vault", *flag])
     assert seen[0].start is bool(flag)
+    assert seen[0].retry is None
+    assert seen[0].retry_delay is None
+
+
+def test_ssh_parser_accepts_retry_flags(monkeypatch):
+    config = make_config(VAULT)
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: config)
+
+    seen: list = []
+    monkeypatch.setattr(cli.vm, "dispatch", lambda _c, a: seen.append(a))
+    monkeypatch.setattr(cli.ctn, "dispatch", lambda _c, a: seen.append(a))
+    monkeypatch.setattr(cli.flake, "require_flake", lambda _config: None)
+
+    cli.main(["ssh", "vault", "--retry", "3", "--retry-delay", "0.5"])
+    assert seen[0].retry == 3
+    assert seen[0].retry_delay == 0.5
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [["--retry", "-1"], ["--retry-delay", "-0.5"], ["--retry", "many"]],
+)
+def test_ssh_parser_rejects_invalid_retry_flags(monkeypatch, flag: list[str]):
+    config = make_config(VAULT)
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: config)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["ssh", "vault", *flag])
+    assert exc.value.code == 2
 
 
 # --- VM action_ssh --------------------------------------------------------
@@ -56,7 +85,7 @@ def _vm_stubs(monkeypatch, running: bool):
     monkeypatch.setattr(vm.flake, "base_name", lambda _c, _k, name: name)
     monkeypatch.setattr(vm.flake, "require_template", lambda *_a, **_k: None)
     monkeypatch.setattr(vm.ssh, "is_running", lambda _c, _n: running)
-    monkeypatch.setattr(vm.ssh, "exec_ssh", lambda _c, n: calls.append(("ssh", n)))
+    monkeypatch.setattr(vm.ssh, "exec_ssh", lambda _c, n, **_k: calls.append(("ssh", n)))
     monkeypatch.setattr(vm.ca, "ensure_vm_certs", lambda *_a, **_k: None)
     monkeypatch.setattr(vm, "action_start", lambda _c, n, mounts: calls.append(("start", n)))
     return calls
@@ -101,12 +130,12 @@ def _ctn_stubs(monkeypatch, running: bool):
         calls.append(("start", n))
         state["running"] = True
 
-    def _exec(*_a):
+    def _exec(*_a, **_k):
         calls.append(("ssh", None))
-        raise _Exec  # real execvp never returns
+        raise _Exec  # the real runner always exits
 
     monkeypatch.setattr(ctn, "action_start", _start)
-    monkeypatch.setattr(ctn.os, "execvp", _exec)
+    monkeypatch.setattr(ctn.ssh, "run_ssh", _exec)
     return calls
 
 

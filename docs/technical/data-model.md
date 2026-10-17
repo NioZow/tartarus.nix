@@ -32,6 +32,10 @@ x509_ca_dir = "/home/user/.local/share/tartarus/x509"
 log = false
 schema = 2
 
+[ssh]
+retries = 5             # retries after the first attempt
+retry_delay = 2.0       # seconds between attempts
+
 [proxy]
 enable = true
 location = "host"

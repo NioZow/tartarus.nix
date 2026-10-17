@@ -27,6 +27,12 @@ TOML schema -- ``$XDG_CONFIG_HOME/tartarus/config.toml`` (default
     # 1 (implicit, pre-marker) or 2 (adds container_host / host).
     schema = 2
 
+    # SSH connection retries for `tartarus ssh`: retries after the first
+    # attempt, and the fixed delay between attempts (seconds).
+    [ssh]
+    retries = 5
+    retry_delay = 2.0
+
     # Proxy transport config only; filtering is per guest.
     [proxy]
     enable = true
@@ -71,6 +77,7 @@ back to the built-in defaults so ``tartarus --help`` still works.
 from __future__ import annotations
 
 import getpass
+import math
 import os
 import re
 import tomllib
@@ -84,6 +91,10 @@ from .system import detect_system
 
 # ``vault-2`` -> base template ``vault``; mirrors ``nix.flake.INSTANCE_RE``.
 _INSTANCE_RE = re.compile(r"^(.+)-(\d+)$")
+
+# Built-in `tartarus ssh` retry defaults (overridable via `[ssh]`, env or CLI).
+DEFAULT_SSH_RETRIES = 5
+DEFAULT_SSH_RETRY_DELAY = 2.0
 
 
 @dataclass(frozen=True)
@@ -153,6 +164,8 @@ class Config:
     enabled_guests: list[Guest] = field(default_factory=list)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     log: bool = False
+    ssh_retries: int = DEFAULT_SSH_RETRIES
+    ssh_retry_delay: float = DEFAULT_SSH_RETRY_DELAY
     # config.toml schema version written by the host module (`schema = N`).
     # Files predating the marker default to 1.
     schema: int = 1
@@ -261,6 +274,18 @@ def _as_int(value: Any, field_name: str) -> int:
         return int(value)
     except ValueError:
         raise TartarusError(f"{field_name}: expected an integer, got {value!r}") from None
+
+
+def _as_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise TartarusError(f"{field_name}: expected a number, got {value!r}")
+    try:
+        number = float(value)
+    except ValueError:
+        raise TartarusError(f"{field_name}: expected a number, got {value!r}") from None
+    if not math.isfinite(number):
+        raise TartarusError(f"{field_name}: expected a finite number, got {value!r}")
+    return number
 
 
 def _as_list(value: Any, field_name: str = "") -> list[str]:
@@ -453,6 +478,28 @@ def load_config(overrides: Mapping[str, Any] | None = None) -> Config:
 
     log = _as_bool(_layer(cli.get("log"), "TARTARUS_LOG", data.get("log"), False), "log")
 
+    ssh_raw = data.get("ssh") or {}
+    if not isinstance(ssh_raw, dict):
+        raise TartarusError("`ssh` must be a table ([ssh])")
+
+    ssh_retries = _as_int(
+        _layer(cli.get("ssh_retries"), "TARTARUS_SSH_RETRIES", ssh_raw.get("retries"), DEFAULT_SSH_RETRIES),
+        "ssh.retries",
+    )
+    if ssh_retries < 0:
+        raise TartarusError(f"ssh.retries: expected a non-negative integer, got {ssh_retries}")
+    ssh_retry_delay = _as_float(
+        _layer(
+            cli.get("ssh_retry_delay"),
+            "TARTARUS_SSH_RETRY_DELAY",
+            ssh_raw.get("retry_delay"),
+            DEFAULT_SSH_RETRY_DELAY,
+        ),
+        "ssh.retry_delay",
+    )
+    if ssh_retry_delay < 0:
+        raise TartarusError(f"ssh.retry_delay: expected a non-negative number, got {ssh_retry_delay}")
+
     proxy_raw = data.get("proxy") or {}
     if not isinstance(proxy_raw, dict):
         raise TartarusError("`proxy` must be a table ([proxy])")
@@ -503,6 +550,8 @@ def load_config(overrides: Mapping[str, Any] | None = None) -> Config:
         enabled_guests=_parse_guests(data.get("guests")),
         proxy=proxy,
         log=log,
+        ssh_retries=ssh_retries,
+        ssh_retry_delay=ssh_retry_delay,
         schema=schema,
         config_path=config_path if config_path.is_file() else None,
     )

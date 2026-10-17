@@ -13,6 +13,26 @@ from .nix import flake
 from .output import die
 
 
+def _non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    return number
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative number, got {value!r}")
+    return number
+
+
 def add_command_parser(sub: argparse._SubParsersAction) -> None:
     """One flat command set, shared by MicroVMs and containers.
 
@@ -130,6 +150,21 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         "--start",
         action="store_true",
         help="start the instance first if it isn't already running",
+    )
+    p.add_argument(
+        "-r",
+        "--retry",
+        type=_non_negative_int,
+        default=None,
+        metavar="N",
+        help="retry a failed connection N times (default: config `ssh.retries`, 5)",
+    )
+    p.add_argument(
+        "--retry-delay",
+        type=_non_negative_float,
+        default=None,
+        metavar="SECONDS",
+        help="seconds to wait between retries (default: config `ssh.retry_delay`, 2)",
     )
 
     p = sub.add_parser("cid", help="print a MicroVM instance's VSOCK CID (resolves by name, running or not)")

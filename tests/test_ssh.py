@@ -13,6 +13,7 @@ Run from the repository root::
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,7 +23,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from tartarus import ssh  # noqa: E402
-from tartarus.config import Config  # noqa: E402
+from tartarus.config import Config, load_config  # noqa: E402
+from tartarus.errors import TartarusError  # noqa: E402
 
 # macOS `arp -an` spellings: an unrelated entry, then the wanted guest.
 ARP_OTHER = "? (192.168.64.1) at 0:1:2:3:4:5 on bridge100 ifscope [bridge]\n"
@@ -129,3 +131,118 @@ def test_does_not_wait_when_the_guest_is_stopped(monkeypatch, capsys, tmp_path):
         ssh.resolve_running_ip(config, "litellm")
     assert exc.value.code == 1
     assert "is not running" in capsys.readouterr().err
+
+
+# --- run_ssh retries ------------------------------------------------------
+
+def _completed(argv: list[str], code: int) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(argv, code)
+
+
+def test_run_ssh_retries_connection_failures_then_succeeds(monkeypatch, capsys):
+    codes = iter([255, 255, 0])
+    monkeypatch.setattr(ssh.subprocess, "run", lambda argv: _completed(argv, next(codes)))
+    sleeps: list[float] = []
+    monkeypatch.setattr(ssh.time, "sleep", sleeps.append)
+
+    with pytest.raises(SystemExit) as exc:
+        ssh.run_ssh(["ssh", "vault"], retries=5, retry_delay=2.0)
+    assert exc.value.code == 0
+    assert sleeps == [2.0, 2.0]
+
+    err = capsys.readouterr().err
+    assert "retrying in 2s (1/5)" in err
+    assert "retrying in 2s (2/5)" in err
+
+
+def test_run_ssh_exhausts_retries_and_returns_the_last_status(monkeypatch):
+    attempts: list[list[str]] = []
+
+    def _run(argv):
+        attempts.append(argv)
+        return _completed(argv, 255)
+
+    monkeypatch.setattr(ssh.subprocess, "run", _run)
+    monkeypatch.setattr(ssh.time, "sleep", lambda _s: None)
+
+    with pytest.raises(SystemExit) as exc:
+        ssh.run_ssh(["ssh", "vault"], retries=3, retry_delay=0.5)
+    assert exc.value.code == 255
+    assert len(attempts) == 4  # first attempt + 3 retries
+
+
+@pytest.mark.parametrize("code", [0, 1, 42])
+def test_run_ssh_does_not_retry_non_connection_failures(monkeypatch, code: int):
+    attempts: list[list[str]] = []
+
+    def _run(argv):
+        attempts.append(argv)
+        return _completed(argv, code)
+
+    monkeypatch.setattr(ssh.subprocess, "run", _run)
+    monkeypatch.setattr(
+        ssh.time, "sleep", lambda _s: pytest.fail("must not sleep on a non-255 exit")
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        ssh.run_ssh(["ssh", "vault"], retries=5, retry_delay=2.0)
+    assert exc.value.code == code
+    assert len(attempts) == 1
+
+
+# --- config reload: [ssh] retry settings ----------------------------------
+
+def _retry_config(tmp_path: Path, extra: str = "[ssh]\nretries = 7\nretry_delay = 0.25\n") -> Path:
+    path = tmp_path / "config.toml"
+    path.write_text(extra)
+    return path
+
+
+def test_config_parses_ssh_retry_settings(monkeypatch, tmp_path):
+    path = _retry_config(tmp_path)
+    monkeypatch.setenv("TARTARUS_CONFIG", str(path))
+    monkeypatch.delenv("TARTARUS_SSH_RETRIES", raising=False)
+    monkeypatch.delenv("TARTARUS_SSH_RETRY_DELAY", raising=False)
+
+    config = load_config()
+    assert config.ssh_retries == 7
+    assert config.ssh_retry_delay == 0.25
+
+
+def test_config_ssh_retry_defaults(monkeypatch, tmp_path):
+    path = _retry_config(tmp_path, "")
+    monkeypatch.setenv("TARTARUS_CONFIG", str(path))
+    monkeypatch.delenv("TARTARUS_SSH_RETRIES", raising=False)
+    monkeypatch.delenv("TARTARUS_SSH_RETRY_DELAY", raising=False)
+
+    config = load_config()
+    assert config.ssh_retries == 5
+    assert config.ssh_retry_delay == 2.0
+
+
+def test_config_ssh_retry_env_wins_over_toml(monkeypatch, tmp_path):
+    path = _retry_config(tmp_path)
+    monkeypatch.setenv("TARTARUS_CONFIG", str(path))
+    monkeypatch.setenv("TARTARUS_SSH_RETRIES", "9")
+    monkeypatch.setenv("TARTARUS_SSH_RETRY_DELAY", "1.5")
+
+    config = load_config()
+    assert config.ssh_retries == 9
+    assert config.ssh_retry_delay == 1.5
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "[ssh]\nretries = -1\n",
+        "[ssh]\nretry_delay = -0.5\n",
+        "[ssh]\nretry_delay = \"soon\"\n",
+        "ssh = 3\n",
+    ],
+)
+def test_config_rejects_invalid_ssh_retry_settings(monkeypatch, tmp_path, extra: str):
+    path = _retry_config(tmp_path, extra)
+    monkeypatch.setenv("TARTARUS_CONFIG", str(path))
+
+    with pytest.raises(TartarusError):
+        load_config()

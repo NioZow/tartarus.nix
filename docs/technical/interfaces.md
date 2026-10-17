@@ -103,7 +103,7 @@ tartarus spawn <template> [--name N] [-u|--upgrade]
 tartarus stop <name> [--purge] [-d|--debug]
 tartarus restart <name> [-u|--upgrade] [-d|--debug]
 tartarus logs <name>
-tartarus ssh <name> [-s|--start]
+tartarus ssh <name> [-s|--start] [-r|--retry N] [--retry-delay SECONDS]
 tartarus cid <name>          # MicroVM only
 tartarus ip <name>
 tartarus proxy <name>        # MicroVM only (ProxyCommand)

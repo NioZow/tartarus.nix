@@ -113,6 +113,8 @@ firewall rule, no proxy entry and no autostart, and is omitted from
 | `tartarus.ca.enable` | bool | `true` | The shared per-host SSH + X.509 CA. |
 | `tartarus.ssh.enable` | bool | `true` | System-wide SSH trust for the Tartarus CA. |
 | `tartarus.ssh.knownHostsFile` | str | — | Path of the generated `known_hosts` file carrying the `@cert-authority *.trs` line. |
+| `tartarus.ssh.retries` | int | `5` | How many times `tartarus ssh` retries a failed connection (ssh exit 255). |
+| `tartarus.ssh.retryDelay` | float | `2.0` | Seconds between `tartarus ssh` connection retries. |
 
 `tartarus.ca.*` also exposes the CA paths (`ssh.caDir`, `ssh.keyPath`,
 `ssh.pubPath`, `ssh.machinesDir`, `x509.caDir`, `x509.keyPath`, `x509.crtPath`,
