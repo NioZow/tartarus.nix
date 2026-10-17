@@ -45,10 +45,16 @@
     then "microvm"
     else "containers";
 
-  # Every share keeps the platform's proto: vfkit only accepts virtiofs;
-  # Linux keeps whatever the caller declared (built-ins and ad-hoc are 9p).
-  appShares = map (s: s // {proto = p.shareProto;}) g.shares;
-  extraShares = map (s: s // {proto = p.shareProto;}) g.extraShares;
+  # The platform default is virtiofs on both Linux and Darwin. vfkit only
+  # accepts virtiofs, so Darwin forces it; on Linux a share may opt into 9p
+  # explicitly (e.g. a legacy share whose source cannot be served by
+  # virtiofsd), but nothing defaults to it.
+  normalizeProto = s:
+    if p.isDarwin
+    then "virtiofs"
+    else s.proto or p.shareProto;
+  appShares = map (s: s // {proto = normalizeProto s;}) g.shares;
+  extraShares = map (s: s // {proto = normalizeProto s;}) g.extraShares;
 
   rawShares =
     appShares
@@ -143,7 +149,7 @@
           tag = "ti${toString inner.id}-s-${s.tag}";
           source = s.source;
           mountPoint = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
-          proto = p.shareProto;
+          proto = normalizeProto s;
           readOnly = s.readOnly or false;
           snapshot = s.snapshot or true;
         })
@@ -151,7 +157,7 @@
     ) (g.innerContainers or [])
     ++ extraShares;
 
-  isWritableNinePShare = s: (s.proto or "9p") == "9p" && !(s.readOnly or false);
+  isWritableNinePShare = s: (s.proto or p.shareProto) == "9p" && !(s.readOnly or false);
 
   # 9p's default securityModel ("none") always reports files to the guest as
   # owned by 0:0. "mapped" stores guest-visible ownership as host-side xattrs
@@ -182,7 +188,7 @@
   writableShareMountPoints = map (s: s.mountPoint) (filter isWritableNinePShare shares);
 
   # A share whose mount point is nested under the guest home (e.g.
-  # ~/.config/rmpc) needs its parent to exist before the 9p mount runs;
+  # ~/.config/rmpc) needs its parent to exist before the share mount runs;
   # otherwise systemd auto-creates the parent as root and blocks the user's own
   # home-manager activation from writing under it. Pre-declared as tmpfiles.
   shareMountParents = unique (

@@ -363,9 +363,13 @@
           ${lib.getExe config.microvm.virtiofsd.package} \
             --socket-path=${lib.escapeShellArg share.socket} \
             --shared-dir=${lib.escapeShellArg share.source} \
+            --thread-pool-size ${toString config.microvm.virtiofsd.threadPoolSize} \
+            ${lib.optionalString share.posixAcl "--posix-acl --xattr"} \
             --cache=${share.cache} \
+            ${lib.optionalString (config.microvm.virtiofsd.inodeFileHandles != null) "--inode-file-handles=${config.microvm.virtiofsd.inodeFileHandles}"} \
             --sandbox none \
             ${lib.optionalString share.readOnly "--readonly"} \
+            ${lib.concatStringsSep " " config.microvm.virtiofsd.extraArgs} \
             ${lib.concatStringsSep " " share.extraArgs} \
             &
           virtiofsd_pids="''${virtiofsd_pids:-} $!"

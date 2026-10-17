@@ -2,8 +2,11 @@
 
 `tartarus.guests.<name>.shares` are host directories exported into a guest
 (`microvm.shares` under the hood). Each entry needs at least `tag`, `source` and
-`mountPoint`; `proto` (`9p`/`virtiofs`) is normalized to the platform by the
-engine.
+`mountPoint`. `proto` defaults to `virtiofs` on both platforms: macOS/vfkit
+forces it (vfkit rejects 9p), and Linux uses it too because QEMU's 9p server is
+slow and mishandles symlinks that traverse `..` (readlink returns `ELOOP`, which
+makes git/libgit2/Nix abort while statting a shared checkout). On Linux a share
+may still opt into `proto = "9p"`.
 
 ```nix
 tartarus.guests.dev.shares = [
@@ -22,8 +25,8 @@ A share with `readOnly = true` must not be writable by the guest: a guest that
 can write a host-owned config file (say `~/.config/zsh`) gets code execution on
 the host the next time the host loads it.
 
-- **Linux (QEMU/KVM)** enforces it at the hypervisor: 9p gets
-  `readonly=on`, and a `virtiofs` share gets `--readonly` on virtiofsd.
+- **Linux (QEMU/KVM)** enforces it at the hypervisor: a `virtiofs` share gets
+  `--readonly` on virtiofsd, and an explicit 9p share gets `readonly=on`.
 - **macOS (vfkit)** ignores it. vfkit's virtio-fs device has no read-only
   option, and microvm.nix does not add `ro` to the guest mount. A guest-side
   `ro` mount is not a boundary either: a guest with root can remount it.

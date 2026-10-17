@@ -186,12 +186,13 @@ in {
       if vsockAvailable
       then id
       else null;
-    # vfkit rejects non-virtiofs shares outright; Linux keeps 9p (its writable
-    # shares get the `mapped` security model in shares.nix).
-    shareProto =
-      if isDarwin
-      then "virtiofs"
-      else "9p";
+    # Default share transport. Both platforms use virtiofs: vfkit rejects 9p
+    # outright, and QEMU's 9p server is slow and does not handle symlinks whose
+    # target traverses `..` (readlink returns ELOOP, which makes libgit2/Nix
+    # abort while statting a shared checkout). virtiofsd has correct POSIX
+    # semantics. A Linux share may still opt into 9p by declaring
+    # `proto = "9p"` (see shares.nix); Darwin always forces virtiofs.
+    shareProto = "virtiofs";
     resolvedProxyHost =
       if proxyHost != null
       then proxyHost

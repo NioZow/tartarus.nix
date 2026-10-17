@@ -1925,6 +1925,34 @@
   chDarwinVm = chDarwinGuests.nixosConfigurations."vm-ch";
   chDarwinBinds = chDarwinVm.config.containers.inner.bindMounts;
 
+  # Share transport: the engine defaults every VM share to virtiofs, while an
+  # explicit Linux `proto = "9p"` opt-in is still honoured (and keeps the
+  # mapped ownership fixup for writable shares).
+  protoGuests = mkGuests {
+    hostSystem = "x86_64-linux";
+    globalProxy.enable = false;
+    guests.v = {
+      enable = true;
+      kind = "vm";
+      id = 7;
+      internet = true;
+      shares = [
+        {
+          tag = "modern";
+          source = "/host/modern";
+          mountPoint = "/home/user/modern";
+        }
+        {
+          tag = "legacy";
+          source = "/host/legacy";
+          mountPoint = "/home/user/legacy";
+          proto = "9p";
+        }
+      ];
+    };
+  };
+  protoVm = protoGuests.nixosConfigurations."vm-v";
+
   # ==== P5: resource-ceiling resolution =================================
   # A plain VM keeps the numeric defaults (768 MiB / 1 vCPU) passed straight to
   # microvm.nix -- the regression guard for the retyped `vm.mem`/`vm.vcpu`.
@@ -2231,7 +2259,8 @@ in {
         && p.gateway == "10.200.0.1"
         && p.hostGateway == "10.200.0.1"
         && p.serviceHost == "2"
-        && p.hypervisor == "qemu")
+        && p.hypervisor == "qemu"
+        && p.shareProto == "virtiofs")
       "Linux VM platform resolution changed";
     "platform/darwin-vm" =
       T
@@ -2298,6 +2327,24 @@ in {
       T
       (!sharePolicy.needsStoreSnapshot darwin (vmReadOnlyShare // {source = "/nix/store";}))
       "the Nix store was copied into itself";
+
+    "shares/proto-defaults-to-virtiofs" =
+      T
+      (let
+        byTag = tag: lib.findFirst (s: s.tag == tag) null protoVm.config.microvm.shares;
+        roStore = byTag "ro-store";
+        modern = byTag "modern";
+        legacy = byTag "legacy";
+      in
+        roStore
+        != null
+        && roStore.proto == "virtiofs"
+        && modern != null
+        && modern.proto == "virtiofs"
+        && legacy != null
+        && legacy.proto == "9p"
+        && legacy.securityModel == "mapped")
+      "share transport did not default to virtiofs / honour the Linux 9p opt-in";
 
     # ---- host assertions ------------------------------------------------
     "assertions/good-host-passes" =

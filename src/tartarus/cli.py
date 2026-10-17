@@ -44,7 +44,7 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         default=[],
         type=vm.mount_type,
         metavar="HOST_PATH:GUEST_PATH",
-        help="ad-hoc 9p share chosen at launch time (repeatable; MicroVMs only)",
+        help="ad-hoc host share chosen at launch time (repeatable; MicroVMs only)",
     )
     p.add_argument(
         "-u",
@@ -62,7 +62,7 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         default=[],
         type=vm.mount_type,
         metavar="HOST_PATH:GUEST_PATH",
-        help="ad-hoc 9p share chosen at launch time (repeatable; MicroVMs only)",
+        help="ad-hoc host share chosen at launch time (repeatable; MicroVMs only)",
     )
     p.add_argument(
         "-u",
@@ -81,7 +81,7 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
         default=[],
         type=vm.mount_type,
         metavar="HOST_PATH:GUEST_PATH",
-        help="ad-hoc 9p share chosen at launch time (repeatable; MicroVMs only)",
+        help="ad-hoc host share chosen at launch time (repeatable; MicroVMs only)",
     )
     p.add_argument(
         "-u",

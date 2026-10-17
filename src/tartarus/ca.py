@@ -411,9 +411,9 @@ def _ensure_x509_client_cert(config: Config, kind: str, name: str) -> None:
     # local user can. The matching *certificate* stays `0644` (it is public).
     client_key.chmod(0o600)
 
-    # Copy (not symlink) the CA cert into the machine directory: the directory
-    # is the guest's filesystem root over 9p, so a symlink outside it cannot
-    # resolve. The CA cert is public, so a copy needs no upkeep.
+    # Copy (not symlink) the CA cert into the machine directory: that
+    # directory is exported whole to the guest, so a symlink pointing outside
+    # it cannot resolve. The CA cert is public, so a copy needs no upkeep.
     ca_copy = guest_dir / "ca.crt"
     if ca_copy.is_symlink():
         ca_copy.unlink()

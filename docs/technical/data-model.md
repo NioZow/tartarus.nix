@@ -95,7 +95,8 @@ Bridges: `trs0` VMs, `trs1` native containers, `trs2` nested containers
 
 A share is a host directory exported into a guest, handed through to
 `microvm.shares`. Each entry needs at least `tag`, `source` and `mountPoint`;
-`proto` (`9p`/`virtiofs`) is normalized to the platform by the engine.
+`proto` (`9p`/`virtiofs`) defaults to `virtiofs`, is forced to it on macOS, and
+is otherwise taken from the share (Linux-only 9p opt-in).
 
 | Field | Meaning |
 | --- | --- |

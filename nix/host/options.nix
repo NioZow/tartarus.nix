@@ -240,9 +240,10 @@ in {
           description = ''
             Extra host<->guest directory shares, passed through to the guest
             engine (microvm.shares). Each entry needs at least `tag`, `source`
-            and `mountPoint`; `proto` is normalized to the host platform by the
-            engine, and writable Linux 9p shares automatically get the `mapped`
-            security model plus an ownership fixup.
+            and `mountPoint`. `proto` defaults to `virtiofs` on both platforms;
+            macOS/vfkit always forces it, while Linux honours an explicit
+            `proto = "9p"` (writable 9p shares then get the `mapped` security
+            model plus an ownership fixup).
 
             `readOnly = true` makes the share read-only for the guest. On Linux
             the hypervisor enforces this; on macOS/vfkit, which ignores it, the
