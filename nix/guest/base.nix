@@ -119,11 +119,18 @@ in {
         };
       };
 
-      users.groups.user = {};
+      # Pin the guest's primary GID to the invoking host user's on Linux. A
+      # rootless virtiofsd calls setegid() with the guest's primary GID on
+      # every create/mkdir/mknod; unless that GID is already one it can assume,
+      # the call fails with EPERM and every write to a virtiofs share is
+      # rejected (the mount still shows `rw`). Darwin does not use virtiofsd,
+      # and its host GID (20) collides with the guest's `lp`, so leave it alone.
+      users.groups.users.gid =
+        mkIf (!g.platform.isDarwin && g.hostGid != null) (lib.mkForce g.hostGid);
       users.users.user =
         {
           createHome = true;
-          group = "user";
+          group = "users";
           description = "${g.name} user";
           home = g.user.home;
           linger = true;

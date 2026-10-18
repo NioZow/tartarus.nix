@@ -403,9 +403,13 @@ def _build_runner(config: Config, name: str, mounts: list[str], *, upgrade: bool
 
     env = dict(os.environ)
     env["MICROVM_EXTRA_SHARES"] = build_mounts_json(mounts)
-    # Pin the guest's `user` uid to the invoking user's so virtiofs ownership
-    # matches transparently on both sides.
+    # Pin the guest's `user` uid/gid to the invoking user's so virtiofs
+    # ownership matches transparently on both sides. The GID must match too:
+    # unprivileged virtiofsd calls setegid() with the guest's primary GID on
+    # create, and setegid() fails with EPERM unless the target is a GID it can
+    # already assume.
     env["TARTARUS_HOST_UID"] = str(os.getuid())
+    env["TARTARUS_HOST_GID"] = str(os.getgid())
 
     if name != base:
         env["MICROVM_INSTANCE_SUFFIX"] = name[len(base) + 1 :]

@@ -50,6 +50,11 @@
     if hostUidRaw == ""
     then null
     else lib.toInt hostUidRaw;
+  hostGidRaw = builtins.getEnv "TARTARUS_HOST_GID";
+  hostGid =
+    if hostGidRaw == ""
+    then null
+    else lib.toInt hostGidRaw;
   # NixOS forbids isNormalUser accounts with uid < 1000 (macOS's first-user uid
   # 501 hits this); isSystemUser is the escape hatch used in base.nix.
   lowHostUid = hostUid != null && hostUid < 1000;
@@ -290,6 +295,7 @@
       platform
       hostHome
       hostUid
+      hostGid
       lowHostUid
       inHostVm
       dnsResolver
