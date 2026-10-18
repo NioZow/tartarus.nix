@@ -33,6 +33,10 @@
   isDarwin = lib.hasSuffix "-darwin" (args.system or builtins.currentSystem);
   isLinux = !isDarwin;
   guests = config.tartarus.instances.guests;
+  sharePolicy = import ../lib/shares.nix {inherit lib;};
+  # The guest engine always places the guest account at /home/user (see
+  # nix/guest/build.nix); overlay upper/work paths derive from it.
+  guestHome = "/home/user";
 
   # Host-side `vsock` listeners bind AF_VSOCK CID 2 (VMADDR_CID_HOST), which
   # only works once `vhost_vsock` is loaded. Until QEMU loads it at VM start,
@@ -78,6 +82,24 @@
       {
         assertion = guest.privateUsers == null || guest.kind == "container";
         message = "tartarus: guest '${name}' sets `privateUsers` but is not a `kind = \"container\"`; user namespacing (`systemd-nspawn --private-users`) is container-only.";
+      }
+      {
+        assertion = !(isDarwin && any (s: s.overlay or false) guest.shares);
+        message = "tartarus: guest '${name}' has an `overlay = true` share on a Darwin host; overlay shares are Linux-only. vfkit ignores `readOnly` and the macOS store snapshot is root-owned, so overlayfs cannot write through the lower there.";
+      }
+      {
+        assertion = all (s: !(s.overlay or false) || sharePolicy.safeOverlayTag s.tag) guest.shares;
+        message = "tartarus: guest '${name}' has an overlay share with an unsafe `tag` (allowed: [A-Za-z0-9._-], not \".\" or \"..\").";
+      }
+      {
+        assertion =
+          all
+          (s:
+            !(s.overlay or false)
+            || !(sharePolicy.safeOverlayTag s.tag)
+            || !(sharePolicy.overlayMountConflict guestHome s))
+          guest.shares;
+        message = "tartarus: guest '${name}' has an overlay share whose `mountPoint` is `/`, the guest home root, or a parent of its own lower/upper/work tree; overlayfs cannot reach the writable layer through such a mount.";
       }
     ])
     guests);

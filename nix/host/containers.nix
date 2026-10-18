@@ -38,6 +38,7 @@
     ;
   ids = import ../lib/ids.nix {inherit lib;};
   binds = import ../lib/binds.nix {inherit lib;};
+  sharePolicy = import ../lib/shares.nix {inherit lib;};
   nixVersion = import ../../lib/version.nix;
 
   # Raw module args: this nixpkgs resolves defaulted arguments through
@@ -99,10 +100,18 @@
         isReadOnly = false;
       };
     }
-    // listToAttrs (map (s:
-      nameValuePair s.mountPoint {
+    // listToAttrs (map (s: let
+      overlay = sharePolicy.isOverlayShare s;
+    in
+      nameValuePair (
+        if overlay
+        then sharePolicy.overlayLowerDir s
+        else s.mountPoint
+      ) {
         hostPath = s.source;
-        isReadOnly = s.readOnly or false;
+        # An overlay share's host source is only ever a lower: force the bind
+        # read-only regardless of the user's `readOnly`.
+        isReadOnly = overlay || (s.readOnly or false);
         # Sources on filesystems without ID-mapped-mount support (notably
         # agenix's ramfs `/run/agenix`) must opt out: nspawn rejects `:idmap`
         # with EINVAL and the container fails to start.

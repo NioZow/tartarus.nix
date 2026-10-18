@@ -31,6 +31,54 @@
     && !(hasSuffix ".zwc" s)
     && !(hasSuffix ".zcompdump" s);
 in rec {
+  # `overlay = true` (tartarus-only; stripped before `microvm.shares`) turns a
+  # share into a writable overlay view of the host directory: the host source is
+  # exported read-only as the overlay `lowerdir`, and every guest write lands in
+  # an upper/work pair under the guest home. The host folder is never written.
+  isOverlayShare = s: (s.overlay or false) == true;
+
+  # Overlay tags become a directory name and a systemd unit name, so keep them
+  # to a conservative, path-safe alphabet. `.`/`..` are excluded even though
+  # they match the character class.
+  safeOverlayTag = tag:
+    builtins.isString tag
+    && tag != ""
+    && tag != "."
+    && tag != ".."
+    && builtins.match "[A-Za-z0-9._-]+" tag != null;
+
+  # The read-only lower mount point inside the guest. Deliberately under /run:
+  # it is runtime material, never persisted, and it cannot collide with the
+  # writable view at the share's original `mountPoint`.
+  overlayLowerDir = s: "/run/tartarus/lower/${s.tag}";
+
+  # Where the writable layer lives. Upper/work must be on the same filesystem;
+  # keeping them under the guest home makes them persist with
+  # `vm.persistentHome` (VMs) or the container rootfs (containers) and
+  # disappear with an ephemeral VM home.
+  overlayPaths = userHome: s: let
+    base = "${userHome}/.local/state/tartarus/overlay-shares/${s.tag}";
+  in {
+    lower = overlayLowerDir s;
+    upper = "${base}/upper";
+    work = "${base}/work";
+  };
+
+  # A mount point that would hide its own lower/upper/work tree (or the home
+  # root) cannot work: overlayfs needs to reach those directories through the
+  # mount point. Checked at the host level and inside the guest.
+  overlayMountConflict = userHome: s: let
+    paths = overlayPaths userHome s;
+  in
+    s.mountPoint == "/"
+    || s.mountPoint == userHome
+    || s.mountPoint == paths.lower
+    || hasPrefix "${s.mountPoint}/" paths.lower
+    || s.mountPoint == paths.upper
+    || hasPrefix "${s.mountPoint}/" paths.upper
+    || s.mountPoint == paths.work
+    || hasPrefix "${s.mountPoint}/" paths.work;
+
   # Whether a share must be re-sourced from a read-only store snapshot. Only
   # macOS/vfkit needs it (Linux enforces `readOnly` at the hypervisor), and the
   # per-share `snapshot = false` opt-out or a never-snapshot prefix disables it.

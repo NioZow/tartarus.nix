@@ -77,6 +77,7 @@ in {
       ./base.nix
       ./network.nix
       ./home.nix
+      ./overlay-shares.nix
       (import ../host/firewall.nix {mode = "guest";})
     ]
     ++ optional g.isVm ./shares.nix

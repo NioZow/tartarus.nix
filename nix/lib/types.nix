@@ -15,6 +15,12 @@ in {
   # validates them against microvm.nix's own submodule, so tartarus only needs
   # to accept the fields the user writes (tag/source/mountPoint/readOnly/...)
   # without shadowing microvm's defaults for the rest.
+  #
+  # `overlay = true` is tartarus-only (stripped before `microvm.shares`): the
+  # source is exported read-only as `/run/tartarus/lower/<tag>` and the guest
+  # gets a writable overlay at `mountPoint` whose upper/work live under the
+  # guest home. Linux hosts only. See `nix/lib/shares.nix` and
+  # `nix/guest/overlay-shares.nix`.
   shareType = types.attrsOf types.unspecified;
 
   # A single .desktop application that runs inside the guest via the

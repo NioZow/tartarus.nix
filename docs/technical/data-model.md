@@ -109,6 +109,7 @@ is otherwise taken from the share (Linux-only 9p opt-in).
 | `mountPoint` | Guest mount path. |
 | `readOnly` | Enforced by the hypervisor on Linux; a store snapshot on macOS. |
 | `snapshot` | Tartarus-only. `false` disables the macOS store copy (use for secrets). |
+| `overlay` | Tartarus-only. `true` exports `source` read-only at `/run/tartarus/lower/<tag>` and mounts a writable overlay at `mountPoint` (upper/work under the guest home). Linux-only; `readOnly` is forced on the lower. |
 
 `readOnly = true` must not be guest-writable: a guest that can write a
 host-owned config file gets host code execution the next time the host loads it.
@@ -118,6 +119,13 @@ world-readable, secret-bearing read-only shares must set `snapshot = false`;
 sources under `/nix/store` and `/run` are never copied, and Tartarus's own
 key-bearing shares set `snapshot = false`. Full detail in
 [Shares and read-only enforcement](./shares.md).
+
+An `overlay = true` share is not passed through unchanged: the engine exports
+the source as a forced read-only lower at `/run/tartarus/lower/<tag>` and the
+guest mounts an overlayfs at `mountPoint` whose upper/work live in
+`~/.local/state/tartarus/overlay-shares/<tag>/`. The host source is never
+written. Overlay shares are rejected on Darwin. Full detail in
+[Overlay shares](./shares.md#overlay-shares).
 
 ## Service listener schemas
 

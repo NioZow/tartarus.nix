@@ -53,7 +53,24 @@
     if p.isDarwin
     then "virtiofs"
     else s.proto or p.shareProto;
-  appShares = map (s: s // {proto = normalizeProto s;}) g.shares;
+  appShareRecords = map (s: s // {proto = normalizeProto s;}) g.shares;
+  # Overlay shares are never exported at their own mount point: the host source
+  # goes to the read-only lower, and `overlay-shares.nix` mounts the writable
+  # overlay at `mountPoint` inside the guest.
+  overlayAppShares = filter sharePolicy.isOverlayShare appShareRecords;
+  normalAppShares = filter (s: !(sharePolicy.isOverlayShare s)) appShareRecords;
+  overlayLowerShares = map (s: {
+    tag = s.tag;
+    source = s.source;
+    mountPoint = sharePolicy.overlayLowerDir s;
+    proto = normalizeProto s;
+    # Forced, regardless of the user's `readOnly`: the host directory is only
+    # ever the overlay lower. Never snapshot it (not needed on Linux, and on
+    # Darwin overlay shares are rejected at evaluation).
+    readOnly = true;
+    snapshot = false;
+  }) overlayAppShares;
+  appShares = normalAppShares ++ overlayLowerShares;
   extraShares = map (s: s // {proto = normalizeProto s;}) g.extraShares;
 
   rawShares =
@@ -145,15 +162,27 @@
     # rejects virtiofs tags longer than 36 bytes.
     ++ concatMap (
       inner:
-        map (s: {
-          tag = "ti${toString inner.id}-s-${s.tag}";
-          source = s.source;
-          mountPoint = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
-          proto = normalizeProto s;
-          readOnly = s.readOnly or false;
-          snapshot = s.snapshot or true;
-        })
-        (filter (s: !(sharePolicy.needsStoreSnapshot p s)) (inner.cfg.shares or []))
+        map (s:
+          if sharePolicy.isOverlayShare s
+          then {
+            tag = "ti${toString inner.id}-s-${s.tag}";
+            source = s.source;
+            mountPoint = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
+            proto = normalizeProto s;
+            # The VM exports the host source as a read-only lower; the nested
+            # container's own overlay mount writes to its home instead.
+            readOnly = true;
+            snapshot = false;
+          }
+          else {
+            tag = "ti${toString inner.id}-s-${s.tag}";
+            source = s.source;
+            mountPoint = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
+            proto = normalizeProto s;
+            readOnly = s.readOnly or false;
+            snapshot = s.snapshot or true;
+          })
+        (filter (s: sharePolicy.isOverlayShare s || !(sharePolicy.needsStoreSnapshot p s)) (inner.cfg.shares or []))
     ) (g.innerContainers or [])
     ++ extraShares;
 
@@ -168,8 +197,9 @@
   # snapshot there. `snapshot` is tartarus-internal and stripped before the
   # shares reach `microvm.shares`.
   # `idmap` is a container-bind concern only (see ../lib/binds.nix); strip it so
-  # microvm.nix's share submodule never sees an unknown field.
-  shares = map (s: builtins.removeAttrs s ["snapshot" "idmap"]) (
+  # microvm.nix's share submodule never sees an unknown field. `overlay` is
+  # tartarus-only (the overlay mount itself lives in overlay-shares.nix).
+  shares = map (s: builtins.removeAttrs s ["snapshot" "idmap" "overlay"]) (
     map (
       s:
         if sharePolicy.needsStoreSnapshot p s
@@ -193,8 +223,11 @@
   # home-manager activation from writing under it. Pre-declared as tmpfiles.
   shareMountParents = unique (
     filter (d: d != g.user.home && hasPrefix "${g.user.home}/" d)
-    (map (s: dirOf s.mountPoint) (appShares ++ g.extraShares))
+    (map (s: dirOf s.mountPoint) (appShares ++ overlayAppShares ++ g.extraShares))
   );
+
+  # The lower shares mount under /run; their parents are root-owned.
+  overlayLowerParents = unique (map (s: dirOf (sharePolicy.overlayLowerDir s)) overlayAppShares);
 
   persistentHome = g.vm.persistentHome;
 
@@ -250,6 +283,7 @@ in {
     {
       systemd.tmpfiles.rules =
         (map (d: "d ${d} 0755 ${user} users -") shareMountParents)
+        ++ (map (d: "d ${d} 0755 root root -") overlayLowerParents)
         ++ optionals g.isVm (
           optional persistentHome.enable "z ${g.user.home} 0755 ${user} users -"
         );

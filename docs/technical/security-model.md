@@ -72,6 +72,14 @@ CA-authenticated channel.
   it at the hypervisor; macOS enforces it host-side with a read-only store
   snapshot, and key-bearing shares opt out of snapshotting. See
   [Shares](./shares.md).
+- **Overlay shares** are Linux-only: the host source is a forced read-only lower
+  and the guest writes only to its own upper/work layer, so the host folder is
+  never modified. On Darwin evaluation fails rather than falling back to a
+  writable lower (vfkit ignores `readOnly`, and overlayfs cannot use the
+  root-owned store snapshot as an upper). A native container with
+  `privateUsers = "no"` runs the overlay as (container) root, so its upper/work
+  layer is root-owned inside the container rootfs; that is the same trust
+  boundary as the container itself, not the host.
 - **Container isolation.** A native container can be given its own user
   namespace (`privateUsers`): `"identity"` gives capability isolation, and
   `"pick"`/an int gives real UID isolation (with `idmap` on Tartarus's own bind

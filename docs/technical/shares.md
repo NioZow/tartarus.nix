@@ -104,3 +104,67 @@ that is fine when they are world-readable (agenix secrets are `0444`).
 
 `idmap` is a tartarus-only field, like `snapshot`; it is stripped before the
 shares reach `microvm.shares`.
+
+## Overlay shares
+
+`overlay = true` turns a share into a **writable overlay view** of the host
+directory. The guest sees a normal writable directory at `mountPoint`; the host
+source is exported only as a read-only overlay lower, and every guest write
+lands in an upper/work pair inside the guest.
+
+```nix
+tartarus.guests.dev.shares = [
+  {
+    tag = "opencode";
+    source = "${homeDir}/.config/nixcfg/dotfiles/.config/opencode";
+    mountPoint = "/home/user/.config/opencode";
+    overlay = true;
+  }
+];
+```
+
+What the engine does:
+
+- The host source is exported as a **read-only** share at
+  `/run/tartarus/lower/<tag>` (`readOnly` is forced, whatever the share says).
+  The share is never exported at its original `mountPoint`.
+- The guest mounts an overlayfs at `mountPoint` with:
+  - `lowerdir=/run/tartarus/lower/<tag>`
+  - `upperdir=~/.local/state/tartarus/overlay-shares/<tag>/upper`
+  - `workdir=~/.local/state/tartarus/overlay-shares/<tag>/work`
+  - `userxattr` (so a tmpfs home works as the upper; harmless on ext4)
+- A per-share oneshot (`tartarus-overlay-prepare-<tag>.service`) creates the
+  upper/work directories owned by the guest user before the mount. It cannot be
+  done with tmpfiles: `systemd-tmpfiles-setup.service` runs after
+  `local-fs.target`, so the mount would race it.
+
+The writable layer persists with the guest's home: with
+`vm.persistentHome.enable` for a VM (otherwise the home is tmpfs and the layer
+is ephemeral), and with the container rootfs for containers. Deleting the
+upper/work directory resets the guest's view; the host folder is never touched.
+
+`tag` must match `[A-Za-z0-9._-]+` (and must not be `.`/`..`), and `mountPoint`
+must not be `/`, the guest home root, or a parent of its own lower/upper/work
+tree.
+
+### Linux only
+
+Overlay shares are rejected at evaluation on Darwin. vfkit ignores `readOnly`,
+and the macOS read-only enforcement works by exporting a root-owned store
+snapshot — overlayfs cannot write through a `0444`/`0555` root-owned lower as
+the guest user.
+
+### Containers
+
+Native containers bind the host source read-only at `/run/tartarus/lower/<tag>`
+(never at the share's mount point) and run the same overlay mount inside the
+container. With `privateUsers`, that bind is rendered as
+`--bind-ro=<source>:/run/tartarus/lower/<tag>:idmap`, so the usual `idmap`
+opt-out applies.
+
+A nested container follows the same model inside its container-host VM: the VM
+exports the source read-only under `/var/lib/tartarus-inner/<name>/shares/<tag>`
+and the container binds that at `/run/tartarus/lower/<tag>`.
+
+The overlay share's host source stays read-only to the container. The writable
+layer lives in the container's own home, just like a VM's.

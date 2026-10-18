@@ -1095,6 +1095,51 @@
     };
   };
 
+  # A native container with an overlay share: the host domain binds the source
+  # read-only at its lower path, never at the share's own mount point, and the
+  # container evaluates the overlay mount + prepare service itself.
+  hostCtnOverlay = mkHost {
+    guests.oc = {
+      enable = true;
+      kind = "container";
+      id = 7;
+      internet = true;
+      shares = [
+        {
+          tag = "opencode";
+          source = "/host/opencode";
+          mountPoint = "/home/user/.config/opencode";
+          overlay = true;
+          # Must still render the lower read-only.
+          readOnly = false;
+        }
+      ];
+    };
+  };
+  ctnOverlayGuests = mkGuestsFromHost hostCtnOverlay;
+  ctnOverlay = ctnOverlayGuests.nixosConfigurations."ctn-oc";
+  ctnOverlayFs = ctnOverlay.config.fileSystems."/home/user/.config/opencode";
+
+  # The same overlay share in a private user namespace must render as an
+  # id-mapped read-only bind of the lower.
+  hostCtnOverlayPrivate = mkHost {
+    guests.oc = {
+      enable = true;
+      kind = "container";
+      id = 7;
+      internet = true;
+      privateUsers = "pick";
+      shares = [
+        {
+          tag = "opencode";
+          source = "/host/opencode";
+          mountPoint = "/home/user/.config/opencode";
+          overlay = true;
+        }
+      ];
+    };
+  };
+
   # Feature 3: a host-wide `tartarus.containers.privateUsers` default applies to
   # every container (native and nested) unless the guest overrides it. `box` is
   # a VM and must be left untouched by the default.
@@ -1953,6 +1998,94 @@
   };
   protoVm = protoGuests.nixosConfigurations."vm-v";
 
+  # Overlay shares: the host source is exported read-only at
+  # /run/tartarus/lower/<tag>, never at the share's own mount point, and the
+  # guest mounts a writable overlay there. `readOnly = false` must not make the
+  # lower writable.
+  overlayGuests = mkGuests {
+    hostSystem = "x86_64-linux";
+    globalProxy.enable = false;
+    guests.v = {
+      enable = true;
+      kind = "vm";
+      id = 7;
+      internet = true;
+      shares = [
+        {
+          tag = "opencode";
+          source = "/host/opencode";
+          mountPoint = "/home/user/.config/opencode";
+          overlay = true;
+          readOnly = false;
+        }
+        {
+          tag = "plain";
+          source = "/host/plain";
+          mountPoint = "/home/user/plain";
+        }
+      ];
+    };
+  };
+  overlayVm = overlayGuests.nixosConfigurations."vm-v";
+  overlayVmShares = overlayVm.config.microvm.shares;
+  overlayVmFs = overlayVm.config.fileSystems."/home/user/.config/opencode";
+  overlayVmPrepare = overlayVm.config.systemd.services."tartarus-overlay-prepare-opencode";
+
+  # A Darwin host must reject any overlay share (vfkit ignores `readOnly` and
+  # the store snapshot is root-owned).
+  hostDarwinOverlay = mkDarwinHost {
+    x = {
+      enable = true;
+      kind = "vm";
+      id = 3;
+      internet = true;
+      shares = [
+        {
+          tag = "opencode";
+          source = "/Users/user/.config/opencode";
+          mountPoint = "/home/user/.config/opencode";
+          overlay = true;
+        }
+      ];
+    };
+  };
+
+  # A nested container's overlay share: the container-host VM exports the
+  # source read-only under the inner directory, binds it into the nested
+  # container at /run/tartarus/lower/<tag>, and the container mounts the
+  # writable overlay itself.
+  chOverlayGuests = mkGuests {
+    hostSystem = "x86_64-linux";
+    globalProxy.enable = false;
+    guests = {
+      ch = {
+        enable = true;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        vm.containerHost.enable = true;
+      };
+      inner = {
+        enable = true;
+        kind = "container";
+        id = 6;
+        internet = true;
+        host = "ch";
+        shares = [
+          {
+            tag = "opencode";
+            source = "/host/opencode";
+            mountPoint = "/home/user/.config/opencode";
+            overlay = true;
+          }
+        ];
+      };
+    };
+  };
+  chOverlayVm = chOverlayGuests.nixosConfigurations."vm-ch";
+  chOverlayCtn = chOverlayGuests.nixosConfigurations."ctn-inner";
+  chOverlayBinds = chOverlayVm.config.containers.inner.bindMounts;
+
   # ==== P5: resource-ceiling resolution =================================
   # A plain VM keeps the numeric defaults (768 MiB / 1 vCPU) passed straight to
   # microvm.nix -- the regression guard for the retyped `vm.mem`/`vm.vcpu`.
@@ -2346,6 +2479,47 @@ in {
         && legacy.securityModel == "mapped")
       "share transport did not default to virtiofs / honour the Linux 9p opt-in";
 
+    # ---- overlay shares -------------------------------------------------
+    "shares/overlay-vm-lower" =
+      T
+      (let
+        byTag = tag: lib.findFirst (s: s.tag == tag) null overlayVmShares;
+        lower = byTag "opencode";
+      in
+        lower
+        != null
+        && lower.mountPoint == "/run/tartarus/lower/opencode"
+        && (lower.readOnly or false)
+        && lib.all (s: s.mountPoint != "/home/user/.config/opencode") overlayVmShares
+        && byTag "plain" != null)
+      "an overlay share was not exported as a forced read-only lower";
+    "shares/overlay-vm-filesystem" =
+      T
+      (overlayVmFs.fsType
+        == "overlay"
+        && overlayVmFs.device == "overlay"
+        && lib.any (o: o == "lowerdir=/run/tartarus/lower/opencode") overlayVmFs.options
+        && lib.any (o: o == "upperdir=/home/user/.local/state/tartarus/overlay-shares/opencode/upper") overlayVmFs.options
+        && lib.any (o: o == "workdir=/home/user/.local/state/tartarus/overlay-shares/opencode/work") overlayVmFs.options
+        && lib.any (o: o == "userxattr") overlayVmFs.options
+        && lib.any (o: o == "x-systemd.requires=tartarus-overlay-prepare-opencode.service") overlayVmFs.options
+        && overlayVmFs.depends == ["/run/tartarus/lower/opencode"])
+      "the guest overlay filesystem is not configured correctly";
+    "shares/overlay-vm-prepare-service" =
+      T
+      (overlayVmPrepare.serviceConfig.Type
+        == "oneshot"
+        && hasInfix "-o user -g users" overlayVmPrepare.serviceConfig.ExecStart
+        && hasInfix "/home/user/.local/state/tartarus/overlay-shares/opencode/upper" overlayVmPrepare.serviceConfig.ExecStart
+        && hasInfix "/home/user/.local/state/tartarus/overlay-shares/opencode/work" overlayVmPrepare.serviceConfig.ExecStart
+        && overlayVmPrepare.unitConfig.DefaultDependencies == false
+        && lib.elem "/home/user" overlayVmPrepare.unitConfig.RequiresMountsFor
+        && lib.elem "/run/tartarus/lower/opencode" overlayVmPrepare.unitConfig.RequiresMountsFor)
+      "the overlay prepare service is missing ownership/ordering";
+
+    "assertions/darwin-overlay-rejected" =
+      T (!assertionsPass hostDarwinOverlay) "a Darwin host with an overlay share was accepted";
+
     # ---- host assertions ------------------------------------------------
     "assertions/good-host-passes" =
       T (assertionsPass hostOk) "a valid host configuration was rejected";
@@ -2633,6 +2807,31 @@ in {
         && lib.any (f: hasInfix ":/etc/tartarus/ssh:idmap" f) flags)
       "a share with `idmap = false` was still emitted as an id-mapped bind";
 
+    "host-containers/overlay-bind" =
+      T
+      (hostCtnOverlay.config.containers.oc.bindMounts ? "/run/tartarus/lower/opencode"
+        && hostCtnOverlay.config.containers.oc.bindMounts."/run/tartarus/lower/opencode".hostPath == "/host/opencode"
+        && hostCtnOverlay.config.containers.oc.bindMounts."/run/tartarus/lower/opencode".isReadOnly
+        && !(hostCtnOverlay.config.containers.oc.bindMounts ? "/home/user/.config/opencode"))
+      "a native container did not bind the overlay source read-only at its lower";
+    "host-containers/overlay-guest-filesystem" =
+      T
+      (ctnOverlayFs.fsType
+        == "overlay"
+        && lib.any (o: o == "lowerdir=/run/tartarus/lower/opencode") ctnOverlayFs.options
+        && lib.any (o: o == "upperdir=/home/user/.local/state/tartarus/overlay-shares/opencode/upper") ctnOverlayFs.options
+        && ctnOverlay.config.systemd.services ? "tartarus-overlay-prepare-opencode")
+      "the native container did not evaluate the overlay mount/prepare service";
+    "host-containers/overlay-private-users-idmap" =
+      T
+      (let
+        flags = hostCtnOverlayPrivate.config.containers.oc.extraFlags;
+      in
+        hostCtnOverlayPrivate.config.containers.oc.bindMounts
+        == {}
+        && lib.elem "--bind-ro=/host/opencode:/run/tartarus/lower/opencode:idmap" flags)
+      "a privateUsers overlay share was not rendered as an id-mapped read-only lower bind";
+
     # A host-wide `tartarus.containers.privateUsers` default applies to every
     # container, is overridable per guest, and leaves VMs alone.
     "host-containers/private-users-host-default" =
@@ -2728,6 +2927,33 @@ in {
         && chRichBinds."/home/user/work".hostPath == "/var/lib/tartarus-inner/inner/shares/work"
         && chRichBinds."/home/user/shared".hostPath == "/var/lib/tartarus-inner/shared/inner")
       "the nested container's shares are not bind-mounted at their guest paths";
+    "container-host/nested-overlay-lower-device" =
+      T
+      (let
+        lower = lib.findFirst (s: s.tag == "ti6-s-opencode") null chOverlayVm.config.microvm.shares;
+      in
+        lower
+        != null
+        && lower.mountPoint == "/var/lib/tartarus-inner/inner/shares/opencode"
+        && (lower.readOnly or false))
+      "the nested container's overlay lower was not exported read-only by the VM";
+    "container-host/nested-overlay-bind" =
+      T
+      (chOverlayBinds ? "/run/tartarus/lower/opencode"
+        && chOverlayBinds."/run/tartarus/lower/opencode".hostPath == "/var/lib/tartarus-inner/inner/shares/opencode"
+        && chOverlayBinds."/run/tartarus/lower/opencode".isReadOnly
+        && !(chOverlayBinds ? "/home/user/.config/opencode"))
+      "the nested container did not bind the overlay source read-only at its lower";
+    "container-host/nested-overlay-guest" =
+      T
+      (let
+        fs = chOverlayCtn.config.fileSystems."/home/user/.config/opencode";
+      in
+        fs.fsType
+        == "overlay"
+        && lib.any (o: o == "lowerdir=/run/tartarus/lower/opencode") fs.options
+        && chOverlayCtn.config.systemd.services ? "tartarus-overlay-prepare-opencode")
+      "the nested container did not evaluate its overlay mount/prepare service";
     # Device-budget guard: on Darwin a read-only inner share is store-snapshotted
     # and bound from /nix/store rather than exported as a virtiofs device.
     "container-host/nested-rosnapshot-no-device" =

@@ -258,6 +258,20 @@ in {
             a source filesystem that does not support ID-mapped mounts (e.g.
             agenix's ramfs `/run/agenix`), which would otherwise make nspawn
             fail with `Failed to clone ...: Invalid argument`.
+
+            `overlay = true` makes the share a writable overlay view of
+            `source`: the guest sees a normal writable directory at
+            `mountPoint`, while `source` is exported read-only as the overlay
+            lower at `/run/tartarus/lower/<tag>` and every write lands in
+            `~/.local/state/tartarus/overlay-shares/<tag>/{upper,work}`. This is
+            tartarus-only (the field is stripped before shares reach
+            `microvm.shares`) and Linux-only: on Darwin evaluation fails,
+            because vfkit ignores `readOnly` and the store snapshot is
+            root-owned. `readOnly` is forced on the lower; the upper/work layer
+            persists with `vm.persistentHome` (VMs) or the container rootfs
+            (containers). The `tag` must match `[A-Za-z0-9._-]+` and the
+            `mountPoint` must not be `/`, the guest home root, or a parent of
+            its own lower/upper/work tree.
           '';
         };
 

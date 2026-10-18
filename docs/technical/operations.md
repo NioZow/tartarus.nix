@@ -58,6 +58,15 @@ On Darwin the proxy is a launchd agent: `launchctl list | grep tartarus-proxy`;
 - **A share is not read-only on macOS.** vfkit ignores `readOnly`; the engine
   snapshots the source into the store. A secret-bearing share needs
   `snapshot = false`. See [Shares](./shares.md).
+- **An overlay share fails to evaluate on Darwin.** That is deliberate:
+  `overlay = true` is Linux-only. Move the guest to a Linux host, or drop
+  `overlay` and use a plain read-only share on macOS. See
+  [Overlay shares](./shares.md#overlay-shares).
+- **An overlay share is empty or writes vanish.** Check that the guest is on a
+  Linux host, that the tag is `[A-Za-z0-9._-]+`, and that the mount point is not
+  a parent of `~/.local/state/tartarus/overlay-shares/<tag>`. On a VM without
+  `vm.persistentHome.enable` the home is tmpfs, so the writable layer is
+  discarded at shutdown.
 - **A VM is unresponsive but RAM is high.** Free page reporting only returns
   *freed* pages; a busy VM stays resident. Use the manual balloon if needed
   (see [How it works](./how-it-works.md#memory-management)).

@@ -215,6 +215,8 @@
           sleep 1
         done
         install -d -m 0755 "$dst/ssh"
+        ${concatMapStringsSep "\n" (s: ''install -d -m 0755 "$dst/ssh/lower/${s.tag}"'')
+          (filter (s: sharePolicy.isOverlayShare s && sharePolicy.safeOverlayTag s.tag) (inner.cfg.shares or []))}
         cp -f "$src/ssh_host_ed25519_key" "$dst/ssh/ssh_host_ed25519_key"
         cp -f "$src/ssh_host_ed25519_key.pub" "$dst/ssh/ssh_host_ed25519_key.pub" || true
         cp -f "$src/ssh_host_ed25519_key-cert.pub" "$dst/ssh/ssh_host_ed25519_key-cert.pub" || true
@@ -368,9 +370,24 @@ in {
           # from the VM path `nix/guest/shares.nix` mounts under the
           # container's inner directory. Either way, read-only stays read-only
           # at the container's own mount point.
-          // listToAttrs (map (s:
-            nameValuePair s.mountPoint (
-              if sharePolicy.needsStoreSnapshot g.platform s
+          // listToAttrs (map (s: let
+            overlay = sharePolicy.isOverlayShare s;
+          in
+            nameValuePair (
+              if overlay
+              then sharePolicy.overlayLowerDir s
+              else s.mountPoint
+            ) (
+              if overlay
+              then {
+                # `nix/guest/shares.nix` exports the host source read-only
+                # under the inner directory; the container sees it only as the
+                # overlay lower, never at the share's own mount point.
+                hostPath = "/var/lib/tartarus-inner/${inner.name}/shares/${s.tag}";
+                isReadOnly = true;
+                idmap = s.idmap or true;
+              }
+              else if sharePolicy.needsStoreSnapshot g.platform s
               then {
                 hostPath = innerSnapshot s;
                 isReadOnly = true;

@@ -60,7 +60,7 @@ Host-wide defaults for `kind = "container"` guests.
 | `graphical` | bool | `false` | Graphical remote display via the `wprs` transport. |
 | `internet` | bool | `true` | Direct NAT egress. Mutually exclusive with `proxy.enable`. |
 | `sharedFolder` | bool | `false` | Mount a per-guest host directory at `~/shared`. |
-| `shares` | list | `[]` | Extra host/guest directory shares (a `readOnly = true` share is enforced by the hypervisor on Linux and a read-only store snapshot on macOS). See [Shares](../technical/shares.md). |
+| `shares` | list | `[]` | Extra host/guest directory shares (a `readOnly = true` share is enforced by the hypervisor on Linux and a read-only store snapshot on macOS; `overlay = true` gives a writable overlay view of a Linux host directory while the host source stays read-only). See [Shares](../technical/shares.md). |
 | `apps` | list | `[]` | Host `.desktop` launchers for apps running in the guest. |
 | `autostart` | bool | `false` | Start on login via a tartarus user service. |
 | `requires` | list | `[]` | Names of other enabled guests started before this one. Must be acyclic. |
