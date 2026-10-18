@@ -41,6 +41,7 @@
   names = import ../nix/lib/names.nix {inherit lib;};
   platform = import ../nix/guest/platform.nix {inherit lib;};
   sharePolicy = import ../nix/lib/shares.nix {inherit lib;};
+  mountsLib = import ../nix/lib/mounts.nix {inherit lib;};
   renderSquid = import ../nix/host/proxy.nix {mode = "squidConfig";};
 
   # ==== test-record helpers ==============================================
@@ -1959,7 +1960,10 @@
         shares = [
           {
             tag = "rosnap";
-            source = ./.;
+            # A non-store source. A repo-relative path becomes a /nix/store
+            # path under `nix flake check`, and store paths are already
+            # immutable, so they are never re-snapshotted.
+            source = "/var/empty";
             mountPoint = "/home/user/rosnap";
             readOnly = true;
           }
@@ -1997,6 +2001,40 @@
     };
   };
   protoVm = protoGuests.nixosConfigurations."vm-v";
+
+  # Runtime-mount staging share: Linux VMs get it, Darwin VMs and containers
+  # must not.
+  mountGuests = mkGuests {
+    globalProxy.enable = false;
+    guests.dev = {
+      enable = true;
+      kind = "vm";
+      id = 3;
+      internet = true;
+    };
+  };
+  mountVm = mountGuests.nixosConfigurations."vm-dev";
+  mountDarwinGuests = mkGuests {
+    hostSystem = "aarch64-darwin";
+    globalProxy.enable = false;
+    guests.dev = {
+      enable = true;
+      kind = "vm";
+      id = 3;
+      internet = true;
+    };
+  };
+  mountDarwinVm = mountDarwinGuests.nixosConfigurations."vm-dev";
+  mountCtnGuests = mkGuests {
+    globalProxy.enable = false;
+    guests.dev = {
+      enable = true;
+      kind = "container";
+      id = 4;
+      internet = true;
+    };
+  };
+  mountCtn = mountCtnGuests.nixosConfigurations."ctn-dev";
 
   # Overlay shares: the host source is exported read-only at
   # /run/tartarus/lower/<tag>, never at the share's own mount point, and the
@@ -2478,6 +2516,94 @@ in {
         && legacy.proto == "9p"
         && legacy.securityModel == "mapped")
       "share transport did not default to virtiofs / honour the Linux 9p opt-in";
+
+    # ---- runtime-mounts staging share -----------------------------------
+    "mounts/linux-vm-share" =
+      T
+      (let
+        found = filter (s: s.tag == "tartarus-mounts") mountVm.config.microvm.shares;
+        s = head found;
+      in
+        builtins.length found
+        == 1
+        && s.mountPoint == "/run/tartarus-mount/staging"
+        && s.source == "/home/user/.local/state/tartarus/dev/mounts"
+        && !(s.readOnly or false)
+        && s.proto == "virtiofs")
+      "the Linux VM runtime-mount staging share is missing or wrong";
+    "mounts/darwin-vm-no-share" =
+      T
+      (lib.findFirst (s: s.tag == "tartarus-mounts") null mountDarwinVm.config.microvm.shares == null)
+      "a Darwin VM was given the runtime-mount staging share";
+    "mounts/container-no-share" =
+      T
+      (lib.findFirst (s: s.tag == "tartarus-mounts") null (lib.attrByPath ["microvm" "shares"] [] mountCtn.config) == null)
+      "a container was given the runtime-mount staging share";
+    "mounts/lib-default-root" =
+      T
+      (mountsLib.resolve {
+          hostHome = "/home/user";
+          name = "dev";
+        }
+        == "/home/user/.local/state/tartarus/dev/mounts")
+      "the default runtime-mount root changed";
+    "mounts/lib-override" =
+      T
+      (mountsLib.resolve {
+          envValue = "/tmp/x";
+          hostHome = "/home/user";
+          name = "dev";
+        }
+        == "/tmp/x")
+      "TARTARUS_MOUNT_ROOT did not override the runtime-mount root";
+
+    "mounts/linux-vm-service" =
+      T
+      (let
+        service = mountVm.config.systemd.services.tartarus-mount or null;
+        asText = value:
+          if builtins.isList value
+          then concatStringsSep " " (map builtins.toString value)
+          else builtins.toString value;
+        exec =
+          if service == null
+          then ""
+          else asText (service.serviceConfig.ExecStart or "");
+        environment =
+          if service == null
+          then []
+          else (service.serviceConfig.Environment or []);
+      in
+        service
+        != null
+        && (service.wantedBy or []) == ["multi-user.target"]
+        && hasInfix "tartarus-mount serve" exec
+        && service.serviceConfig.RuntimeDirectory == "tartarus-mount"
+        && lib.any (entry: hasInfix "TARTARUS_MOUNT_USER=user" entry) environment
+        && lib.any (entry: hasInfix "TARTARUS_MOUNT_GROUP=users" entry) environment)
+      "the Linux VM runtime-mount helper service is missing or misconfigured";
+    "mounts/linux-vm-helper-in-path" =
+      T
+      (lib.any (p: (p.name or "") == "tartarus-mount") mountVm.config.environment.systemPackages)
+      "the runtime-mount helper is not in the guest system PATH";
+    "mounts/darwin-vm-no-service" =
+      T
+      (let
+        result = builtins.tryEval (mountDarwinVm.config.systemd.services ? tartarus-mount);
+      in
+        if result.success
+        then !result.value
+        else true)
+      "a Darwin VM was given the runtime-mount helper service";
+    "mounts/container-no-service" =
+      T
+      (let
+        result = builtins.tryEval (mountCtn.config.systemd.services ? tartarus-mount);
+      in
+        if result.success
+        then !result.value
+        else true)
+      "a container was given the runtime-mount helper service";
 
     # ---- overlay shares -------------------------------------------------
     "shares/overlay-vm-lower" =

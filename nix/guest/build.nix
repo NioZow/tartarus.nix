@@ -18,6 +18,7 @@
 #   MICROVM_ID_OVERRIDE       forced id/CID for a numbered VM instance
 #   MICROVM_EXTRA_SHARES      JSON list of ad-hoc `vm start --mount` shares
 #   TARTARUS_HOST_UID         invoking host uid (virtiofs ownership)
+#   TARTARUS_MOUNT_ROOT       absolute staging root for this instance
 #
 # Container instances use CONTAINER_INSTANCE_SUFFIX / CONTAINER_ID_OVERRIDE.
 # ---------------------------------------------------------------------------
@@ -35,6 +36,7 @@
 }: let
   platformLib = import ./platform.nix {inherit lib;};
   ids = import ../lib/ids.nix {inherit lib;};
+  mountsLib = import ../lib/mounts.nix {inherit lib;};
 
   # ==== impure instance/shares interface (see header) ====
   # The host user's home, for the client pubkey and VM share sources. Taken from
@@ -62,6 +64,7 @@
   vmInstanceSuffix = builtins.getEnv "MICROVM_INSTANCE_SUFFIX";
   vmIdOverride = builtins.getEnv "MICROVM_ID_OVERRIDE";
   vmExtraSharesRaw = builtins.getEnv "MICROVM_EXTRA_SHARES";
+  mountRootRaw = builtins.getEnv "TARTARUS_MOUNT_ROOT";
   ctnInstanceSuffix = builtins.getEnv "CONTAINER_INSTANCE_SUFFIX";
   ctnIdOverride = builtins.getEnv "CONTAINER_ID_OVERRIDE";
 
@@ -302,6 +305,13 @@
       ;
 
     isVm = platform.isVm;
+
+    # Absolute host staging root exported to Linux VMs as the `tartarus-mounts`
+    # share. Resolved per guest so numbered instances get their own directory.
+    mountRoot = mountsLib.resolve {
+      envValue = mountRootRaw;
+      inherit hostHome name;
+    };
 
     # A VM that hosts nested systemd-nspawn containers. Only such a VM pulls in
     # ./container-host.nix and the inner key-material shares.

@@ -26,6 +26,27 @@ def run_sudo(cmd: list[str]) -> None:
         sys.exit(result.returncode)
 
 
+def run_sudo_capture(
+    cmd: list[str],
+    *,
+    timeout: float | None = None,
+    pass_fds: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess:
+    """Run a sudo command, capturing output and returning the result (no exit).
+
+    ``pass_fds`` is forwarded to :func:`subprocess.run` so a caller can hand a
+    directory descriptor to ``sudo --preserve-fds`` (see
+    :func:`tartarus.mounts._namespace_run`).
+    """
+    return subprocess.run(
+        [_sudo_bin(), *cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        pass_fds=tuple(pass_fds),
+    )
+
+
 def run_sudo_quiet(cmd: list[str], *, debug: bool = False) -> None:
     """Like :func:`run_sudo`, but swallows the command's stdout/stderr unless
     ``debug`` is set or it actually fails -- for the mutating calls behind

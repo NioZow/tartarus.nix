@@ -25,6 +25,7 @@
   };
 in {
   tartarus = import ./tartarus {inherit pkgs;};
+  "tartarus-mount" = import ./tartarus-mount {inherit pkgs;};
   "sudo-auth-proxy" = sudoAuthProxy.package {inherit pkgs;};
   "ssh-agent-proxy" = sshAgentProxyPkg.package {inherit pkgs;};
   "clipboard-bridge" = clipboardBridge.package {inherit pkgs;};

@@ -57,6 +57,30 @@ proxy) unless noted.
 - [ ] The `tartarus_container` nftables table only lists exact container
       addresses (the `tartarus_container_hosts` set).
 
+### Runtime mounts (Linux VM + native container)
+
+The helper and staging share are build-time artifacts, so rebuild/restart the
+VM once before the first check.
+
+- [ ] `tartarus restart vault -u` completes with the runtime-mount share and
+      helper installed.
+- [ ] `tartarus mount vault <host-dir>:/home/user/rt` succeeds; write a file
+      from inside the guest and see it on the host.
+- [ ] `tartarus mount vault <host-dir>:/home/user/rt-ro -r` succeeds; a guest
+      write fails.
+- [ ] `tartarus mount vault <host-dir>:/home/user/rt-ov --overlay` succeeds;
+      writes are visible in the guest but not on the host.
+- [ ] `tartarus unmount vault <target>` (alias `umount`) succeeds for each mode;
+      `findmnt <target>` / `mountpoint <target>` reports it is no longer a
+      mountpoint.
+- [ ] Stop and start the VM: the mounts do not survive, and
+      `findmnt -R <state_root>/<name>/mounts` is empty.
+- [ ] Mount and unmount a native container, including one with
+      `privateUsers = "pick"`; verify ownership inside with `stat`.
+- [ ] `tartarus mounts` lists the entries and `tartarus unmount` clears them.
+- [ ] Negative: a macOS/vfkit VM refuses runtime mounts, and a nested container
+      refuses them with the container-host explanation.
+
 ### Host firewall + host proxy
 
 - [ ] `sudo nft list table inet tartarus_vm` and `... tartarus_container` show

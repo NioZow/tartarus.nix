@@ -86,6 +86,59 @@ The build cache: `start`, `restart`, `spawn` and `build` reuse an existing
 given. When the flake changed since the build (git `HEAD`, dirty tracked files,
 or `flake.lock`), they print one line suggesting `--upgrade`.
 
+## Runtime mounts
+
+`tartarus mount` attaches a host folder to a running guest; `unmount` (alias
+`umount`) detaches it; `mounts` lists the records and marks them stale when the
+guest is down. Nothing is rebuilt or restarted, and the mounts are runtime-only.
+
+### VM path
+
+1. Refuse on macOS/vfkit and require the VM to be running.
+2. Preflight over SSH: `/run/current-system/sw/bin/tartarus-mount` must be
+   executable and `/run/tartarus-mount/staging` must exist. Otherwise fail with
+   the one-time `tartarus restart <name> -u` instruction.
+3. Generate an opaque id and create `<state>/<name>/mounts/<id>` on the host.
+4. Bind the host folder there with `sudo mount --bind`; for `ro` and `overlay`,
+   remount the staging bind read-only.
+5. Call the guest helper over the CA-trusted VSOCK/SSH transport:
+   `tartarus-mount mount <id> <target> <mode>`. The helper mounts from
+   `/run/tartarus-mount/staging/<id>`; the host never sends a source path.
+6. Record `{id, kind, source, target, mode, stage}` in the state file. On any
+   failure, release the host staging bind and remove its directory before
+   reporting the error.
+
+### Container path
+
+1. Refuse nested containers (the host source is not visible in the
+   container-host VM) and require the container to be running.
+2. Resolve the leader with `machinectl show <name> -p Leader`; fall back to
+   `systemctl show -p MainPID container@<name>` and that process's first child.
+3. Open the host source and stage it inside the container namespace through an
+   inherited directory fd: `nsenter -t <leader> -m -U -S 0 -G 0 -r
+   /proc/<leader>/root` plus `mount --bind /proc/self/fd/<n> ...`.
+4. Decide idmap from `/proc/<leader>/uid_map`: a shifted map gets
+   `--map-users=0:0:65536 --map-groups=0:0:65536`; `--no-idmap` forces a plain
+   bind, and a source filesystem that rejects idmap falls back to one with a
+   warning.
+5. Bind (or remount `ro`, or mount overlay with upper/work under the container's
+   `/run` tmpfs) at the target. Containers need no host cleanup on stop: their
+   mounts disappear with the namespace.
+
+### Lifecycle
+
+- `start` releases stale host staging binds and clears runtime-mount state
+  before launch, covering an unclean previous exit.
+- `stop`, `restart` and `stop --purge` release and clear the guest's runtime
+  mounts; `--purge` then wipes the whole state dir as before.
+- `mounts` marks an entry stale when its guest is not running. After a host
+  reboot the host binds are already gone, so `start` and `mounts` tolerate the
+  leftover state; `unmount` removes the record.
+- Cleanup warns and continues: a staging bind that cannot be released never
+  keeps the guest running.
+- The helper and staging share are build-time artifacts, so an existing VM
+  needs one rebuild/restart before its first runtime mount.
+
 ## Networking
 
 ### Linux

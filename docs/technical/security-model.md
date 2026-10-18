@@ -85,6 +85,15 @@ CA-authenticated channel.
   `"pick"`/an int gives real UID isolation (with `idmap` on Tartarus's own bind
   mounts, except shares that opt out because their source filesystem — such as
   agenix's ramfs `/run/agenix` — cannot be ID-mapped).
+- **Runtime mounts.** Every bind/unmount is a host `sudo` operation, and the
+  guest helper only accepts an opaque id from `/run/tartarus-mount/staging`,
+  never a host source path. Its socket is guest-local, mode `0660` root:users,
+  and peer-authenticated (root or the guest user); targets are re-validated on
+  both sides. The staging share is writable by the guest and dedicated to
+  non-secret data. With `--no-idmap` (or a source filesystem that rejects
+  idmapped mounts) a `privateUsers` container gets a plain bind, so ownership
+  may appear as `nobody`/`nogroup`; that is the same accepted trade-off as the
+  declarative `idmap = false`.
 - **The enabled-guest guard.** The CLI refuses to act on a guest that is not
   enabled, because a disabled guest has no firewall rules, CA certificate or
   proxy entry — i.e. no host-side enforcement in place.
@@ -123,6 +132,11 @@ CA-authenticated channel.
 - The host/guest service channels rely on the guest system being built from the
   declared `systemConfig`; a consumer that disables the guest-side pieces loses
   the corresponding protections.
+- The runtime-mount staging root `<state>/<name>/mounts` is guest-writable; it
+  is dedicated and must not hold secrets.
+- Runtime mounts are not persisted and disappear on stop/restart. A guest with
+  root can unmount or remount its own runtime mounts; host-side read-only is
+  enforced by the host bind, not by the guest mount.
 
 For the detailed threat tables, see the [ssh-agent-proxy](./ssh-agent-proxy.md)
 and [sudo-auth-proxy](./sudo-auth-proxy.md) threat models.

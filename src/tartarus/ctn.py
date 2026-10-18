@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import NoReturn
 
-from . import ca, ssh, system
+from . import ca, mounts, ssh, system
 from .config import Config
 from .errors import TartarusError
 from .nix import eval as nix_eval
@@ -374,6 +374,8 @@ def action_start(config: Config, name: str, upgrade: bool = False) -> None:
         if nested_state(config, guest.host, name) == "running":
             warn(f"'{name}' is already running.")
             return
+        # The unit is down, so any recorded runtime mounts are stale.
+        mounts.cleanup_container_mounts(config, name)
         result = nested_systemctl(config, guest.host, "start", name)
         if result.returncode != 0:
             die(f"failed to start '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
@@ -394,6 +396,10 @@ def action_start(config: Config, name: str, upgrade: bool = False) -> None:
     if is_running(name):
         warn(f"'{name}' is already running.")
         return
+
+    # A stale state file from an unclean previous exit must not shadow the
+    # mounts this start will establish.
+    mounts.cleanup_container_mounts(config, name)
 
     _STARTING.add(name)
     try:
@@ -459,6 +465,8 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
         result = nested_systemctl(config, guest.host, "stop", name)
         if result.returncode != 0:
             die(f"failed to stop '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
+        # The stopped namespace took every runtime mount with it.
+        mounts.cleanup_container_mounts(config, name)
         ok(f"'{name}' stopped.")
         return
 
@@ -471,6 +479,10 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
         ok(f"'{name}' stopped.")
     else:
         warn(f"'{name}' is not running.")
+
+    # Runtime mounts are namespace-local; the stop (or an earlier unclean exit)
+    # leaves only a stale state file behind.
+    mounts.cleanup_container_mounts(config, name)
 
     if purge:
         run_sudo_quiet(["nixos-container", "destroy", name], debug=debug)
@@ -494,12 +506,16 @@ def action_restart(config: Config, name: str) -> None:
         result = nested_systemctl(config, guest.host, "restart", name)
         if result.returncode != 0:
             die(f"failed to restart '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
+        # A restart destroys the namespace, so recorded mounts are stale.
+        mounts.cleanup_container_mounts(config, name)
         ok(f"'{name}' restarted.")
         return
     if name not in list_conf_names():
         die(f"'{name}' has never been created -- use `tartarus --container start` or `spawn` first")
     ca.ensure_ctn_certs(config, base)
     run_sudo(["systemctl", "restart", f"container@{name}"])
+    # A restart destroys the namespace, so recorded mounts are stale.
+    mounts.cleanup_container_mounts(config, name)
     ok(f"'{name}' restarted.")
 
 
@@ -700,3 +716,17 @@ def dispatch(config: Config, args) -> None:
         action_ssh(config, args.name, args.start, args.retry, args.retry_delay)
     elif args.command == "ip":
         action_ip(config, args.name)
+    elif args.command == "mount":
+        mounts.action_mount(
+            config,
+            args.name,
+            args.spec,
+            kind="container",
+            read_only=args.read_only,
+            overlay=args.overlay,
+            no_idmap=args.no_idmap,
+        )
+    elif args.command in ("unmount", "umount"):
+        mounts.action_unmount(config, args.name, args.target, kind="container")
+    elif args.command == "mounts":
+        mounts.action_mounts(config, args.name, json_output=args.json)

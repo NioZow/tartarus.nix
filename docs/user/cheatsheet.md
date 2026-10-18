@@ -73,6 +73,9 @@ tartarus build <name> [-u]
 tartarus spawn <template> [--name N]
 tartarus stop <name> [--purge]
 tartarus restart <name> [-u]
+tartarus mount <guest> HOST:GUEST [-r|--read-only|--overlay] [--no-idmap]
+tartarus unmount <guest> GUEST        # alias: umount
+tartarus mounts [guest] [--json]
 tartarus logs <name>
 tartarus ssh <name> [-s] [-r N] [--retry-delay SECONDS]
 tartarus cid <name>          # MicroVM only
@@ -93,6 +96,9 @@ tartarus --container <cmd> <name>   # force the container path
 | Build seems stale after editing the flake | Re-run with `-u/--upgrade`. |
 | `kind = "container"` refused on Darwin | Set `host` (or `tartarus.containers.containerHost`) to a container-host VM. |
 | `internet = true` and `proxy.enable = true` | Pick one; they are mutually exclusive. |
+| Runtime mount refused on macOS / for a nested container | Use a Linux VM or a native container; macOS/vfkit and nested containers are unsupported. |
+| "helper or staging share missing" on `tartarus mount` | Rebuild and restart the VM once: `tartarus restart <name> -u`. |
+| `tartarus mounts` shows a stale entry after a host reboot | `tartarus unmount <guest> <target>` clears the record (the host bind is already gone). |
 
 ## Paths
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from typing import Sequence
 
-from . import ca, ctn, listing, vm
+from . import ca, ctn, listing, mounts, vm
 from .config import Config, load_config
 from .ctn import CTN_CONF_DIR
 from .errors import TartarusError
@@ -188,6 +188,36 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
     )
     p.add_argument("name", help="instance name, with or without a trailing '.trs' (ssh's %%h)")
 
+    p = sub.add_parser("mount", help="attach a host folder to a running guest at runtime")
+    p.add_argument("name", help="instance name")
+    p.add_argument(
+        "spec",
+        metavar="HOST_PATH:GUEST_PATH",
+        help="host directory and guest mount point; ~/ expands to the guest home (colons are not supported in paths)",
+    )
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("-r", "--read-only", action="store_true", help="mount the host folder read-only")
+    mode.add_argument("--overlay", action="store_true", help="writable overlay over a read-only host folder")
+    p.add_argument(
+        "--no-idmap",
+        action="store_true",
+        help="containers: force a plain bind instead of an idmapped mount",
+    )
+
+    p = sub.add_parser(
+        "unmount", aliases=["umount"], help="detach a runtime mount from a running guest"
+    )
+    p.add_argument("name", help="instance name")
+    p.add_argument(
+        "target",
+        metavar="GUEST_PATH",
+        help="guest mount point to detach (~/ expands to the guest home)",
+    )
+
+    p = sub.add_parser("mounts", help="list runtime mounts (all guests, or just one)")
+    p.add_argument("name", nargs="?", help="instance name (default: every guest)")
+    p.add_argument("--json", action="store_true", help="print as JSON instead of a table")
+
     p = sub.add_parser("ca", help="manage the shared guest CA material")
     ca_sub = p.add_subparsers(dest="ca_command", required=True)
     q = ca_sub.add_parser(
@@ -327,6 +357,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             else:
                 ca.ensure_vm_certs(config, guest.name)
             ok(f"CA material for '{guest.name}' is ready.")
+            return
+
+        if args.command in ("mount", "unmount", "umount", "mounts"):
+            if args.command == "mounts" and args.name is None:
+                mounts.action_mounts(config, None, json_output=args.json)
+                return
+            guard_guest(config, args)
+            if args.container:
+                ctn.dispatch(config, args)
+            else:
+                vm.dispatch(config, args)
             return
 
         if args.container and args.command in ("cid", "proxy", "proxy-ip"):

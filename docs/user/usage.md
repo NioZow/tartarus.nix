@@ -100,7 +100,55 @@ MicroVMs accept repeatable `--mount HOST_PATH:GUEST_PATH` shares at launch time:
 tartarus start vault --mount ~/src:/home/user/src
 ```
 
-`--mount` changes the generated derivation, so it forces a rebuild.
+`--mount` changes the generated derivation, so it forces a rebuild, and the
+share is fixed at boot.
+
+## Runtime mounts
+
+To attach a host folder to an **already-running** guest without rebuilding or
+restarting it, use `tartarus mount`:
+
+```bash
+tartarus mount dev ~/src:/home/user/src
+tartarus mount dev ~/src:/home/user/src --read-only
+tartarus mount dev ~/.config/foo:/home/user/.config/foo --overlay
+tartarus unmount dev /home/user/src        # alias: umount
+tartarus mounts                            # all guests
+tartarus mounts dev --json
+```
+
+| Mode | Flag | Effect |
+| --- | --- | --- |
+| `rw` (default) | — | Read-write bind of the host folder. |
+| read-only | `-r` / `--read-only` | Guest writes fail. |
+| overlay | `--overlay` | Writable guest-local layer over a read-only host folder; the host folder is never written. The layer lives under `/run` (tmpfs), so it is runtime-only. |
+
+`--read-only` and `--overlay` are mutually exclusive. Runtime mounts are
+**runtime-only**: they disappear on stop/restart and are not persisted or
+re-applied. `restart` drops both launch-time and runtime mounts.
+
+Runtime mounts work for Linux MicroVMs and native containers. They are
+**refused** for macOS/vfkit MicroVMs (vfkit has no device hotplug or bind
+mounts) and for nested containers (the host source is not visible inside the
+container-host VM). The first use on an existing VM needs one rebuild/restart
+to install the guest helper and staging share:
+
+```bash
+tartarus restart <name> -u
+```
+
+For containers, `--no-idmap` forces a plain bind instead of an idmapped mount;
+ownership may then appear as `nobody`/`nogroup` inside the container.
+
+The spec is `HOST_PATH:GUEST_PATH`, split on the first colon (colons in paths
+are therefore unsupported). The host path must be an existing directory; `~/`
+on either side expands, but on the guest side `~` means the guest home
+(`/home/user`), not the host user's home. The guest path must be absolute
+after expansion (or start with `~/`) and may not be `/`, `/proc`, `/sys`,
+`/dev` or `/run/tartarus-mount`. The host staging directory lives under
+`<state_root>/<name>/mounts` and is guest-writable — do not put secrets there.
+See [Shares](../technical/shares.md#runtime-mount-staging-share) for the
+mechanism.
 
 ## Dependencies and autostart
 

@@ -70,6 +70,21 @@ On Darwin the proxy is a launchd agent: `launchctl list | grep tartarus-proxy`;
 - **A VM is unresponsive but RAM is high.** Free page reporting only returns
   *freed* pages; a busy VM stays resident. Use the manual balloon if needed
   (see [How it works](./how-it-works.md#memory-management)).
+- **A runtime mount says the helper or staging share is missing.**
+  The VM predates the runtime-mount artifacts. Rebuild and restart it once:
+  `tartarus restart <name> -u`.
+- **`tartarus mounts` shows a stale entry after a reboot.** Host staging binds
+  vanish on reboot; the record remains. `tartarus unmount <guest> <target>`
+  clears it (there is nothing left to release).
+- **Staging binds remain after an unclean exit.** `tartarus start` releases them
+  before launching. To inspect first, use
+  `findmnt -R <state_root>/<name>/mounts`.
+- **Runtime mounts are refused on macOS or for a nested container.** That is
+  deliberate: macOS/vfkit has no hotplug or bind mounts, and a nested
+  container's host source is not visible inside the container-host VM. Use a
+  Linux VM or a native container.
+- **Runtime-mount staging holds host data.** `<state_root>/<name>/mounts` is
+  guest-writable; keep secrets out of it.
 - **A nested container won't start.** Nested nspawn under microvm.nix is the
   [container-host](./container-host.md) path; see its runtime caveats.
 
@@ -89,3 +104,6 @@ For the full, platform-specific manual pass, work through the
   guest.
 - **Disk:** VM writable `/nix/store` overlays (`vm.nixStoreOverlay.size`) and
   persistent homes (`vm.persistentHome.size`) are sized per guest.
+- **Runtime mounts are ephemeral.** They are not persisted or re-applied; state
+  lives in `<state_root>/<name>/runtime-mounts.json` only while the mount
+  exists, and stop/restart removes it.

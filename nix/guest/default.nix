@@ -82,6 +82,7 @@ in {
     ]
     ++ optional g.isVm ./shares.nix
     ++ optional g.isVm ./store-overlay.nix
+    ++ optional (g.isVm && !p.isDarwin) ./runtime-mounts.nix
     ++ optional (g.proxy.enable || (g.proxy.isProxyHost or false)) ./proxy.nix
     ++ [sudoAuthProxy.nixosModule]
     ++ [g.systemConfig];

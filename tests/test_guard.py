@@ -57,6 +57,9 @@ VM_GUEST_COMMANDS = [
     ["proxy", "NAME"],
     ["ip", "NAME"],
     ["proxy-ip", "NAME"],
+    ["mount", "NAME", "/tmp:/mnt"],
+    ["unmount", "NAME", "/mnt"],
+    ["mounts", "NAME"],
 ]
 CTN_GUEST_COMMANDS = [
     ["--container", "status", "NAME"],
@@ -67,6 +70,9 @@ CTN_GUEST_COMMANDS = [
     ["--container", "logs", "NAME"],
     ["--container", "ssh", "NAME"],
     ["--container", "ip", "NAME"],
+    ["--container", "mount", "NAME", "/tmp:/mnt"],
+    ["--container", "unmount", "NAME", "/mnt"],
+    ["--container", "mounts", "NAME"],
 ]
 
 

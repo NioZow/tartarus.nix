@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import socket
 import subprocess
 import time
@@ -169,8 +170,9 @@ def resolve_cid(config: Config, name: str) -> str:
     """
     if name.endswith(".trs"):
         name = name[: -len(".trs")]
-    base = flake.base_name(config, "vm", name)
-    flake.require_template(config, "vm", base)
+    # Resolve from config.toml rather than the flake outputs: runtime-mount
+    # commands call this without evaluating the user's flake.
+    base = config.require_guest(name, "vm").name
 
     cid_file = config.state_dir(name) / "cid"
     if cid_file.exists():
@@ -252,8 +254,7 @@ def resolve_running_ip(config: Config, name: str) -> str:
             guest_id = None
 
     if guest_id is None:
-        base = flake.base_name(config, "vm", name)
-        flake.require_template(config, "vm", base)
+        base = config.require_guest(name, "vm").name
         guest_id = flake.guest_id(config, "vm", base)
 
     expected = system.guest_ip(guest_id)
@@ -413,6 +414,73 @@ def exec_ssh(
         retries=retries,
         retry_delay=retry_delay,
     )
+
+
+def run_remote(
+    config: Config,
+    name: str,
+    argv: list[str],
+    *,
+    retries: int | None = None,
+    retry_delay: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a non-interactive remote command in a running VM.
+
+    Uses the same VSOCK transport and CA-trust options as :func:`exec_ssh`,
+    but captures stdout/stderr and returns the completed process instead of
+    replacing the current process. Only ssh's connection error status (255) is
+    retried; a remote command's own exit status is returned immediately.
+    """
+    if system.is_darwin():
+        raise TartarusError(
+            "remote runtime commands for MicroVMs are not supported on "
+            "macOS/vfkit: vfkit has no device hotplug or runtime mounts. "
+            "Use a Linux host instead."
+        )
+
+    base = config.require_guest(name, "vm").name
+    if not is_running(config, name):
+        raise TartarusError(
+            f"'{name}' is not running. Start it first: tartarus start {name}"
+        )
+
+    retries = config.ssh_retries if retries is None else retries
+    retry_delay = config.ssh_retry_delay if retry_delay is None else retry_delay
+
+    cid = resolve_cid(config, name)
+    known_hosts = config.ssh_dir / "known_hosts"
+    static_hosts = config.ssh_dir / "known_hosts_static"
+    command = [
+        "ssh",
+        "-o",
+        f"ProxyCommand=socat - VSOCK-CONNECT:{cid}:22",
+        "-o",
+        f"HostKeyAlias={base}.trs",
+        "-o",
+        f"UserKnownHostsFile={known_hosts} {static_hosts} {known_hosts_trs(config)}",
+        "-o",
+        f"IdentityFile={user_ssh_key(config)}",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-l",
+        "user",
+        name,
+        shlex.join(argv),
+    ]
+
+    attempt = 0
+    while True:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != SSH_CONNECTION_ERROR or attempt >= retries:
+            return result
+        attempt += 1
+        note(
+            f"ssh connection failed (exit {result.returncode}); "
+            f"retrying in {retry_delay:g}s ({attempt}/{retries})..."
+        )
+        time.sleep(retry_delay)
 
 
 def exec_logs(config: Config, name: str) -> NoReturn:

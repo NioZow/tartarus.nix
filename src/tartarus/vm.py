@@ -18,7 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import ca, ssh, system
+from . import ca, mounts, ssh, system
 from .config import Config
 from .nix import eval as nix_eval
 from .nix import flake
@@ -368,6 +368,11 @@ def _build_runner(config: Config, name: str, mounts: list[str], *, upgrade: bool
     state = config.state_dir(name)
     state.mkdir(parents=True, exist_ok=True)
 
+    # Host staging root for runtime mounts, shared into the guest. Created
+    # before the reuse check so a reused build still has it.
+    mount_root = state / "mounts"
+    mount_root.mkdir(parents=True, exist_ok=True)
+
     # The guest flake mounts $HOME/shared/<name>; for the canonical instance a
     # rebuild's tmpfiles rule already made it, but numbered instances aren't
     # known at rebuild time, so the hypervisor would otherwise fail with no
@@ -410,6 +415,7 @@ def _build_runner(config: Config, name: str, mounts: list[str], *, upgrade: bool
     # already assume.
     env["TARTARUS_HOST_UID"] = str(os.getuid())
     env["TARTARUS_HOST_GID"] = str(os.getgid())
+    env["TARTARUS_MOUNT_ROOT"] = str(mount_root)
 
     if name != base:
         env["MICROVM_INSTANCE_SUFFIX"] = name[len(base) + 1 :]
@@ -478,6 +484,14 @@ def action_start(config: Config, name: str, mounts: list[str], upgrade: bool = F
         pid = (config.state_dir(name) / "microvm.pid").read_text().strip()
         warn(f"'{name}' is already running (pid {pid}).")
         return
+
+    # A stale runtime-mount state file or host staging bind can survive an
+    # unclean exit (or a host reboot); release both before (re)launching.
+    # The module is shadowed by the `mounts` argv parameter here, so import
+    # it under another name.
+    from . import mounts as runtime_mounts
+
+    runtime_mounts.cleanup_vm_mounts(config, name)
 
     # Only a build needs the key material baked in -- skip the (for a
     # container-host VM, per-inner) cert work entirely when already running.
@@ -602,6 +616,10 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
 
     _stop_relays(config, name)
 
+    # Runtime mounts do not survive a stop/restart: release host staging binds
+    # and drop the state file whether or not the guest was running.
+    mounts.cleanup_vm_mounts(config, name)
+
     if purge:
         shutil.rmtree(state, ignore_errors=True)
         ok(f"Purged state for '{name}'.")
@@ -663,3 +681,17 @@ def dispatch(config: Config, args) -> None:
         ssh.action_ip(config, args.name)
     elif args.command == "proxy-ip":
         ssh.action_proxy_ip(config, args.name)
+    elif args.command == "mount":
+        mounts.action_mount(
+            config,
+            args.name,
+            args.spec,
+            kind="vm",
+            read_only=args.read_only,
+            overlay=args.overlay,
+            no_idmap=args.no_idmap,
+        )
+    elif args.command in ("unmount", "umount"):
+        mounts.action_unmount(config, args.name, args.target, kind="vm")
+    elif args.command == "mounts":
+        mounts.action_mounts(config, args.name, json_output=args.json)

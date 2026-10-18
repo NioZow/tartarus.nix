@@ -727,3 +727,43 @@ def test_vm_command_on_nested_container_infers_container(monkeypatch):
     cli.main(["ssh", "ch"])
 
     assert reached == [("ctn", "ssh"), ("ctn", "start"), ("vm", "ssh")]
+
+
+# --- runtime-mount cleanup on container stop ------------------------------
+
+
+def test_native_stop_cleans_runtime_mounts(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, BOX)
+    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "box")
+    monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctn, "list_conf_names", lambda: {"box"})
+    monkeypatch.setattr(ctn, "is_running", lambda _n: True)
+    monkeypatch.setattr(ctn, "run_sudo_quiet", lambda *_a, **_k: None)
+    cleaned: list[str] = []
+    monkeypatch.setattr(
+        ctn.mounts,
+        "cleanup_container_mounts",
+        lambda _c, name: cleaned.append(name),
+    )
+
+    ctn.action_stop(config, "box", False)
+
+    assert cleaned == ["box"]
+
+
+def test_nested_stop_cleans_runtime_mounts(monkeypatch, tmp_path):
+    config = make_config_in(tmp_path, CH, INNER)
+    monkeypatch.setattr(ctn, "base_name", lambda _c, _n: "inner")
+    monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctn.ssh, "is_running", lambda _c, _n: True)
+    monkeypatch.setattr(ctn, "nested_systemctl", lambda *_a, **_k: _done())
+    cleaned: list[str] = []
+    monkeypatch.setattr(
+        ctn.mounts,
+        "cleanup_container_mounts",
+        lambda _c, name: cleaned.append(name),
+    )
+
+    ctn.action_stop(config, "inner", False)
+
+    assert cleaned == ["inner"]

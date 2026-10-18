@@ -81,6 +81,74 @@ For anything else that must stay off the store, opt out per share:
 `snapshot` is a tartarus-only field; it is stripped before the shares are handed
 to `microvm.shares`.
 
+## Runtime-mount staging share
+
+`tartarus mount` attaches a host folder to an already-running guest. A VM cannot
+hot-plug a share (QEMU's `microvm` machine type has no hotplug), so every Linux
+VM gets one built-in, writable sharing channel at boot:
+
+| | |
+| --- | --- |
+| Tag | `tartarus-mounts` |
+| Host source | `<state_root>/<instance>/mounts` (override with `TARTARUS_MOUNT_ROOT`) |
+| Guest mount point | `/run/tartarus-mount/staging` |
+
+It is Linux-only: the CLI refuses runtime mounts on macOS/vfkit, and the share
+is not added there (an extra virtiofs device would consume one of vfkit's 26
+device slots). The host creates the source directory before build/start. The
+guest helper only ever mounts from `staging/<id>`; the host supplies an opaque
+id, never a source path.
+
+### Guest helper
+
+A root systemd service, `tartarus-mount`, listens on the Unix socket
+`/run/tartarus-mount/control.sock` (mode `0660`, owner root, group `users`).
+`RuntimeDirectory=tartarus-mount` with `RuntimeDirectoryPreserve=yes` keeps the
+socket and state across service restarts but not guest reboots.
+
+The protocol is one JSON request line and one JSON response line:
+
+```
+{"op":"mount","id":"a1b2c3d4","target":"/home/user/src","mode":"rw"}
+{"op":"umount","target":"/home/user/src"}
+{"op":"list"}
+```
+
+The helper checks `SO_PEERCRED` and accepts only root or the guest user,
+re-validates the target with the same rules as the host, and is idempotent: a
+repeat of the same id/target/mode succeeds, while mounting over a target it
+does not manage is refused. The id must match `[A-Za-z0-9_-]+`.
+
+Modes:
+
+- **rw** — bind `staging/<id>` at the target.
+- **ro** — bind, then remount read-only.
+- **overlay** — the lower is `staging/<id>` (already read-only on the host);
+  upper/work live under `/run/tartarus-mount/overlays/<id>`, with `userxattr`.
+  `/run` is tmpfs, so the writable layer is runtime-only and the host folder is
+  never written.
+
+### Containers
+
+Native containers need no share: the host source is bind-mounted directly into
+the container's mount namespace. Because the host source is not visible in that
+namespace, the host opens it in its own namespace, stages it through an
+inherited directory fd with `nsenter` at `/run/tartarus-mount/staging/<id>`,
+then binds that at the target. Unmounting happens inside the namespace, and the
+container's mounts vanish with it on stop.
+
+Containers with `privateUsers` (`"pick"`) get nspawn's `:idmap` semantics via
+`mount --map-users=0:0:65536 --map-groups=0:0:65536`, so host ownership stays
+visible. `--no-idmap` forces a plain bind. If the source filesystem rejects
+idmapped mounts, the host falls back to a plain bind and warns that ownership
+may appear as `nobody`/`nogroup`. Overlay upper/work live in the container's
+`/run` tmpfs, so they are runtime-only there too.
+
+These are build-time artifacts: an existing VM needs one rebuild/restart
+(`tartarus restart <name> -u`) before its first runtime mount. The namespace-fd
+and idmap details are the zeus-spike items; treat them as the intended design,
+not as separately verified here.
+
 ## ID-mapped container binds
 
 A `privateUsers` container gets its share (and CA) binds as id-mapped nspawn

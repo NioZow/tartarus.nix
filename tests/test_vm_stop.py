@@ -112,3 +112,50 @@ def test_stop_not_running_is_a_noop(monkeypatch, tmp_path):
     monkeypatch.setattr(vm.os, "kill", _boom)
 
     vm.action_stop(config, "vault", purge=False)
+
+
+# --- runtime-mount cleanup on stop ---------------------------------------
+
+
+def _kill_already_exited(_pid, sig):
+    if sig == 0:
+        raise ProcessLookupError
+
+
+def test_stop_cleans_vm_runtime_mounts(monkeypatch, tmp_path):
+    config = make_config(tmp_path)
+    _prepare_state(tmp_path, "vault", 999999)
+    _stub_action_stop(monkeypatch, timeout=False)
+    events: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        vm.mounts,
+        "cleanup_vm_mounts",
+        lambda _c, name: events.append(("cleanup", name)),
+    )
+    monkeypatch.setattr(vm.os, "kill", _kill_already_exited)
+    monkeypatch.setattr(vm.os, "killpg", lambda *_a, **_k: None)
+
+    vm.action_stop(config, "vault", purge=False)
+
+    assert events == [("cleanup", "vault")]
+
+
+def test_stop_cleans_before_purge_removes_state(monkeypatch, tmp_path):
+    config = make_config(tmp_path)
+    state = _prepare_state(tmp_path, "vault", 999999)
+    _stub_action_stop(monkeypatch, timeout=False)
+    events: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        vm.mounts,
+        "cleanup_vm_mounts",
+        lambda _c, name: events.append(("cleanup", name)),
+    )
+    monkeypatch.setattr(
+        vm.shutil, "rmtree", lambda path, **_k: events.append(("rmtree", str(path)))
+    )
+    monkeypatch.setattr(vm.os, "kill", _kill_already_exited)
+    monkeypatch.setattr(vm.os, "killpg", lambda *_a, **_k: None)
+
+    vm.action_stop(config, "vault", purge=True)
+
+    assert events == [("cleanup", "vault"), ("rmtree", str(state))]

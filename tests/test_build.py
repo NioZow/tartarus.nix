@@ -103,6 +103,7 @@ def test_build_runner_reuses_valid_result(monkeypatch, tmp_path):
     assert calls == []
     assert returned == result
     assert cid is None
+    assert (config.state_dir("vault") / "mounts").is_dir()
 
 
 def test_build_runner_upgrade_forces_build(monkeypatch, tmp_path):
@@ -202,6 +203,11 @@ def test_build_runner_records_mounts(monkeypatch, tmp_path):
     assert len(calls) == 1
     info = json.loads((config.state_dir("vault") / "build-info.json").read_text())
     assert info["mounts"] == ["/a:/a"]
+    assert (config.state_dir("vault") / "mounts").is_dir()
+    _args, kwargs = calls[0]
+    assert kwargs["env"]["TARTARUS_MOUNT_ROOT"] == str(
+        config.state_dir("vault") / "mounts"
+    )
 
 
 # --- cid persistence for numbered instances -------------------------------

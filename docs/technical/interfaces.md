@@ -85,6 +85,7 @@ invocation.
 | `CONTAINER_ID_OVERRIDE` | Same as `MICROVM_ID_OVERRIDE`, for containers. |
 | `TARTARUS_HOST_UID` | Invoking host uid (virtiofs ownership). |
 | `TARTARUS_SYSTEM` | Default guest system when `system` is not passed. |
+| `TARTARUS_MOUNT_ROOT` | Absolute host staging root for a VM instance's runtime mounts; defaults to `<home>/.local/state/tartarus/<name>/mounts`. |
 | `HOME` | Invoking host home (share sources, pubkey). |
 
 ## CLI contract
@@ -102,6 +103,9 @@ tartarus build <name> [-u|--upgrade] [--mount HOST:GUEST]
 tartarus spawn <template> [--name N] [-u|--upgrade]
 tartarus stop <name> [--purge] [-d|--debug]
 tartarus restart <name> [-u|--upgrade] [-d|--debug]
+tartarus mount <guest> HOST:GUEST [-r|--read-only|--overlay] [--no-idmap]
+tartarus unmount <guest> GUEST        # alias: umount
+tartarus mounts [guest] [--json]
 tartarus logs <name>
 tartarus ssh <name> [-s|--start] [-r|--retry N] [--retry-delay SECONDS]
 tartarus cid <name>          # MicroVM only
@@ -119,6 +123,22 @@ SYSTEM`, `--state-root PATH`, `--log/--no-log`.
 - Commands that name one guest infer its kind from `config.toml`.
 - `cid`/`proxy`/`proxy-ip` are MicroVM-only and error under `--container`.
 - Every named-guest command passes the enabled-guest guard before acting.
+- `mount`, `unmount`/`umount` and `mounts` are handled before
+  `flake.require_flake`: they need no user-flake evaluation, but named variants
+  still run the enabled-guest guard.
+
+Runtime mounts are recorded per guest in
+`<state_root>/<name>/runtime-mounts.json`, written atomically (temp file plus
+`os.replace`) and removed on unmount, stop, restart and `--purge`:
+
+| Key | Meaning |
+| --- | --- |
+| `id` | Opaque staging id (`[A-Za-z0-9_-]+`). |
+| `kind` | `"vm"` or `"container"`. |
+| `source` | Resolved host directory. |
+| `target` | Absolute guest mount point. |
+| `mode` | `"rw"`, `"ro"` or `"overlay"`. |
+| `stage` | Host staging dir (VM) or container-side `/run/tartarus-mount/staging/<id>`. |
 
 ## Invariants and assertions
 

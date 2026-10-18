@@ -184,7 +184,16 @@
           })
         (filter (s: sharePolicy.isOverlayShare s || !(sharePolicy.needsStoreSnapshot p s)) (inner.cfg.shares or []))
     ) (g.innerContainers or [])
-    ++ extraShares;
+    ++ extraShares
+    # Runtime-mount staging area. Linux-only: macOS/vfkit has no runtime mounts
+    # and the extra device would eat one of vfkit's 26 virtiofs slots. Writable
+    # by design -- the guest helper bind-mounts from this dedicated directory.
+    ++ optional (g.isVm && !p.isDarwin) {
+      tag = "tartarus-mounts";
+      source = g.mountRoot;
+      mountPoint = "/run/tartarus-mount/staging";
+      proto = "virtiofs";
+    };
 
   isWritableNinePShare = s: (s.proto or p.shareProto) == "9p" && !(s.readOnly or false);
 
