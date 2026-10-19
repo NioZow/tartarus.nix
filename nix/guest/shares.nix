@@ -59,17 +59,19 @@
   # overlay at `mountPoint` inside the guest.
   overlayAppShares = filter sharePolicy.isOverlayShare appShareRecords;
   normalAppShares = filter (s: !(sharePolicy.isOverlayShare s)) appShareRecords;
-  overlayLowerShares = map (s: {
-    tag = s.tag;
-    source = s.source;
-    mountPoint = sharePolicy.overlayLowerDir s;
-    proto = normalizeProto s;
-    # Forced, regardless of the user's `readOnly`: the host directory is only
-    # ever the overlay lower. Never snapshot it (not needed on Linux, and on
-    # Darwin overlay shares are rejected at evaluation).
-    readOnly = true;
-    snapshot = false;
-  }) overlayAppShares;
+  overlayLowerShares =
+    map (s: {
+      tag = s.tag;
+      source = s.source;
+      mountPoint = sharePolicy.overlayLowerDir s;
+      proto = normalizeProto s;
+      # Forced, regardless of the user's `readOnly`: the host directory is only
+      # ever the overlay lower. Never snapshot it (not needed on Linux, and on
+      # Darwin overlay shares are rejected at evaluation).
+      readOnly = true;
+      snapshot = false;
+    })
+    overlayAppShares;
   appShares = normalAppShares ++ overlayLowerShares;
   extraShares = map (s: s // {proto = normalizeProto s;}) g.extraShares;
 
@@ -217,11 +219,27 @@
     )
     (map (
         s:
-          if isWritableNinePShare s
-          then s // {securityModel = s.securityModel or "mapped";}
+        # agenix's ramfs has no POSIX ACL xattrs; advertising them makes
+        # every guest access fail with EOPNOTSUPP. See ../lib/shares.nix.
+        # It also cannot back `--inode-file-handles`: virtiofsd would reopen
+        # the (group-restricted) ramfs mount point for reading, which fails
+        # for an unprivileged virtiofsd. Use plain O_PATH fds instead.
+          if sharePolicy.needsNoPosixAcl s
+          then
+            s
+            // {
+              posixAcl = false;
+              extraArgs = (s.extraArgs or []) ++ ["--inode-file-handles=never"];
+            }
           else s
       )
-      rawShares)
+      (map (
+          s:
+            if isWritableNinePShare s
+            then s // {securityModel = s.securityModel or "mapped";}
+            else s
+        )
+        rawShares))
   );
 
   writableShareMountPoints = map (s: s.mountPoint) (filter isWritableNinePShare shares);

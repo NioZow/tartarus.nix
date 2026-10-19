@@ -70,7 +70,8 @@ in rec {
   overlayMountConflict = userHome: s: let
     paths = overlayPaths userHome s;
   in
-    s.mountPoint == "/"
+    s.mountPoint
+    == "/"
     || s.mountPoint == userHome
     || s.mountPoint == paths.lower
     || hasPrefix "${s.mountPoint}/" paths.lower
@@ -78,6 +79,21 @@ in rec {
     || hasPrefix "${s.mountPoint}/" paths.upper
     || s.mountPoint == paths.work
     || hasPrefix "${s.mountPoint}/" paths.work;
+
+  # agenix mounts its secrets on a ramfs, which has no POSIX ACL xattr
+  # support. With virtiofsd's `--posix-acl`, the guest negotiates
+  # FUSE_POSIX_ACL and asks for `system.posix_acl_access`; ramfs answers
+  # EOPNOTSUPP, and the guest VFS propagates that out of its permission check,
+  # so every access to the share fails with "Operation not supported". Such a
+  # share must not advertise ACL/xattr passthrough.
+  needsNoPosixAcl = share: let
+    source = toString share.source;
+  in
+    source
+    == "/run/agenix"
+    || hasPrefix "/run/agenix/" source
+    || source == "/run/agenix.d"
+    || hasPrefix "/run/agenix.d/" source;
 
   # Whether a share must be re-sourced from a read-only store snapshot. Only
   # macOS/vfkit needs it (Linux enforces `readOnly` at the hypervisor), and the

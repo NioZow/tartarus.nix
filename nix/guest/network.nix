@@ -17,6 +17,18 @@ in {
   services.resolved.enable = false;
   networking.nameservers = [p.gateway];
   networking.search = ["trs"];
+
+  # Every guest reaches the *physical host* through the stable `host` alias
+  # (and `host.trs`, matching the internal suffix). This is the address where
+  # host-side relays live: the bridge gateway for a VM or native container,
+  # the vmnet gateway on Darwin, and -- from inside a nested container -- the
+  # container-host VM's upstream gateway, since the container's own gateway
+  # (`10.202.0.1`) only NATs outward. Use `host:<relay port>` to reach a guest
+  # port that its `relays` declaration exposes.
+  networking.hosts = {
+    ${p.hostGateway} = ["host" "host.trs"];
+  };
+
   # The host (or, on Darwin, vmnet) enforces egress; the in-guest NixOS
   # firewall stays off.
   networking.firewall.enable = false;

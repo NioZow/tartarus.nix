@@ -141,6 +141,14 @@ guest is down. Nothing is rebuilt or restarted, and the mounts are runtime-only.
 
 ## Networking
 
+Every guest's `/etc/hosts` maps `host` and `host.trs` to the physical host
+(`tartarusGuest.platform.hostGateway`): the bridge gateway for a VM or native
+container, the vmnet gateway on Darwin, and — from inside a nested container —
+the container-host VM's upstream gateway, since the container's own gateway
+only NATs outward. A guest port declared in `relays` is therefore reachable as
+`host:<port>` from every guest, in addition to the host-local and
+bridge-gateway paths described below.
+
 ### Linux
 
 - Two static bridges: `trs0` for VMs (`10.200.0.0/24`, host `10.200.0.1`) and

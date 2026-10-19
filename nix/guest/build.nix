@@ -382,7 +382,12 @@
             --thread-pool-size ${toString config.microvm.virtiofsd.threadPoolSize} \
             ${lib.optionalString share.posixAcl "--posix-acl --xattr"} \
             --cache=${share.cache} \
-            ${lib.optionalString (config.microvm.virtiofsd.inodeFileHandles != null) "--inode-file-handles=${config.microvm.virtiofsd.inodeFileHandles}"} \
+            ${lib.optionalString (
+              config.microvm.virtiofsd.inodeFileHandles
+              != null
+              && !(lib.any (arg: lib.hasPrefix "--inode-file-handles" arg) share.extraArgs)
+            )
+            "--inode-file-handles=${config.microvm.virtiofsd.inodeFileHandles}"} \
             --sandbox none \
             ${lib.optionalString share.readOnly "--readonly"} \
             ${lib.concatStringsSep " " config.microvm.virtiofsd.extraArgs} \

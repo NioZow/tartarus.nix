@@ -996,6 +996,13 @@ in {
           name = "ssh-agent-proxy";
           description = "SSH agent proxy via its configured listeners";
           command = "${package}/bin/ssh-agent-proxy --config ${serverConfigPath}${optionalString server.debug " --debug"}";
+          # `auth = "ask"` rules raise a zenity/swiftDialog prompt, so the unit
+          # must start inside the approver's graphical session to inherit the
+          # compositor's DISPLAY/WAYLAND_DISPLAY (imported into the systemd user
+          # manager after default.target). Darwin ignores these Linux-only keys.
+          after = ["graphical-session.target"];
+          partOf = ["graphical-session.target"];
+          wantedBy = ["graphical-session.target"];
           environment = optionalAttrs (server.settings.agent_sockets == null) {
             SSH_AUTH_SOCK = "%t/ssh-agent";
           };

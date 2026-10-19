@@ -135,7 +135,11 @@ network is visible to the macOS host.
   `socat` relay** on the DNS path; the proxy keeps its existing host relay
   (`nix/host/relay.nix`), which lands on the same DNAT.
 - **Names.** The VM's `/etc/hosts` maps each inner address to `<name>` and
-  `<name>.trs`, which is what the ProxyJump resolves on the jump host.
+  `<name>.trs`, which is what the ProxyJump resolves on the jump host. Every
+  inner container also gets `host`/`host.trs` pointing at the physical host
+  (`platform.hostGateway`, i.e. the VM's upstream gateway), so a relayed guest
+  port is reachable as `host:<port>` from inside the container even though its
+  own gateway is the VM-local bridge.
 
 ## 5. Identity, CA and SSH
 

@@ -1093,6 +1093,16 @@
         name = instance.name;
         description = "sudo authentication proxy server (${concatStringsSep "," (map (t: t.type) instance.server.listeners)})";
         command = "${package}/bin/sudo-auth-proxy --config ${instance.configPath}";
+        # The server needs the approver's GUI: zenity/swiftDialog must inherit
+        # the compositor's DISPLAY/WAYLAND_DISPLAY, which UWSM imports into the
+        # systemd user manager only after default.target. A default.target unit
+        # therefore starts too early and every prompt fails with "Failed to open
+        # display"; ordering it into the graphical session fixes that. Darwin
+        # ignores these Linux-only keys (launchd agents already run in the GUI
+        # session).
+        after = ["graphical-session.target"];
+        partOf = ["graphical-session.target"];
+        wantedBy = ["graphical-session.target"];
         # Its own runtime dir, matching the `sudo-auth-proxy-<name>` unit; the
         # Python re-creates/chmods it regardless (doc §9.1).
         extraSystemdServiceConfig = {
@@ -1162,6 +1172,16 @@
         name = "sudo-auth-proxy";
         description = "sudo authentication proxy server (${concatStringsSep "," (map (t: t.type) server.listeners)})";
         command = "${package}/bin/sudo-auth-proxy --config ${configPath}";
+        # The server needs the approver's GUI: zenity/swiftDialog must inherit
+        # the compositor's DISPLAY/WAYLAND_DISPLAY, which UWSM imports into the
+        # systemd user manager only after default.target. A default.target unit
+        # therefore starts too early and every prompt fails with "Failed to open
+        # display"; ordering it into the graphical session fixes that. Darwin
+        # ignores these Linux-only keys (launchd agents already run in the GUI
+        # session).
+        after = ["graphical-session.target"];
+        partOf = ["graphical-session.target"];
+        wantedBy = ["graphical-session.target"];
         # The server binds `%t/sudo-auth-proxy/server.sock`, so the per-user
         # runtime directory must be `0700` and owned by the server user (doc
         # §9.1). systemd creates and owns it for the user unit; on macOS

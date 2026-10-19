@@ -165,6 +165,6 @@ in {
   config = mkIf (cfg.enable && hasGuests) (mkService {
     name = "tartarus-ca-known-hosts";
     description = "Update tartarus (MicroVM/container) CA known_hosts for ${username}";
-    command = "${script}/bin/tartarus-ca-known-hosts";
+    command = "${script}";
   });
 }

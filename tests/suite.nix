@@ -1985,6 +1985,7 @@
       kind = "vm";
       id = 7;
       internet = true;
+      services.sshAgentProxy = true;
       shares = [
         {
           tag = "modern";
@@ -1996,6 +1997,13 @@
           source = "/host/legacy";
           mountPoint = "/home/user/legacy";
           proto = "9p";
+        }
+        {
+          tag = "secrets";
+          source = "/run/agenix/tartarus-dev";
+          mountPoint = "/etc/tartarus-secrets";
+          proto = "virtiofs";
+          readOnly = true;
         }
       ];
     };
@@ -2498,6 +2506,12 @@ in {
       T
       (!sharePolicy.needsStoreSnapshot darwin (vmReadOnlyShare // {source = "/nix/store";}))
       "the Nix store was copied into itself";
+    "shares/agenix-needs-no-posix-acl" =
+      T
+      (sharePolicy.needsNoPosixAcl {source = "/run/agenix/tartarus-dev";}
+        && sharePolicy.needsNoPosixAcl {source = "/run/agenix.d/3/tartarus-dev";}
+        && !(sharePolicy.needsNoPosixAcl {source = "/home/user/.config/zsh";}))
+      "agenix ramfs source not flagged for disabling POSIX ACLs";
 
     "shares/proto-defaults-to-virtiofs" =
       T
@@ -2516,6 +2530,21 @@ in {
         && legacy.proto == "9p"
         && legacy.securityModel == "mapped")
       "share transport did not default to virtiofs / honour the Linux 9p opt-in";
+
+    "shares/agenix-disables-posix-acl" =
+      T
+      (let
+        byTag = tag: lib.findFirst (s: s.tag == tag) null protoVm.config.microvm.shares;
+        secrets = byTag "secrets";
+        modern = byTag "modern";
+      in
+        secrets
+        != null
+        && secrets.posixAcl == false
+        && secrets.extraArgs == ["--inode-file-handles=never"]
+        && modern.posixAcl == true
+        && modern.extraArgs == [])
+      "the agenix share did not disable virtiofsd POSIX ACLs / file handles";
 
     # ---- runtime-mounts staging share -----------------------------------
     "mounts/linux-vm-share" =
@@ -2604,6 +2633,12 @@ in {
         then !result.value
         else true)
       "a container was given the runtime-mount helper service";
+
+    "agent/headless-starts-with-user-manager" =
+      T
+      (protoVm.config.home-manager.users.user.systemd.user.services.ssh-agent-proxy.Install.WantedBy
+        == ["default.target"])
+      "the ssh-agent proxy was not moved to default.target in a headless guest";
 
     # ---- overlay shares -------------------------------------------------
     "shares/overlay-vm-lower" =
@@ -2889,6 +2924,26 @@ in {
         && dnsNativeCtn.config.networking.defaultGateway.interface == "eth0")
       "a native container did not get a default route via its host bridge";
 
+    # Every guest gets a stable `host`/`host.trs` alias for the physical host,
+    # where `relays` are exposed. A native container reaches its bridge gateway;
+    # a nested container reaches the container-host VM's upstream gateway (its
+    # own gateway only NATs outward); a Darwin VM reaches the vmnet gateway.
+    "guest-network/host-alias-native-container" =
+      T
+      (dnsNativeCtn.config.networking.hosts."10.201.0.1" == ["host" "host.trs"])
+      "a native container's `host` alias is missing or points elsewhere";
+
+    "guest-network/host-alias-nested-container" =
+      T
+      (chInner.config.networking.hosts."10.200.0.1" == ["host" "host.trs"])
+      "a nested container's `host` alias is not the physical host gateway";
+
+    "guest-network/host-alias-darwin-vm" =
+      T
+      (fwDarwinGuests.nixosConfigurations."vm-svc".config.networking.hosts."192.168.64.1"
+        == ["host" "host.trs"])
+      "a Darwin VM's `host` alias is not the vmnet gateway";
+
     # Passwordless container sudo: a scoped NOPASSWD rule for `systemctl <verb>
     # container@*` is emitted (and only that command).
     "host-containers/sudo-no-password" =
@@ -2986,7 +3041,8 @@ in {
     # native-vs-nested per host.
     "host-containers/containerhost-default-resolves" =
       T
-      (hostCtnHostDefault.config.tartarus.instances.guests.inner.host == "ch"
+      (hostCtnHostDefault.config.tartarus.instances.guests.inner.host
+        == "ch"
         && !(lib.elem "inner" hostCtnHostDefault.config.tartarus.instances.container.hostSideNames)
         && lib.elem "inner" hostCtnHostDefault.config.tartarus.instances.container.enabledNames)
       "the host-wide containerHost default did not nest a host-less container";
@@ -3706,7 +3762,12 @@ in {
           server = {
             enable = true;
             settings.agent_sockets = ["/tmp/agent-a"];
-            listeners = [{type = "vsock"; scanAgentSocketDirs = true;}];
+            listeners = [
+              {
+                type = "vsock";
+                scanAgentSocketDirs = true;
+              }
+            ];
           };
         };
       })))

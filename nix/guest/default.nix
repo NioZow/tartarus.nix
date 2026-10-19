@@ -94,7 +94,10 @@ in {
         enable = true;
         # `unix` is the host→guest SSH RemoteForward path; vsock/tcp keep the
         # platform's callback transport (doc §3; audit A1).
-        transport = if sapUnix then "unix" else connection.transport;
+        transport =
+          if sapUnix
+          then "unix"
+          else connection.transport;
         host = connection.host;
         cid = connection.cid;
         port = 65001;
@@ -121,9 +124,18 @@ in {
         # server identity with its own `acl` (`trustedFingerprints`/
         # `trustedNames`) to refuse a fake server.
         security = {
-          transportEncryption = if sapUnix then "mtls" else "none";
-          serverAuth = if sapUnix then "transport" else "none";
-          clientAuth = if sapUnix then "transport" else "none";
+          transportEncryption =
+            if sapUnix
+            then "mtls"
+            else "none";
+          serverAuth =
+            if sapUnix
+            then "transport"
+            else "none";
+          clientAuth =
+            if sapUnix
+            then "transport"
+            else "none";
         };
         # mTLS material for the `unix` path only; under `none` the block is not
         # emitted at all (`transport_encryption != "mtls"`), so the guest
@@ -165,26 +177,41 @@ in {
                 upstream = [
                   # Local agent first: it is the default `key.socket` and the
                   # `ssh-add`/`ssh-add -d` target.
-                  {transport = "unix"; socket = "%t/ssh-agent";}
+                  {
+                    transport = "unix";
+                    socket = "%t/ssh-agent";
+                  }
                   ({
-                    name = "host";
-                    transport = if sshUnix then "unix" else connection.transport;
-                    port = 65000;
-                    security = {
-                      transport_encryption = if sshUnix then "mtls" else "none";
-                      server_auth = if sshUnix then "transport" else "none";
-                      client_auth = if sshUnix then "transport" else "none";
-                    };
-                  }
-                  // optionalAttrs (!sshUnix) {
-                    host = connection.host;
-                    cid = connection.cid;
-                  }
-                  // optionalAttrs sshUnix {
-                    # The `unix` transport omits `socket`: the proxy reads the
-                    # per-session `$SSH_AUTH_PROXY_SOCK` at connect time.
-                    mtls = clientMtls "1.3.6.1.4.1.99999.2.2" "1.3.6.1.4.1.99999.2.1";
-                  })
+                      name = "host";
+                      transport =
+                        if sshUnix
+                        then "unix"
+                        else connection.transport;
+                      port = 65000;
+                      security = {
+                        transport_encryption =
+                          if sshUnix
+                          then "mtls"
+                          else "none";
+                        server_auth =
+                          if sshUnix
+                          then "transport"
+                          else "none";
+                        client_auth =
+                          if sshUnix
+                          then "transport"
+                          else "none";
+                      };
+                    }
+                    // optionalAttrs (!sshUnix) {
+                      host = connection.host;
+                      cid = connection.cid;
+                    }
+                    // optionalAttrs sshUnix {
+                      # The `unix` transport omits `socket`: the proxy reads the
+                      # per-session `$SSH_AUTH_PROXY_SOCK` at connect time.
+                      mtls = clientMtls "1.3.6.1.4.1.99999.2.2" "1.3.6.1.4.1.99999.2.1";
+                    })
                 ];
                 rule = [
                   {
@@ -213,6 +240,21 @@ in {
                 }
               ];
             };
+          };
+        })
+
+        # The shared module installs the proxy into
+        # `graphical-session.target` so an `auth = "ask"` prompt inherits the
+        # session's DISPLAY. A headless guest never reaches that target, so
+        # the proxy would stay inactive and SSH_AUTH_SOCK would point at a
+        # dead socket. Start it with the user manager there instead. Darwin
+        # keeps the graphical ordering (its launchd agent has no systemd
+        # targets to override).
+        (mkIf (services.sshAgentProxy && !p.isDarwin && !g.graphical) {
+          systemd.user.services.ssh-agent-proxy = {
+            Install.WantedBy = lib.mkForce ["default.target"];
+            Unit.After = lib.mkForce [];
+            Unit.PartOf = lib.mkForce [];
           };
         })
 

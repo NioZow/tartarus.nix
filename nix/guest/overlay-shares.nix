@@ -109,8 +109,8 @@ in {
       })
       shares);
 
-  config = mkIf (shares != []) (mkMerge [
-    {
+  config = mkMerge [
+    (mkIf (shares != []) {
       fileSystems = lib.listToAttrs (map (s: let
         paths = pathsFor s;
       in {
@@ -127,20 +127,20 @@ in {
             "userxattr"
             "x-systemd.requires=${prepareService s}.service"
             "x-systemd.after=${prepareService s}.service"
-          ]
+          ];
           # A VM exports the lower as its own mount; order this mount after it.
           # A container's lower is an nspawn bind mount (performed before init),
           # so there is no mount unit to order against.
           depends = optionals g.isVm [paths.lower];
         };
       }) shares);
-    }
+    })
 
     {
       systemd.tmpfiles.rules =
         map (d: "d ${d} 0755 ${g.user.name} users -") mountParents;
     }
-  ]);
 
-  assertions = overlayAssertions;
+    {assertions = overlayAssertions;}
+  ];
 }

@@ -64,7 +64,7 @@ Host-wide defaults for `kind = "container"` guests.
 | `apps` | list | `[]` | Host `.desktop` launchers for apps running in the guest. |
 | `autostart` | bool | `false` | Start on login via a tartarus user service. |
 | `requires` | list | `[]` | Names of other enabled guests started before this one. Must be acyclic. |
-| `relays` | list | `[]` | Host port forwards into this guest (`{ port; targetPort; protocol; host; }`). Darwin-only effect; on Linux the host firewall DNATs instead. |
+| `relays` | list | `[]` | Host port forwards into this guest (`{ port; targetPort; protocol; host; }`). Every guest can reach the relay as `host:<port>` (the `host` alias is in its `/etc/hosts`); on Linux the host firewall DNATs the port, on Darwin a `socat` relay binds the gateway. |
 | `services.clipboardBridge` | bool | `false` | Clipboard bridge (guest client + host server, mTLS). |
 | `services.sshAgentProxy` | bool | `false` | Forward the host ssh-agent into the guest. |
 | `services.sudoAuthProxy` | bool | `false` | PAM sudo authentication proxy. |
