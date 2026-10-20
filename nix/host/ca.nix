@@ -88,6 +88,12 @@
     subnets = instances.enabledSubnets;
     knownHostsFile = "${homeDir}/.ssh/known_hosts_trs";
   });
+
+  service = mkService {
+    name = "tartarus-ca-known-hosts";
+    description = "Update tartarus (MicroVM/container) CA known_hosts for ${username}";
+    command = "${script}";
+  };
 in {
   options.tartarus.ca = {
     enable = lib.mkEnableOption "the shared per-host tartarus SSH + X509 CA" // {default = true;};
@@ -162,9 +168,16 @@ in {
     };
   };
 
-  config = mkIf (cfg.enable && hasGuests) (mkService {
-    name = "tartarus-ca-known-hosts";
-    description = "Update tartarus (MicroVM/container) CA known_hosts for ${username}";
-    command = "${script}";
-  });
+  config = mkIf (cfg.enable && hasGuests) (
+    if service ? launchd.agents
+    then {
+      # nix-service renders Darwin user scope as `launchd.agents`, which
+      # nix-darwin installs in `/Library/LaunchAgents` and loads as root. macOS
+      # then warns "Expecting a LaunchDaemons path..." and fails the unload with
+      # EIO. `launchd.user.agents` installs in `~/Library/LaunchAgents` and is
+      # loaded in the primary user's session (`launchctl asuser`).
+      launchd.user.agents = service.launchd.agents;
+    }
+    else service
+  );
 }

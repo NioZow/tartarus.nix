@@ -58,7 +58,14 @@ in {
   config =
     if isDarwin
     then {
-      launchd.agents = mkMerge (map (g: (mkService (serviceFor g)).launchd.agents) enabled);
+      # `launchd.user.agents` (not `launchd.agents`): nix-service renders
+      # Darwin user scope as `launchd.agents`, which nix-darwin installs in
+      # `/Library/LaunchAgents` and loads as root. macOS then warns
+      # "Expecting a LaunchDaemons path..." and fails the unload with EIO, and
+      # the agent ends up in the root domain. `launchd.user.agents` installs in
+      # `~/Library/LaunchAgents` and the activation loads it in the primary
+      # user's session (`launchctl asuser`), which is where these belong.
+      launchd.user.agents = mkMerge (map (g: (mkService (serviceFor g)).launchd.agents) enabled);
     }
     else {
       systemd.user.services = mkMerge (map (g: (mkService (serviceFor g)).systemd.user.services) enabled);

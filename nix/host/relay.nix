@@ -147,7 +147,13 @@ in {
   config =
     if isDarwin
     then {
-      launchd.agents = mkMerge (map (r: (mkRelayService r).launchd.agents) userRelays);
+      # `launchd.user.agents` (not `launchd.agents`): nix-service renders
+      # Darwin user scope as `launchd.agents`, which nix-darwin installs in
+      # `/Library/LaunchAgents` and loads as root. macOS then warns
+      # "Expecting a LaunchDaemons path..." and fails the unload with EIO, and
+      # the relay ends up in the root domain. `launchd.user.agents` installs in
+      # `~/Library/LaunchAgents` and runs in the primary user's session.
+      launchd.user.agents = mkMerge (map (r: (mkRelayService r).launchd.agents) userRelays);
       launchd.daemons = mkMerge (map (r: (mkRelayService r).launchd.daemons) systemRelays);
     }
     else {};
