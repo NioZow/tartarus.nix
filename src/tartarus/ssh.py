@@ -34,7 +34,6 @@ SSH_CONNECTION_ERROR = 255
 
 KNOWN_HOSTS_TRS_NAME = "known_hosts_trs"
 USER_SSH_KEY_NAME = "tartarus"
-CONTAINER_SSH_KEY_NAME = "containers"
 
 # Linux only: a freshly started MicroVM needs a moment to bring up its
 # interface; until then the host ARP table has no entry for its MAC. Poll
@@ -47,10 +46,6 @@ ARP_POLL_INTERVAL = 0.5
 
 def user_ssh_key(config: Config) -> Path:
     return config.ssh_dir / USER_SSH_KEY_NAME
-
-
-def container_ssh_key(config: Config) -> Path:
-    return config.ssh_dir / CONTAINER_SSH_KEY_NAME
 
 
 def known_hosts_trs(config: Config) -> Path:
@@ -82,19 +77,15 @@ def _ensure_client_key(config: Config, key: Path, comment: str, label: str) -> N
 
 
 def ensure_user_ssh_key(config: Config) -> None:
-    """Generate the shared client keys if missing.
+    """Generate the shared client key if missing.
 
-    MicroVMs authenticate with ``~/.ssh/tartarus``; containers authenticate
-    with ``~/.ssh/containers``. The matching public keys are baked into guest
-    builds (``base.nix`` picks ``containers.pub`` for ``kind = "container"``),
-    so both must exist before a guest is built.
+    Every guest kind (MicroVM, native container, nested container)
+    authenticates with ``~/.ssh/tartarus``. The matching public key is baked
+    into guest builds (``base.nix``), so it must exist before a guest is built.
     """
     host = socket.gethostname()
     _ensure_client_key(
-        config, user_ssh_key(config), f"microvm-{config.user}@{host}", "MicroVM"
-    )
-    _ensure_client_key(
-        config, container_ssh_key(config), f"container-{config.user}@{host}", "container"
+        config, user_ssh_key(config), f"tartarus-{config.user}@{host}", "tartarus"
     )
 
 

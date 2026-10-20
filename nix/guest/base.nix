@@ -43,10 +43,11 @@
     tic -x -o $out/share/terminfo combined.src
   '';
 
-  pubKeyFile =
-    if g.isVm
-    then "${g.hostHome}/.ssh/tartarus.pub"
-    else "${g.hostHome}/.ssh/containers.pub";
+  # Every guest kind authenticates with the same shared client key. Using a
+  # single key keeps `tartarus ssh`, the consumer's ssh_config and the guest's
+  # baked-in authorized_keys in sync no matter how the guest is reached (direct,
+  # VSOCK, or ProxyJump through a container-host VM).
+  pubKeyFile = "${g.hostHome}/.ssh/tartarus.pub";
 
   # The host key reaches both VMs (over a virtiofs share) and nspawn
   # containers (bind-mounted at /etc/tartarus/ssh) owned by the host user, not

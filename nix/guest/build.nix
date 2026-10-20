@@ -42,7 +42,7 @@
   # The host user's home, for the client pubkey and VM share sources. Taken from
   # the caller's `homeDir` rather than the ambient `$HOME`: a native container is
   # built inside `nixos-rebuild`, which runs as root, so `$HOME` is `/root` and
-  # the guest would bake `/root/.ssh/containers.pub` (missing) into its
+  # the guest would bake `/root/.ssh/tartarus.pub` (missing) into its
   # authorized_keys. `mkGuests` already resolves `homeDir` from `$HOME` for the
   # standalone/ad-hoc path, so that behaviour is unchanged.
   hostHome = homeDir;

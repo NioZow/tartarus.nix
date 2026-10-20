@@ -450,9 +450,9 @@ def _ensure_build_certs(config: Config, base: str) -> None:
 
     The VM's own host key/client cert plus, for a container-host VM, every
     nested container's (``container-host.nix`` bind-mounts those). All must
-    exist before ``_build_runner`` so ``base.nix`` can read the client public
-    key -- ``~/.ssh/tartarus.pub`` for VMs, ``~/.ssh/containers.pub`` for
-    containers -- and so the shares have a source. ``base`` (not the numbered
+    exist before ``_build_runner`` so ``base.nix`` can read the shared client
+    public key -- ``~/.ssh/tartarus.pub`` for every guest kind -- and so the
+    shares have a source. ``base`` (not the numbered
     instance name) is the template either way.
     """
     ca.ensure_vm_certs(config, base)
