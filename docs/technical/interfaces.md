@@ -20,6 +20,8 @@ Current flake (`nix/default.nix`), per system in `x86_64-linux`,
 | Output | Contents |
 | --- | --- |
 | `lib.mkGuests` | The build contract (below). |
+| `lib.sshConfig` | `{ mkBlock, mkFile }` OpenSSH config renderer used by `tartarus-ssh` and reusable by consumers. |
+| `lib.sshForwardWrapper` | `{ mkHostCase, mkForwardWrapper }` `RemoteForward`/`SetEnv` SSH wrapper builder used by the proxy integrations. |
 | `nixosModules.tartarus` | The host module (options, firewall, proxy, CA, launcher). |
 | `nixosModules."sudo-auth-proxy"` | PAM client module (same as `...-pam`). |
 | `nixosModules."sudo-auth-proxy-pam"` | Explicit alias for the PAM client. |
@@ -28,10 +30,32 @@ Current flake (`nix/default.nix`), per system in `x86_64-linux`,
 | `homeManagerModules."sudo-auth-proxy"` | Server module. |
 | `homeManagerModules."ssh-agent-proxy"` | Server/bridge/agent module. |
 | `homeManagerModules."clipboard-bridge"` | Server/client/adminClient module. |
+| `homeManagerModules."tartarus-ssh"` | Guest SSH client config (`tartarus.ssh.client.*`). |
 | `packages.<system>` | `tartarus`, `sudo-auth-proxy`, `ssh-agent-proxy`, `clipboard-bridge`, `tartarus-certs`. |
 | `apps.<system>."tartarus-certs"` | Runnable certificate tool. |
 | `checks.<system>` | The eval-level suite plus the sudo-auth-proxy TOML-shape check. |
 | `devShells.<system>.default` | `uv` + Python for the CLI. |
+
+## `lib.sshConfig`
+
+The shared OpenSSH config renderer (`nix/lib/ssh-config.nix`):
+
+- `mkBlock host attrs` renders a `Host <host>` block, mapping booleans to
+  `yes`/`no` and lists to repeated directives.
+- `mkFile header blocks` joins blocks under a managed-by header.
+
+`tartarus-ssh` uses it for `~/.ssh/config.d/tartarus`; consumers can use it for
+their own static host files (nixcfg renders `hosts`, `olympus`, `pwncollege`
+and `synacktiv` this way).
+
+## `lib.sshForwardWrapper`
+
+`mkForwardWrapper pkgs name opts` builds the wrapper installed as
+`sudo-auth-proxy-ssh` / `ssh-agent-proxy-ssh` (and optionally as `ssh` when
+`shadowSsh = true`). It resolves the destination with `ssh -G`, adds an
+unpredictable per-session token to the guest socket, and execs the real ssh
+with `RemoteForward` + `SetEnv`. `opts` carries `hosts`, `hostSocket`,
+`remoteSocket` and `envVar`.
 
 ## `lib.mkGuests`
 

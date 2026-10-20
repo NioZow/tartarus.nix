@@ -269,6 +269,10 @@
       type = lib.types.attrsOf lib.types.unspecified;
       default = {};
     };
+    options.launchd.user.agents = lib.mkOption {
+      type = lib.types.attrsOf lib.types.unspecified;
+      default = {};
+    };
   };
   mkDarwinHostWith = {
     guests ? {},
@@ -418,7 +422,7 @@
   };
   darwinNestedRelayArgs =
     concatStringsSep " "
-    hostDarwinNestedRelay.config.launchd.agents."tartarus-relay-inner-tcp-8080".serviceConfig.ProgramArguments;
+    hostDarwinNestedRelay.config.launchd.user.agents."tartarus-relay-inner-tcp-8080".serviceConfig.ProgramArguments;
 
   hostBadInternetProxy = mkHost {
     proxy = fullProxy;
@@ -3391,12 +3395,14 @@ in {
     "relay/darwin-tcp-privileged" =
       T (hostDarwinRelays.config.launchd.daemons ? "tartarus-relay-x-tcp-53") "privileged TCP relay is not a root launch daemon";
     "relay/darwin-user-agent" =
-      T (hostDarwinRelays.config.launchd.agents ? "tartarus-relay-x-tcp-3128") "non-privileged relay is not a user launch agent";
+      T (hostDarwinRelays.config.launchd.user.agents ? "tartarus-relay-x-tcp-3128") "non-privileged relay is not a user launch agent";
+    "relay/darwin-not-system-agent" =
+      T (!(hostDarwinRelays.config.launchd.agents ? "tartarus-relay-x-tcp-3128")) "non-privileged relay was emitted as a system-wide (/Library/LaunchAgents) agent";
     "relay/darwin-proxy-auto" =
-      T (hostDarwinGuestProxyOk.config.launchd.agents ? "tartarus-relay-proxyvm-tcp-3128") "the guest-hosted proxy relay was not generated automatically";
+      T (hostDarwinGuestProxyOk.config.launchd.user.agents ? "tartarus-relay-proxyvm-tcp-3128") "the guest-hosted proxy relay was not generated automatically";
     "relay/darwin-nested-targets-host-vm" =
       T
-      (hostDarwinNestedRelay.config.launchd.agents ? "tartarus-relay-inner-tcp-8080"
+      (hostDarwinNestedRelay.config.launchd.user.agents ? "tartarus-relay-inner-tcp-8080"
         && hasInfix "TCP4-LISTEN:8080,bind=192.168.64.1,reuseaddr,fork TCP4:192.168.64.47:8080" darwinNestedRelayArgs)
       "a nested container's relay did not target its container-host VM";
 
@@ -3703,6 +3709,72 @@ in {
       T
       (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {tartarus.ssh-agent-proxy.enable = true;}))
       "ssh-agent-proxy home-manager module does not evaluate standalone";
+
+    "standalone/hm-tartarus-ssh" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."tartarus-ssh" {
+        tartarus.ssh.client.enable = true;
+      }))
+      "tartarus-ssh home-manager module does not evaluate standalone";
+
+    # The client fragment is self-contained and pulled in through
+    # `programs.ssh.includes`, so enabling one option is enough.
+    "tartarus-ssh/config-fragment" = let
+      hm = mkStandaloneHm self.homeManagerModules."tartarus-ssh" {
+        tartarus.ssh.client = {
+          enable = true;
+          containerJumps = [
+            {
+              name = "jelly";
+              id = 7;
+              via = "ch.trs";
+            }
+          ];
+        };
+      };
+      fragment = hm.config.home.file.".ssh/config.d/tartarus".text;
+    in
+      T
+      (
+        hm.config.programs.ssh.includes
+        == ["~/.ssh/config.d/tartarus"]
+        && hasInfix "Host jelly" fragment
+        && hasInfix "IdentityFile ~/.ssh/tartarus" fragment
+        && hasInfix "ProxyJump ch.trs" fragment
+      )
+      "tartarus-ssh did not generate the separate config fragment/include";
+
+    # The renderer is a public output so consumers can reuse it for their own
+    # static SSH host files instead of carrying their own copy.
+    "lib/ssh-config" = let
+      render = self.lib.sshConfig;
+      text = render.mkFile "# test" [
+        (render.mkBlock "olympus" {
+          user = "root";
+          port = 2222;
+          forwardAgent = true;
+        })
+      ];
+    in
+      T
+      (
+        hasInfix "Host olympus" text
+        && hasInfix "port 2222" text
+        && hasInfix "forwardAgent yes" text
+      )
+      "exposed sshConfig renderer did not render a block";
+
+    "lib/ssh-forward-wrapper" = let
+      wrapper = self.lib.sshForwardWrapper.mkForwardWrapper pkgs "test-ssh-forward" {
+        hosts = ["example.trs"];
+        hostSocket = "%t/test/server.sock";
+        remoteSocket = "/run/test/%r@%h.sock";
+        envVar = "TEST_SOCK";
+      };
+    in
+      T
+      (wrapper.drvPath != "")
+      "exposed sshForwardWrapper did not produce a derivation";
     # `settings.agent_sockets` (the merged agent socket list: all entries are
     # forwarded, the first is the `key` default) must type-check and evaluate.
     "standalone/hm-ssh-agent-proxy-agent-sockets" =

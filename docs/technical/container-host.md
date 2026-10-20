@@ -347,11 +347,12 @@ host-backed and faulted on demand. Revisit if microvm.nix gains vfkit/VZ
 
 ## 12. Consumer: nixcfg `ssh.nix`
 
-`modules/programs/user/ssh.nix` excludes nested containers (`host != null`)
-from the direct `10.201.0.<id>` Host blocks and instead emits a ProxyJump block
-(`ProxyJump <host>.trs`, `HostKeyAlias <name>.trs`,
-`IdentityFile ~/.ssh/containers`), mirroring what `tartarus ssh <inner>`
-already does. A bare `ssh <inner>` therefore works.
+The `homeManagerModules."tartarus-ssh"` client module (enable with
+`tartarus.ssh.client.enable = true`) excludes nested containers
+(`host != null`) from the direct `10.201.0.<id>` Host blocks and instead emits
+a ProxyJump block (`ProxyJump <host>.trs`, `HostKeyAlias <name>.trs`,
+`IdentityFile ~/.ssh/tartarus`) into `~/.ssh/config.d/tartarus`, mirroring what
+`tartarus ssh <inner>` already does. A bare `ssh <inner>` therefore works.
 
 ## See also
 

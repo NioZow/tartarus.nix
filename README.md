@@ -17,7 +17,10 @@ overlays and secrets; Tartarus provides the engine, not the content.
   HTTPS/443 allowlists.
 - **Standalone utilities.** `sudo-auth-proxy`, `ssh-agent-proxy` and
   `clipboard-bridge` ship as packages and self-contained NixOS/home-manager
-  modules usable without any VM.
+  modules usable without any VM. The home-manager module
+  `tartarus-ssh` generates the guest SSH client config in its own
+  `~/.ssh/config.d/tartarus` fragment (enable with
+  `tartarus.ssh.client.enable = true`).
 
 ## Quick start
 

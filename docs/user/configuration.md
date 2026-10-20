@@ -121,6 +121,33 @@ firewall rule, no proxy entry and no autostart, and is omitted from
 `x509.hostDir`, `x509.hostCertPath`, `x509.hostKeyPath`, `x509.machinesDir`) for
 advanced/key-rotation setups; the defaults are suitable for most hosts.
 
+## `tartarus.ssh.client.*` (home-manager)
+
+This option set lives in the separate home-manager module
+`inputs.tartarus.homeManagerModules."tartarus-ssh"`. It writes the user's SSH
+client entries for every enabled guest and includes them from the main SSH
+config, so enabling one option is enough:
+
+```nix
+imports = [inputs.tartarus.homeManagerModules."tartarus-ssh"];
+tartarus.ssh.client.enable = true;
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enable` | bool | `false` | Generate the guest SSH entries. |
+| `configFile` | str | `".ssh/config.d/tartarus"` | Generated fragment path, relative to the home directory. |
+| `include` | bool | `true` | Add the fragment to `programs.ssh.includes`. |
+| `strictHostKeyChecking` | bool | `true` | Set `StrictHostKeyChecking yes` on guest blocks. |
+| `vmVsock` | bool | `true` | Reach VSOCK-enabled VMs through `tartarus proxy` instead of their bridge IP. |
+| `containerJumps` | list | `[]` | Explicit `{ name; id; via; }` container entries for Darwin/standalone home-manager. |
+| `tartarusUid` | int | host user's uid | UID used for guest-side gpg-agent socket paths. |
+
+The module reads guest data from `osConfig.tartarus.instances`, which exists
+when the tartarus host module is imported in the same NixOS/nix-darwin
+configuration. It adds the fragment at include order 1100, after the
+consumer's generated host files and before an unmanaged custom file.
+
 ## Memory management
 
 A guest's RAM is fixed at boot (`vm.mem`, default 768 MiB) and its *usable* size

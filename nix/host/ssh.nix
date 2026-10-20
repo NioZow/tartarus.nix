@@ -1,8 +1,9 @@
-# Host-side SSH wiring that tartarus itself must own.
+# Host-side SSH wiring that tartarus itself owns.
 #
-# The user-facing `Host *.trs` entries and the per-user `known_hosts_trs`
-# reference stay with the consumer (nixcfg's `modules/programs/user/ssh.nix`)
-# and are deliberately NOT duplicated here. What tartarus owns is:
+# The user-facing `Host *.trs` client entries live in the separate
+# home-manager module (`homeManagerModules."tartarus-ssh"`, which writes
+# `~/.ssh/config.d/tartarus`), because they are per-user config. What tartarus
+# owns here is:
 #
 #   * the on-disk `known_hosts_trs` location, exposed as an option so the CA
 #     service (`./ca.nix`) and any per-user config agree on one path;

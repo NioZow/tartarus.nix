@@ -24,6 +24,16 @@ in {
       }
       // args);
 
+  # Render OpenSSH config blocks/files from plain Nix values. Exposed so
+  # consumers (e.g. nixcfg's static host groups) use the same renderer as the
+  # `tartarus-ssh` home-manager module instead of carrying a copy.
+  lib.sshConfig = import ./lib/ssh-config.nix {inherit lib;};
+
+  # Build the `ssh` wrapper that installs a per-session RemoteForward/SetEnv
+  # for the sudo-auth-proxy and ssh-agent-proxy unix transports. Exposed so
+  # consumers install it without duplicating the shell.
+  lib.sshForwardWrapper = import ./lib/ssh-forward-wrapper.nix {inherit lib;};
+
   nixosModules = {
     tartarus = import ./host/default.nix {inherit inputs self;};
     "sudo-auth-proxy" = sudoAuthProxy.nixosModule;
@@ -39,6 +49,7 @@ in {
     "sudo-auth-proxy" = sudoAuthProxy.homeManagerModule;
     "ssh-agent-proxy" = sshAgentProxyPkg.homeManagerModule;
     "clipboard-bridge" = clipboardBridge.homeManagerModule;
+    "tartarus-ssh" = import ./home/ssh;
   };
 
   packages = forAllSystems (system: import ./packages {inherit inputs self system;});

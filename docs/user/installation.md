@@ -157,6 +157,14 @@ only their own `tartarus.<service>.*` options and can be used with no guest, no
 VM and no host module at all. See their deep-dive docs and the ready-to-edit
 files in [`examples/`](../../examples).
 
+The `homeManagerModules."tartarus-ssh"` module is the client-side counterpart
+for hosts that run guests: enable `tartarus.ssh.client.enable = true` and it
+writes `~/.ssh/config.d/tartarus`, then adds that file to
+`programs.ssh.includes`. It needs `osConfig.tartarus.instances` (so it is most
+useful in a NixOS/nix-darwin home-manager configuration); standalone
+home-manager can still use `tartarus.ssh.client.containerJumps` for explicit
+container entries.
+
 ### Debian (and other non-NixOS hosts)
 
 A `vsock` listener binds the host CID 2 and needs the `vhost_vsock` kernel
