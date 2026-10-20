@@ -38,22 +38,6 @@
   # nix/guest/build.nix); overlay upper/work paths derive from it.
   guestHome = "/home/user";
 
-  # Host-side `vsock` listeners bind AF_VSOCK CID 2 (VMADDR_CID_HOST), which
-  # only works once `vhost_vsock` is loaded. Until QEMU loads it at VM start,
-  # that bind fails with EADDRNOTAVAIL (errno 99), so load it up front when any
-  # enabled Linux VM actually asks for a host service over vsock.
-  needsHostVsock = any (
-    g:
-      g.enable
-      && g.kind == "vm"
-      && !(g.services.disableVsock or false)
-      && (
-        ((g.services.sudoAuthProxy or false) && ((g.services.sudoAuthProxyTransport or "vsock") != "unix"))
-        || ((g.services.sshAgentProxy or false) && ((g.services.sshAgentProxyTransport or "vsock") != "unix"))
-        || (g.services.clipboardBridge or false)
-      )
-  ) (attrValues guests);
-
   # The tartarus CLI, taken from this flake's own package outputs (built with
   # tartarus's own nixpkgs) so the host module never has to evaluate the
   # consumer's `pkgs` mid-config.
@@ -275,6 +259,34 @@ in {
     ++ lib.optionals isLinux [
       (import ./containers.nix {inherit inputs self;})
       ./container-sudo.nix
+      # Host-side `vsock` listeners bind AF_VSOCK CID 2 (VMADDR_CID_HOST),
+      # which only works once `vhost_vsock` is loaded; load it up front when an
+      # enabled Linux VM asks for a host service over vsock. `boot` is
+      # NixOS-only, so this module must not be imported on Darwin. `mkIf` (not
+      # an eagerly-built `lib.optional` in `config`) keeps the guest-derived
+      # condition lazy: forcing it while the module system resolves module
+      # arguments trips the `_module.args` recursion.
+      ({
+        config,
+        lib,
+        ...
+      }: let
+        needsHostVsock = lib.any (
+          g:
+            g.enable
+            && g.kind == "vm"
+            && !(g.services.disableVsock or false)
+            && (
+              ((g.services.sudoAuthProxy or false) && ((g.services.sudoAuthProxyTransport or "vsock") != "unix"))
+              || ((g.services.sshAgentProxy or false) && ((g.services.sshAgentProxyTransport or "vsock") != "unix"))
+              || (g.services.clipboardBridge or false)
+            )
+        ) (lib.attrValues config.tartarus.instances.guests);
+      in {
+        config = lib.mkIf needsHostVsock {
+          boot.kernelModules = ["vhost_vsock"];
+        };
+      })
     ];
 
   options.tartarus.internalAssertions = mkOption {
@@ -285,10 +297,5 @@ in {
     description = "Internal: the tartarus-owned assertions, for the test suite.";
   };
 
-  config = lib.mkMerge [
-    {assertions = tartarusAssertions;}
-    (lib.mkIf (isLinux && needsHostVsock) {
-      boot.kernelModules = ["vhost_vsock"];
-    })
-  ];
+  config = {assertions = tartarusAssertions;};
 }
