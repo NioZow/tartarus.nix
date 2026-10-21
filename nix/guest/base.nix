@@ -113,11 +113,23 @@ in {
 
       nix = {
         settings.experimental-features = ["nix-command" "flakes"];
-        gc = mkIf g.isVm {
-          automatic = true;
-          dates = "daily";
-          options = "--max-freed 500M";
-        };
+
+        # Never collect garbage inside a guest, for either guest kind:
+        #
+        # * A VM's Nix DB lives in the writable overlay and only knows the
+        #   paths registered at boot. The read-only store it is layered on is
+        #   invisible to that DB, so GC treats every host store path as dead
+        #   and walks all of /nix/store -- including the million-entry
+        #   `.links` pool -- trying to delete it. With an unprivileged
+        #   virtiofsd that pins one host O_PATH fd per inode it has looked up
+        #   (file handles need CAP_DAC_READ_SEARCH), the daemon exhausts its
+        #   fd table; every subsequent open in the guest then fails with
+        #   ENFILE ("too many open files in system"), including login shells.
+        # * A container shares the host's store *and* DB, so its GC would
+        #   delete the host's paths.
+        #
+        # The host owns the shared store and GCs it itself; a guest must not.
+        gc.automatic = lib.mkForce false;
       };
 
       # Pin the guest's primary GID to the invoking host user's on Linux. A
