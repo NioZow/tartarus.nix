@@ -29,6 +29,11 @@ in
     build-system = [pkgs.python3Packages.hatchling];
     dependencies = [];
 
+    # Fail the build if a module is missing from the packaged source (e.g. a new
+    # file left untracked, which Nix flakes do not see). `tartarus.cli` imports
+    # every action module, so a missing one is caught here, not at runtime.
+    pythonImportsCheck = ["tartarus.cli"];
+
     nativeBuildInputs = [pkgs.makeWrapper];
 
     # No runtime Python dependencies (stdlib only); the external tools the CLI
