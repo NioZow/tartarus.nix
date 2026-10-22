@@ -12,7 +12,6 @@ import json
 import os
 import platform
 import pty
-import shutil
 import signal
 import subprocess
 import time
@@ -20,6 +19,7 @@ from pathlib import Path
 
 from . import ca, mounts, ssh, system
 from .config import Config
+from .fs import safe_rmtree
 from .nix import eval as nix_eval
 from .nix import flake
 from .output import c, die, info, ok, print_table, warn
@@ -618,11 +618,22 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
 
     # Runtime mounts do not survive a stop/restart: release host staging binds
     # and drop the state file whether or not the guest was running.
-    mounts.cleanup_vm_mounts(config, name)
+    unreleased = mounts.cleanup_vm_mounts(config, name)
 
     if purge:
-        shutil.rmtree(state, ignore_errors=True)
-        ok(f"Purged state for '{name}'.")
+        if unreleased:
+            # Recursively deleting the state dir would walk through a live bind
+            # and empty the host source directory.
+            warn(
+                f"not purging '{name}': {unreleased} runtime-mount stage(s) are "
+                "still mounted; unmount them and retry"
+            )
+        elif safe_rmtree(state, warn=warn):
+            ok(f"Purged state for '{name}'.")
+        else:
+            warn(
+                f"purged '{name}' only partially: live mounts were left in place"
+            )
     else:
         (state / "microvm.pid").unlink(missing_ok=True)
         for sock in state.glob("*.sock"):

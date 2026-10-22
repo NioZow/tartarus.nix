@@ -151,7 +151,7 @@ def test_stop_cleans_before_purge_removes_state(monkeypatch, tmp_path):
         lambda _c, name: events.append(("cleanup", name)),
     )
     monkeypatch.setattr(
-        vm.shutil, "rmtree", lambda path, **_k: events.append(("rmtree", str(path)))
+        vm, "safe_rmtree", lambda path, **_k: events.append(("rmtree", str(path)))
     )
     monkeypatch.setattr(vm.os, "kill", _kill_already_exited)
     monkeypatch.setattr(vm.os, "killpg", lambda *_a, **_k: None)
@@ -159,3 +159,45 @@ def test_stop_cleans_before_purge_removes_state(monkeypatch, tmp_path):
     vm.action_stop(config, "vault", purge=True)
 
     assert events == [("cleanup", "vault"), ("rmtree", str(state))]
+
+
+def test_stop_skips_purge_when_a_stage_is_still_mounted(monkeypatch, tmp_path):
+    config = make_config(tmp_path)
+    state = _prepare_state(tmp_path, "vault", 999999)
+    _stub_action_stop(monkeypatch, timeout=False)
+    monkeypatch.setattr(
+        vm.mounts, "cleanup_vm_mounts", lambda _c, _name: 1
+    )
+    monkeypatch.setattr(
+        vm,
+        "safe_rmtree",
+        lambda *_a, **_k: pytest.fail("must not delete with live mounts"),
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(vm, "warn", warnings.append)
+    monkeypatch.setattr(vm.os, "kill", _kill_already_exited)
+    monkeypatch.setattr(vm.os, "killpg", lambda *_a, **_k: None)
+
+    vm.action_stop(config, "vault", purge=True)
+
+    assert state.exists()
+    assert any("not purging" in message for message in warnings)
+
+
+def test_stop_reports_a_partial_purge_when_a_nested_mount_remains(
+    monkeypatch, tmp_path
+):
+    config = make_config(tmp_path)
+    state = _prepare_state(tmp_path, "vault", 999999)
+    _stub_action_stop(monkeypatch, timeout=False)
+    monkeypatch.setattr(vm.mounts, "cleanup_vm_mounts", lambda _c, _name: 0)
+    monkeypatch.setattr(vm, "safe_rmtree", lambda _path, **_k: False)
+    warnings: list[str] = []
+    monkeypatch.setattr(vm, "warn", warnings.append)
+    monkeypatch.setattr(vm.os, "kill", _kill_already_exited)
+    monkeypatch.setattr(vm.os, "killpg", lambda *_a, **_k: None)
+
+    vm.action_stop(config, "vault", purge=True)
+
+    assert state.exists()
+    assert any("only partially" in message for message in warnings)

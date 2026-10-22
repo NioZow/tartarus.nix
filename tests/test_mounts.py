@@ -460,6 +460,27 @@ def _install_fake_sudo(monkeypatch) -> list[list[str]]:
     return calls
 
 
+def _install_fake_sudo_mounts(
+    monkeypatch, mounted: set[Path]
+) -> list[list[str]]:
+    """Fake sudo with real mount-point bookkeeping.
+
+    ``umount`` succeeds and clears the path from ``mounted``; ``os.path.ismount``
+    consults that set, mirroring what the kernel reports afterwards.
+    """
+    calls: list[list[str]] = []
+
+    def _run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        if cmd and cmd[0] == "umount":
+            mounted.discard(Path(cmd[-1]))
+        return _completed(cmd, 0)
+
+    monkeypatch.setattr(mounts.process, "run_sudo_capture", _run)
+    monkeypatch.setattr(mounts.os.path, "ismount", lambda path: Path(path) in mounted)
+    return calls
+
+
 def test_mount_vm_refuses_on_darwin(monkeypatch, tmp_path):
     config = make_config(tmp_path, VAULT)
     monkeypatch.setattr(mounts.system, "is_darwin", lambda: True)
@@ -517,8 +538,7 @@ def test_action_mount_vm_helper_failure_releases_stage(monkeypatch, tmp_path):
     monkeypatch.setattr(mounts.ssh, "is_running", lambda *_a, **_k: True)
     monkeypatch.setattr(mounts.secrets, "token_hex", lambda _n: "deadbeef")
     _install_fake_remote(monkeypatch, helper_code=1)
-    sudo = _install_fake_sudo(monkeypatch)
-    monkeypatch.setattr(mounts.os.path, "ismount", lambda path: Path(path) == stage)
+    sudo = _install_fake_sudo_mounts(monkeypatch, {stage})
 
     with pytest.raises(TartarusError, match="failed to mount"):
         mounts.action_mount(config, "vault", f"{source}:/home/user/src")
@@ -540,8 +560,7 @@ def test_unmount_vm_running_calls_helper_and_releases_stage(monkeypatch, tmp_pat
     }
     monkeypatch.setattr(mounts.ssh, "is_running", lambda *_a, **_k: True)
     remote = _install_fake_remote(monkeypatch)
-    sudo = _install_fake_sudo(monkeypatch)
-    monkeypatch.setattr(mounts.os.path, "ismount", lambda _path: True)
+    sudo = _install_fake_sudo_mounts(monkeypatch, {stage})
 
     mounts._unmount_vm(config, "vault", record)
 
@@ -575,6 +594,58 @@ def test_unmount_vm_guest_down_skips_helper_but_releases_stage(monkeypatch, tmp_
 
     assert sudo == []
     assert not stage.exists()
+
+
+def test_release_stage_never_deletes_through_a_live_mount(monkeypatch, tmp_path):
+    """A stage that cannot be unmounted must not be deleted recursively.
+
+    Removing a live bind's mountpoint walks through the mount and deletes the
+    host source directory's contents.
+    """
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    precious = stage / "keep.txt"
+    precious.write_text("data", encoding="utf-8")
+
+    monkeypatch.setattr(mounts.os.path, "ismount", lambda _path: True)
+    monkeypatch.setattr(
+        mounts.process,
+        "run_sudo_capture",
+        lambda cmd, **_k: _completed(cmd, 1, stderr="target is busy"),
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(mounts, "warn", warnings.append)
+
+    mounts._release_stage(stage)
+
+    assert precious.exists()
+    assert stage.exists()
+    assert warnings and "leaving it in place" in warnings[0]
+
+
+def test_unmount_vm_refuses_a_stage_outside_the_staging_root(monkeypatch, tmp_path):
+    config = make_config(tmp_path, VAULT)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    record = {
+        "id": "deadbeef",
+        "kind": "vm",
+        "target": "/home/user/src",
+        "stage": str(outside),
+    }
+    monkeypatch.setattr(mounts.ssh, "is_running", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        mounts.process,
+        "run_sudo_capture",
+        lambda *_a, **_k: pytest.fail("must not touch a path outside staging"),
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(mounts, "warn", warnings.append)
+
+    mounts._unmount_vm(config, "vault", record)
+
+    assert outside.exists()
+    assert any("unexpected staging path" in message for message in warnings)
 
 
 # --- container runtime path ----------------------------------------------
@@ -924,6 +995,8 @@ def test_mount_container_plain_bind_failure_releases_and_raises(monkeypatch, tmp
     def _responder(_leader, argv, _fds):
         if argv[:2] == ["mount", "--bind"]:
             return 1
+        if argv[:1] == ["mountpoint"]:
+            return 1
         return 0
 
     calls = _install_fake_namespace(monkeypatch, responder=_responder)
@@ -934,7 +1007,7 @@ def test_mount_container_plain_bind_failure_releases_and_raises(monkeypatch, tmp
     stage = "/run/tartarus-mount/staging/deadbeef"
     arguments = _argv_calls(calls)
     assert ["umount", stage] in arguments
-    assert ["rm", "-rf", stage] in arguments
+    assert ["rmdir", stage] in arguments
 
 
 def test_mount_container_ro_remounts_target_read_only(monkeypatch, tmp_path):
@@ -994,7 +1067,10 @@ def test_unmount_container_running_umounts_overlay_and_releases_stage(
 ):
     config = make_config(tmp_path, BOX)
     _container_ready(monkeypatch, running=True)
-    calls = _install_fake_namespace(monkeypatch)
+    calls = _install_fake_namespace(
+        monkeypatch,
+        responder=lambda _l, argv, _f: 1 if argv[:1] == ["mountpoint"] else 0,
+    )
     record = {
         "id": "deadbeef",
         "kind": "container",
@@ -1007,9 +1083,62 @@ def test_unmount_container_running_umounts_overlay_and_releases_stage(
 
     arguments = _argv_calls(calls)
     assert ["umount", "/home/user/src"] in arguments
-    assert ["rm", "-rf", "/run/tartarus-mount/overlays/deadbeef"] in arguments
+    overlay = "/run/tartarus-mount/overlays/deadbeef"
+    assert ["rmdir", f"{overlay}/upper"] in arguments
+    assert ["rmdir", f"{overlay}/work"] in arguments
+    assert ["rmdir", overlay] in arguments
     assert ["umount", "/run/tartarus-mount/staging/deadbeef"] in arguments
-    assert ["rm", "-rf", "/run/tartarus-mount/staging/deadbeef"] in arguments
+    assert ["rmdir", "/run/tartarus-mount/staging/deadbeef"] in arguments
+    assert not any(argv[:2] == ["rm", "-rf"] for argv in arguments)
+
+
+def test_unmount_container_leaves_a_live_stage_mounted(monkeypatch, tmp_path):
+    """Never remove a stage that is still mounted: that deletes the source."""
+    config = make_config(tmp_path, BOX)
+    _container_ready(monkeypatch, running=True)
+    warnings: list[str] = []
+    monkeypatch.setattr(mounts, "warn", warnings.append)
+    calls = _install_fake_namespace(
+        monkeypatch,
+        responder=lambda _l, argv, _f: 0 if argv[:1] == ["mountpoint"] else 1,
+    )
+    record = {
+        "id": "deadbeef",
+        "kind": "container",
+        "target": "/home/user/src",
+        "mode": "rw",
+        "stage": "/run/tartarus-mount/staging/deadbeef",
+    }
+
+    mounts._unmount_container(config, "box", record)
+
+    arguments = _argv_calls(calls)
+    assert ["rmdir", "/run/tartarus-mount/staging/deadbeef"] not in arguments
+    assert not any(argv[:2] == ["rm", "-rf"] for argv in arguments)
+    assert any("leaving it mounted" in message for message in warnings)
+
+
+def test_unmount_container_refuses_tampered_paths(monkeypatch, tmp_path):
+    config = make_config(tmp_path, BOX)
+    _container_ready(monkeypatch, running=True)
+    warnings: list[str] = []
+    monkeypatch.setattr(mounts, "warn", warnings.append)
+    calls = _install_fake_namespace(monkeypatch)
+    record = {
+        "id": "../evil",
+        "kind": "container",
+        "target": "/home/user/src",
+        "mode": "overlay",
+        "stage": "/run/tartarus-mount/staging/../evil",
+    }
+
+    mounts._unmount_container(config, "box", record)
+
+    arguments = _argv_calls(calls)
+    assert not any(argv[:1] == ["rmdir"] for argv in arguments)
+    assert not any(argv[:2] == ["rm", "-rf"] for argv in arguments)
+    assert any("invalid id" in message for message in warnings)
+    assert any("unexpected staging path" in message for message in warnings)
 
 
 def test_unmount_container_stopped_is_a_noop(monkeypatch, tmp_path):
@@ -1052,8 +1181,7 @@ def test_cleanup_vm_mounts_releases_recorded_stages(monkeypatch, tmp_path):
             {"id": "b2", "stage": str(plain)},
         ],
     )
-    monkeypatch.setattr(mounts.os.path, "ismount", lambda path: Path(path) == mounted)
-    sudo = _install_fake_sudo(monkeypatch)
+    sudo = _install_fake_sudo_mounts(monkeypatch, {mounted})
 
     mounts.cleanup_vm_mounts(config, "vault")
 
@@ -1070,14 +1198,35 @@ def test_cleanup_vm_mounts_removes_untracked_leftover(monkeypatch, tmp_path):
     root = mounts.staging_root(config, "vault")
     leftover = root / "leftover"
     leftover.mkdir(parents=True)
-    monkeypatch.setattr(mounts.os.path, "ismount", lambda _path: True)
-    sudo = _install_fake_sudo(monkeypatch)
+    sudo = _install_fake_sudo_mounts(monkeypatch, {leftover})
 
     mounts.cleanup_vm_mounts(config, "vault")
 
     assert ["umount", str(leftover)] in sudo
     assert not leftover.exists()
     assert not mounts.state_path(config, "vault").exists()
+
+
+def test_cleanup_vm_mounts_ignores_a_stage_outside_the_staging_root(
+    monkeypatch, tmp_path
+):
+    config = make_config(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    precious = outside / "keep.txt"
+    precious.write_text("data", encoding="utf-8")
+    mounts.write_state(config, "vault", [{"id": "x", "stage": str(outside)}])
+    monkeypatch.setattr(
+        mounts.process,
+        "run_sudo_capture",
+        lambda *_a, **_k: pytest.fail("must not touch a path outside staging"),
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(mounts, "warn", warnings.append)
+
+    assert mounts.cleanup_vm_mounts(config, "vault") == 1
+    assert precious.exists()
+    assert any("unexpected stage path" in message for message in warnings)
 
 
 def test_cleanup_vm_mounts_nothing_is_a_noop(monkeypatch, tmp_path):

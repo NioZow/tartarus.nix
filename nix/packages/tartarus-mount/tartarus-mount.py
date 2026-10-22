@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -119,6 +120,55 @@ def _chown_tree(path, uid, gid):
             os.chown(os.path.join(root, name), uid, gid)
 
 
+def _safe_rmtree(path):
+    """Remove ``path`` recursively without crossing mounts or symlinks.
+
+    Overlay layers live under /run, but a layer could still be a mountpoint; in
+    that case it is left in place rather than walked into. Symlinks are
+    unlinked, never followed. Returns True only when the tree is gone.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        return True
+    if os.path.ismount(path):
+        return False
+    removed = True
+    try:
+        entries = list(os.scandir(path))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                os.unlink(entry.path)
+            elif not _safe_rmtree(entry.path):
+                removed = False
+        except FileNotFoundError:
+            continue
+        except OSError:
+            removed = False
+    try:
+        os.rmdir(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        removed = False
+    return removed
+
+
 def _same_record(entry, identifier, target, mode):
     return (
         isinstance(entry, dict)
@@ -198,8 +248,12 @@ def umount_op(target, *, overlay_dir, state_file):
         _run([UMOUNT_BIN, "-l", target])
 
     if record.get("mode") == "overlay":
-        overlay = os.path.join(os.fspath(overlay_dir), str(record.get("id", "")))
-        shutil.rmtree(overlay, ignore_errors=True)
+        try:
+            identifier = validate_id(str(record.get("id", "")))
+        except ValueError:
+            identifier = ""
+        if identifier:
+            _safe_rmtree(os.path.join(os.fspath(overlay_dir), identifier))
 
     remaining = [entry for entry in entries if entry is not record]
     write_state(state_file, remaining)
