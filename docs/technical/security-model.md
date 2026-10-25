@@ -54,11 +54,35 @@ CA-authenticated channel.
   signed and the host trusts `@cert-authority *.trs`, so host→guest SSH
   validates without fingerprint prompts and cannot be silently MITM'd.
 - **Host/guest services.** `ssh-agent-proxy`, `sudo-auth-proxy` and
-  `clipboard-bridge` authenticate both ends with the X.509 CA over mTLS. The
-  weaker `ssh`/`x509`/`signature` auth modes were removed: the three security
-  knobs are each `"transport"` or `"none"`, and disabling authentication is
-  explicit and refusable. See [ssh-agent-proxy](./ssh-agent-proxy.md) and
-  [sudo-auth-proxy](./sudo-auth-proxy.md).
+  `clipboard-bridge` each run one server process that binds N self-contained
+  listeners, and every listener states its own security. Where a transport is
+  shared or crosses a guest the host does not trust, both ends authenticate with
+  the X.509 CA over mTLS. The weaker `ssh`/`x509`/`signature` auth modes were
+  removed: the three security knobs are each `"transport"` or `"none"`, and
+  disabling authentication is explicit and refusable. See
+  [ssh-agent-proxy](./ssh-agent-proxy.md),
+  [sudo-auth-proxy](./sudo-auth-proxy.md) and
+  [clipboard-bridge](./clipboard-bridge.md).
+- **Clipboard listeners are per-listener.** `clipboard-bridge` makes the
+  distinction explicit:
+  - **VSOCK callbacks** use `security = none` (no crypto, no peer auth) because
+    the transport is private by construction — a point-to-point hypervisor link
+    with no path for a third party.
+  - **TCP container callbacks** use mTLS, because the container bridge is
+    shared: the peer must chain to the CA **and** carry the client EKU
+    (`1.3.6.1.4.1.99999.3.2`) while the server presents `.3.1`.
+  - **The default admin listener** is a same-user Unix socket — `0600` inside a
+    `0700` parent — authorized by the UID/filesystem boundary plus the ordered
+    `[[rule]]` list. Any process running as that user can already read and write
+    the user's clipboard, so the admin CLI grants it no authority it did not
+    already have.
+  - **There is no shared secret.** The old `secret`/`secret_file` model, the
+    generated secret and the clipboard agenix secret are removed: no replayable
+    bearer token and no password path remains.
+  - **Certificate admin is optional** and uses the admin EKU
+    `1.3.6.1.4.1.99999.3.3`, which guest certificates do not carry, so a guest
+    certificate cannot open an admin mTLS listener. The default host admin path
+    needs no certificate at all.
 - **Network isolation.** On Linux the host owns nftables: each guest kind has
   its own table, exact per-guest rules, and a `policy drop` input chain; guests
   cannot reach each other unless routed. On macOS, vfkit's `vmenet` ports are

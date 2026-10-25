@@ -1,0 +1,125 @@
+# clipboard-bridge — standalone guest client configuration (no Nix required)
+#
+# This is the *guest* side of the service: the daemon that watches the guest's
+# clipboard and pushes/pulls its own slot on the host. It can run on any
+# machine with Python 3.11+ and the `cryptography` wheel; copy it to
+# `~/.config/clipboard-bridge/client.toml` and run (client commands select that
+# file automatically):
+#
+#   clipboard-bridge client
+#
+# The source of truth for the model is `docs/technical/clipboard-bridge.md`.
+#
+# A CLIENT DIALS EXACTLY ONE TRANSPORT. Unlike the server it has one
+# `transport`, one `[security]` block and (for TCP) one `[mtls]` block; it never
+# enumerates listeners. There is no shared secret: a client authenticates the
+# server with mTLS (and can pin it further with `[acl]`), or -- on a transport
+# private by construction -- runs plaintext and relies on the transport itself.
+#
+# This file is the **TCP** guest client: the container / stand-in-VM callback,
+# which crosses the shared container bridge and therefore uses mTLS with the
+# tartarus guest certificate. The VSOCK variant is the same document with
+# `transport = "vsock"`, `cid = 2`, no host, all three `[security]` knobs
+# `"none"` and no `[mtls]` block.
+#
+# ---------------------------------------------------------------------------
+# Read this before editing: the file is validated against an EXACT schema
+#
+# Every key is checked against the set the client actually reads, so a typo or
+# a misplaced key is refused with the key named. A plaintext client
+# (`transport_encryption = "none"`) must state `client_auth` and `server_auth`
+# as `"none"` explicitly: authentication is never disabled implicitly. Paths in
+# `[mtls]` are resolved relative to this file's directory.
+# ---------------------------------------------------------------------------
+
+mode = "client"
+
+# The single transport to dial: "tcp" | "vsock" | "unix".
+transport = "tcp"
+
+# The host address this container reaches -- the clipboard server's TCP
+# listener (the container bridge gateway, `10.201.0.1` in the default wiring).
+host = "10.201.0.1"
+port = 27795
+
+# Seconds to wait for the connect, for the TLS handshake, and for the first
+# reply bytes.
+connect_timeout = 5.0
+handshake_timeout = 10.0
+recv_timeout = 60.0
+
+# Advertise this client at startup so it appears in the admin `clients` output.
+register = true
+
+# ===========================================================================
+# [security] — the same three knobs as a server listener, for this transport.
+#
+# mTLS authenticates BOTH ends: this client proves its certificate to the
+# server, and verifies the server's certificate. `transport_encryption = "mtls"`
+# forces both auth knobs to `"transport"`.
+# ===========================================================================
+[security]
+transport_encryption = "mtls"
+client_auth = "transport"
+server_auth = "transport"
+
+# ===========================================================================
+# [mtls] — this client's certificate material (TCP only).
+#
+#   required_oid       the EKU this (guest client) certificate must carry
+#   peer_required_oid  the EKU the server certificate must carry
+# The server is a different role, so it presents a different OID; a
+# chain-valid certificate with the wrong EKU is rejected.
+# ===========================================================================
+[mtls]
+enable = true
+ca_file = "./ca.crt"
+cert_file = "./client.crt"
+key_file = "./client.key"
+required_oid = "1.3.6.1.4.1.99999.3.2"       # this guest client
+peer_required_oid = "1.3.6.1.4.1.99999.3.1"  # clipboard-bridge server
+
+# ===========================================================================
+# [acl] — OPTIONAL server pinning, enforced AFTER the TLS handshake.
+#
+# An `[acl]` table that is present must pin at least one of the two lists, so
+# both examples below are commented out: uncomment one and replace the value
+# with your host's certificate fingerprint or name. Pinning is stricter than
+# the CA chain alone -- a chain-valid server with the wrong fingerprint/name is
+# then refused.
+#
+#   trusted_fingerprints  server leaf SubjectPublicKeyInfo fingerprints
+#                         ("SHA256:..."), a match is authoritative on its own
+#   trusted_names         fnmatch patterns against the server certificate's
+#                         CN/DNS SAN, a match is authoritative on its own
+#
+# [acl]
+# trusted_fingerprints = ["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]
+# trusted_names = ["athena", "athena.*"]
+
+# ===========================================================================
+# ALTERNATIVE — the local admin client over the same-user Unix socket.
+#
+# This is the default host admin path: no password, no certificate, no TLS.
+# There is exactly one active document per file, so the whole alternative is
+# commented out. The host generator writes this document to
+# `~/.config/clipboard-bridge/admin.toml`, which admin commands (`clients`,
+# `push --target`, `pull --target`, `pull --json`) select automatically. To use
+# it standalone, save it as `admin.toml`; the admin client must not `register`:
+# an admin listener rejects it.
+#
+# mode = "client"
+# transport = "unix"
+# socket = "%t/clipboard-bridge-admin.sock"
+# register = false
+#
+# [security]
+# transport_encryption = "none"
+# client_auth = "none"
+# server_auth = "none"
+#
+# No `[mtls]` block (the socket is plaintext) and no `[acl]` (a Unix socket has
+# no TLS handshake to pin; its 0600/0700 filesystem modes are the control).
+# Then run, for example:
+#
+#   clipboard-bridge clients

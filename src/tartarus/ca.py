@@ -7,11 +7,12 @@ This is the Python port of the three legacy CA scripts (PLAN.md §4 Phase 4):
 
 Public surface (kept stable from Phase 3):
 
-* :func:`ensure_user_ssh`          -- the shared client key + ``known_hosts_trs``.
-* :func:`ensure_ssh_host_key`      -- per-guest SSH host keypair + CA certificate.
-* :func:`ensure_x509_client_cert`  -- per-guest X509 client keypair + cert.
-* :func:`ensure_vm_certs`          -- the composite used by ``vm start``.
-* :func:`ensure_ctn_certs`         -- the container composite used by ``ctn start``.
+* :func:`ensure_user_ssh`            -- the shared client key + ``known_hosts_trs``.
+* :func:`ensure_ssh_host_key`        -- per-guest SSH host keypair + CA certificate.
+* :func:`ensure_x509_client_cert`    -- per-guest X509 client keypair + cert.
+* :func:`ensure_clipboard_admin_cert` -- the optional clipboard admin client cert.
+* :func:`ensure_vm_certs`            -- the composite used by ``vm start``.
+* :func:`ensure_ctn_certs`           -- the container composite used by ``ctn start``.
 
 Only stdlib and the ``ssh-keygen`` / ``openssl`` binaries are used. Paths are
 resolved through :class:`~tartarus.config.Config`, never ``$HOME`` directly.
@@ -65,8 +66,14 @@ X509_LEAF_RSA_BITS = "2048"
 # sudo-auth-proxy (and for the other tartarus services). Per-service
 # isolation is future work; the threat model documents this shared-identity
 # reality rather than the isolation the OID names suggest.
+#
+# The one deliberate exception is ``OID_CLIPBOARD_ADMIN``: the optional admin
+# client certificate (see :func:`_ensure_x509_admin_cert`) carries *only*
+# ``clientAuth`` plus this admin OID. Guest certificates never carry it, so an
+# admin mTLS listener can require it without also accepting a guest identity.
 OID_CLIPBOARD_SERVER = "1.3.6.1.4.1.99999.3.1"
 OID_CLIPBOARD_CLIENT = "1.3.6.1.4.1.99999.3.2"
+OID_CLIPBOARD_ADMIN = "1.3.6.1.4.1.99999.3.3"
 OID_SSHAGENT_SERVER = "1.3.6.1.4.1.99999.2.1"
 OID_SSHAGENT_CLIENT = "1.3.6.1.4.1.99999.2.2"
 OID_SUDO_SERVER = "1.3.6.1.4.1.99999.1.1"
@@ -422,6 +429,100 @@ def _ensure_x509_client_cert(config: Config, kind: str, name: str) -> None:
         ca_copy.chmod(0o644)
 
 
+def _ensure_x509_admin_cert(config: Config) -> None:
+    """Ensure the optional clipboard-bridge **admin** client cert exists.
+
+    The admin certificate is deliberately distinct from a guest client
+    certificate: it carries only ``clientAuth`` plus
+    :data:`OID_CLIPBOARD_ADMIN`, never the guest service OIDs and never a
+    server OID. An admin mTLS listener can therefore require the admin OID and
+    reject a guest certificate, while the default host admin path stays the
+    local Unix socket (no certificate at all).
+
+    Material lives in ``x509/machines/host/admin/`` so it mirrors the guest
+    layout and can be installed next to a client:
+
+    * ``client.key`` -- 2048-bit RSA private key, always ``0600``;
+    * ``client.crt`` -- CA-signed certificate, ``0644``;
+    * ``ca.crt``     -- a copy of the CA certificate, ``0644``.
+
+    Idempotency matches :func:`_ensure_x509_client_cert`: an existing key and
+    certificate are reused, a missing certificate is signed from the existing
+    key, and the key mode is re-applied on every call.
+    """
+    _ensure_x509_ca(config)
+    ca_crt = _x509_ca_crt(config)
+    admin_dir = x509_machine_dir(config, "host", "admin")
+    admin_dir.mkdir(parents=True, exist_ok=True)
+
+    client_key = admin_dir / "client.key"
+    client_crt = admin_dir / "client.crt"
+
+    if not client_key.exists():
+        info("Generating clipboard admin client key...")
+        _run(["openssl", "genrsa", "-out", str(client_key), X509_LEAF_RSA_BITS])
+
+    if not client_crt.exists():
+        csr = admin_dir / "client.csr"
+        _run(
+            [
+                "openssl",
+                "req",
+                "-new",
+                "-key",
+                str(client_key),
+                "-subj",
+                "/C=US/O=Tartarus/CN=admin",
+                "-out",
+                str(csr),
+            ]
+        )
+
+        extfile = admin_dir / "extfile.cnf"
+        # Only the admin OID: no guest client OIDs and no server OIDs.
+        _write_extfile(extfile, f"clientAuth,{OID_CLIPBOARD_ADMIN}")
+        _run(
+            [
+                "openssl",
+                "x509",
+                "-req",
+                "-in",
+                str(csr),
+                "-CA",
+                str(ca_crt),
+                "-CAkey",
+                str(_x509_ca_key(config)),
+                "-CAcreateserial",
+                "-sha256",
+                "-days",
+                X509_CERT_DAYS,
+                "-extfile",
+                str(extfile),
+                "-extensions",
+                "v3_ext",
+                "-out",
+                str(client_crt),
+            ]
+        )
+        client_crt.chmod(0o644)
+        csr.unlink(missing_ok=True)
+        extfile.unlink(missing_ok=True)
+        info(f"Clipboard admin cert generated: {client_crt}")
+    else:
+        info("Clipboard admin cert already exists.")
+
+    # Re-apply on every call so a loosened key (or one generated by an older
+    # version) is remediated, exactly like the guest client path.
+    client_key.chmod(0o600)
+
+    ca_copy = admin_dir / "ca.crt"
+    if ca_copy.is_symlink():
+        ca_copy.unlink()
+    if not (ca_copy.exists() and filecmp.cmp(ca_crt, ca_copy, shallow=False)):
+        shutil.copyfile(ca_crt, ca_copy)
+        ca_copy.chmod(0o644)
+
+
 # --- public entry points --------------------------------------------------
 
 
@@ -442,6 +543,19 @@ def ensure_x509_client_cert(config: Config, kind: str, name: str) -> None:
     _ensure_x509_ca(config)
     _ensure_x509_host_cert(config)
     _ensure_x509_client_cert(config, kind, name)
+
+
+def ensure_clipboard_admin_cert(config: Config) -> None:
+    """Ensure the optional clipboard admin certificate material is ready.
+
+    This is the ``tartarus ca admin`` entry point. It does not require a guest:
+    the admin certificate identifies the control-plane client, not a machine.
+    The default host admin path is the local Unix socket, so issuing this
+    certificate is optional and only needed for a certificate-auth admin
+    listener.
+    """
+    _ensure_x509_ca(config)
+    _ensure_x509_admin_cert(config)
 
 
 def ensure_vm_certs(config: Config, name: str) -> None:

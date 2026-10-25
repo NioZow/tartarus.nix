@@ -124,8 +124,8 @@ Inside a guest with `proxy.enable = true` and `allowHosts = ["example.com"]`:
 - [ ] `ssh -o ConnectTimeout=3 -o BatchMode=yes git@github.com` does not
       connect (port 22 is dropped).
 - [ ] `ping -c1 1.1.1.1` fails (ICMP not proxied).
-- [ ] Internal host services still work: the clipboard/ssh/sudo fallback ports
-      and `*.trs` hosts remain reachable (not sent to the proxy thanks to
+- [ ] Internal host services still work: the clipboard/ssh/sudo host-service
+      ports and `*.trs` hosts remain reachable (not sent to the proxy thanks to
       `NO_PROXY`).
 
 ### Guest-hosted proxy + cross-kind routing
@@ -266,7 +266,24 @@ here needs the tartarus host module or a guest.
       confirm the guest's `SSH_AUTH_SOCK` is the merged socket and that
       `ssh-add -l` lists the host keys.
 - [ ] `clipboard-bridge`: `nixosModules."clipboard-bridge"` (host server) and
-      `homeManagerModules."clipboard-bridge"` (server/client/adminClient); copy
-      on one side and paste on the other over `wprs-0`, confirming the mTLS
-      handshake succeeds with the tartarus X509 CA and fails with a wrong
-      OID/cert.
+      `homeManagerModules."clipboard-bridge"` (server/client/adminClient). The
+      server binds every `server.listeners` entry in one process, and
+      `adminClient` points at the same-user Unix admin listener.
+- [ ] `clipboard-bridge` admin over the local Unix socket needs no credential:
+      `clipboard-bridge clients` lists the running guests — no password, no
+      certificate (`admin = true` listener, socket `0600` in a `0700` directory).
+- [ ] `clipboard-bridge` TCP container guest: copy on one side and paste on the
+      other over `wprs-0` through the mTLS `tartarus-tcp` listener; the handshake
+      uses the tartarus X509 CA and the guest certificate (client EKU `.3.2`),
+      and a wrong OID/cert is rejected.
+- [ ] `clipboard-bridge` VSOCK VM: copy/paste over `wprs-0` works through the
+      `tartarus-vsock` listener with **no TLS**
+      (`transport_encryption = "none"`), so no certificate is involved.
+- [ ] `clipboard-bridge` certificate-admin listener (optional): configure an
+      `admin = true` mTLS listener with peer OID `.3.3` and mint its material
+      with `tartarus ca admin` / `tartarus-certs issue-admin`. The admin
+      certificate succeeds; a guest certificate is denied at the handshake; a
+      missing or wrong `[[rule]]` entry denies the admin action.
+- [ ] `clipboard-bridge` fails loudly: a server config carrying `secret` /
+      `secret_file`, a flat server `transport`/`host`/`port`, or `admin_socket`
+      is refused by name at startup instead of binding the wrong thing.

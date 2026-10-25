@@ -58,9 +58,19 @@ for different hosts).
 
 **Invariants (locked):**
 
-- Applies to the **server** of `sudo-auth-proxy` and `ssh-agent-proxy` only.
-  `clipboard-bridge` and every guest-side **client/bridge** keep a single
-  transport and are **unchanged**.
+- Applies to the **server** of `sudo-auth-proxy`, `ssh-agent-proxy` and
+  `clipboard-bridge`. Every guest-side **client/bridge** keeps a single
+  transport. The clipboard server's `listeners` array may mix `vsock` (VMs),
+  `tcp` (containers) and `unix` entries so one process serves a mixed host; each
+  entry carries its own `security`, `mtls` and `resolution`. The clipboard-only
+  `qemu` resolution mode is removed (the valid modes are `none`, `certificate`,
+  `tartarus`, `mofos`).
+- A clipboard server may additionally bind a same-user Unix **admin** listener
+  (host CLI only; the shipped wiring keeps it plaintext, though TLS over Unix is
+  supported when configured); that is a local control plane, not a second guest
+  transport. It is a **normal listener marked `admin = true`** — there is no
+  `admin_socket` option — authorized by same-user Unix permissions (socket
+  `0600`, parent directory `0700`) and by the ordered `[[rule]]` list.
 - The guest client still dials exactly one transport.
 - The server option surface becomes a **list** (`listeners`) of **self-contained
   entries**; a field an entry omits falls back to the built-in default.
@@ -70,8 +80,10 @@ for different hosts).
   resolves each entry on its own** and spawns one listener per entry inside the
   single server process.
 - The Python additionally keeps accepting a **legacy flat server config** as a
-  single implicit listener (documented compatibility fallback, **not** a Nix
-  option).
+  single implicit listener for `sudo-auth-proxy` and `ssh-agent-proxy` only
+  (documented compatibility fallback, **not** a Nix option). `clipboard-bridge`
+  has **no legacy flat server fallback**: its server must configure
+  `[[listeners]]`, and a flat server document is rejected at load.
 
 ---
 
@@ -316,13 +328,38 @@ transport/security are rewritten per listener:
   unchanged (the markers still select the guest client transport and feed the
   host wiring's listener derivation, §5).
 
+### 2.6 `clipboard-bridge` server schema
+
+The clipboard server gets the same self-contained `listeners` shape as the two
+proxy services, with these differences:
+
+- The `listeners` list is **mandatory** for an enabled server: there is no flat
+  `transport`/`host`/`port` server form to fall back to, and `admin_socket`,
+  `secret` and `secret_file` are removed outright. `load_config` rejects them by
+  name.
+- Every entry accepts `admin = true` (default `false`) in addition to the usual
+  fields; an admin entry is a normal listener whose role is the control plane
+  (§5 of [`clipboard-bridge.md`](../clipboard-bridge.md)), not a second guest
+  transport.
+- `security`, `mtls` and `resolution` are **per entry**; there is no global
+  `mtls` or `resolution` on the server. `unix` rejects `tartarus`/`mofos`
+  resolution, and the clipboard-only `qemu` mode is gone.
+- The document-level `[[rule]]` list stays global and is scoped with
+  `match.listeners`/`match.machine`/`match.action`/`match.target`; first match
+  wins, no match denies, and there is no `ask` policy.
+- `settings` stays global for the `[[vm]]`/`[[tcp_vm]]` CID/IP maps used by
+  `resolution = "tartarus"`.
+- The guest **client** keeps one transport, one `[security]`, an optional
+  `[mtls]` (required whenever that transport resolves to mTLS, including on
+  `unix`) and an optional `[acl]`.
+
 ---
 
 ## 3. Generated TOML schema
 
 ### 3.1 Shape
 
-Both services emit, for a server:
+`sudo-auth-proxy` and `ssh-agent-proxy` emit, for a server:
 
 ```toml
 mode = "server"                 # ssh: mode = "proxy"
@@ -377,6 +414,13 @@ Every entry is self-contained; a field it omits is simply absent from the
 emitted TOML and the Python applies its built-in default. There is no
 `[listener_defaults]` block. There is no per-listener `[acl]` either: the
 document-level `[[rule]]` list scopes itself with `match.listeners`.
+
+The **clipboard** server follows the same per-entry shape (`mode = "server"`, no
+`dialog_program`), with two extras: an entry may carry `admin = true`, and the
+global `settings` keys are `vm`/`tcp_vm` (used by `resolution = "tartarus"`).
+Its `[[rule]]` entries match `listeners`/`machine`/`action`/`target` and carry
+an `allow`/`deny` policy (no `ask`). See
+[`clipboard-bridge.md`](../clipboard-bridge.md).
 
 Top-level keys for the **ssh** server additionally include the global `settings`
 freeform keys (`vm`, `tcp_vm`, `libvirt_uri`, `agent_sockets`,
@@ -486,7 +530,10 @@ legacy_flat := not new_schema
   transport/security keys (rejected — §4.6).
 - `legacy_flat`: the whole parsed top-level dict is the single implicit
   listener, exactly as today. This makes a hand-written flat config keep working
-  with zero edits.
+  with zero edits. This rule is **sudo/ssh only**: `clipboard-bridge` requires
+  `[[listeners]]` on a server (§2.6) and rejects the flat server form by name
+  (`transport`/`host`/`port`, `admin_socket`, `secret`, `secret_file`, global
+  `mtls`/`resolution`).
 
 A config with BOTH `listeners` and flat `transport`/`security`/`mtls` at the top
 level is rejected (ambiguous), and a `listener_defaults` block is refused
@@ -496,8 +543,8 @@ outright.
 
 ## 4. Python algorithm
 
-Both services import no new dependencies; `tomllib` and `threading` are already
-available (Python ≥ 3.11).
+The proxy services import no new dependencies; `tomllib` and `threading` are
+already available (Python ≥ 3.11).
 
 ### 4.1 Shared helpers
 
@@ -531,6 +578,14 @@ def listener_views(config: dict) -> list[dict]:
 Each `view` is exactly the shape `validate_config_schema`,
 `make_transport`, `build_security`, `create_ssl_context`, `get_resolution_mode`
 and `resolve_read_timeouts` already accept. No transport/security code changes.
+
+> **Clipboard exception.** This helper (and its `[config]` legacy fallback) is
+> the sudo/ssh contract. `clipboard-bridge` replaces it with strict parsing:
+> `[[listeners]]` is required on a server, the flat server keys are rejected by
+> name, and each entry is validated (including `admin`, per-entry `security`/
+> `mtls`/`resolution` and the listener bounds) before any bind. There is no flat
+> `[config]` fallback, so a hand-written flat clipboard server config fails
+> loudly.
 
 ### 4.2 sudo `run_server`
 
@@ -917,10 +972,17 @@ guests). This is a cross-check task (§9 T9), not a code change expected here.
 
 - The Python keeps accepting a **legacy flat server config** as one implicit
   listener (top-level `mode` + `transport`/`cid`/`host`/`port`/`socket*` +
-  `[security]`/`[mtls]`/`[acl]`). `examples/sudo-auth-proxy-server.toml`,
+  `[security]`/`[mtls]`/`[acl]`) **for `sudo-auth-proxy` and
+  `ssh-agent-proxy` only**. `examples/sudo-auth-proxy-server.toml`,
   `examples/ssh-agent-proxy-server.toml`, hand-written configs, and the
   standalone package therefore keep working unchanged. This fallback is a
   **Python** compatibility rule only; there is no Nix option for it.
+- `clipboard-bridge` has **no legacy flat server fallback**. A server must
+  configure `[[listeners]]`; the flat `transport`/`host`/`port`, `admin_socket`,
+  `secret`/`secret_file` and global `mtls`/`resolution` keys are rejected at
+  load. The admin Unix socket is a normal `admin = true` listener, not a
+  separate option. There is nothing to migrate at runtime: the host wiring and
+  the Nix module are updated in the same change.
 - The ssh `[security].connect_timeout`/`handshake_timeout`/`decision_timeout`
   keys emitted by the current Nix module are dead (the Python reads them at the
   top level). The new schema emits them at the listener level so they take
@@ -933,6 +995,10 @@ guests). This is a cross-check task (§9 T9), not a code change expected here.
 
 All Python tests run from the package root:
 `python -m pytest tests/test_sudo_auth_proxy.py tests/test_ssh_agent_proxy.py -q`.
+The clipboard contract (listeners required, per-listener security, admin
+listener + rules, no-password behaviour) is covered separately by
+`tests/test_clipboard_bridge.py`; see
+[`clipboard-bridge.md`](../clipboard-bridge.md).
 
 ### 7.1 `tests/test_sudo_auth_proxy.py` (extend)
 

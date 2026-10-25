@@ -119,7 +119,7 @@ nixpkgs `_module.args` recursion.
 | `tartarus` | Python (`src/tartarus`) | The CLI (`nix run .#tartarus`). |
 | `sudo-auth-proxy` | Python + Nix modules | PAM sudo authentication proxy. |
 | `ssh-agent-proxy` | Python + Nix modules | ssh-agent forwarding proxy. |
-| `clipboard-bridge` | Python + Nix modules | Clipboard bridge over the graphical tunnel. |
+| `clipboard-bridge` | Python + Nix modules | Clipboard bridge: one server process binds N self-contained listeners — guest `vsock` (no TLS) and `tcp` (mTLS) callbacks plus a same-user Unix `admin` listener for the local CLI. |
 | `tartarus-certs` | Shell (`scripts/tartarus-certs.sh`) | Standalone CA/leaf certificate tooling. |
 
 ## Boundaries

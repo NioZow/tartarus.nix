@@ -48,5 +48,6 @@ Topic documents that go deeper than the guides above:
 - [Container-host VMs (nested nspawn)](technical/container-host.md)
 - [ssh-agent-proxy](technical/ssh-agent-proxy.md)
 - [sudo-auth-proxy](technical/sudo-auth-proxy.md)
+- [clipboard-bridge](technical/clipboard-bridge.md)
 - [Manual smoke list](technical/smoke.md)
 - [Design notes](technical/design/) (`transport-listeners`, `remove-merge-mode`)

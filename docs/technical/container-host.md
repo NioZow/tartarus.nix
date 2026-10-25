@@ -239,6 +239,11 @@ stands in for its inner containers in `nix/host/services.nix` and
 | `proxy.enable` | VM DNATs the proxy port (`hostProxyIP` = inner host IP) to the VM gateway; a proxy-only container is fenced to that gateway by a VM `forward` drop. |
 | Resolver / proxy **service** (`tartarus.dns.location` / `tartarus.proxy.location`) | A nested container can itself be the host's resolver or proxy. The container-host VM DNATs the service port on its trunk `eth0` inward to the nested container, so the host and its VMs reach `dns`/`proxy` through the VM's address (§4, "Serving nested DNS/proxy"). |
 
+For `clipboardBridge` the nested container always uses the host's **`tcp`**
+listener, which is mTLS with the guest certificate — the DNAT'd port crosses the
+inner bridge plus the VM's masquerade, so it is not private by construction.
+Only a Linux VM's `vsock` callback runs with `security = none`.
+
 `vm.persistentHome` / `vm.nixStoreOverlay` remain VM-only; a nested container's
 rootfs lives on the VM's persistent `nixos-containers.img` volume, so its
 `/home/user` persists there.

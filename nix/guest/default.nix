@@ -265,7 +265,30 @@ in {
             host = connection.host;
             vsockCid = connection.cid;
             port = 27795;
-            mtls = clientMtls "1.3.6.1.4.1.99999.3.2" "1.3.6.1.4.1.99999.3.1";
+            # VSOCK is private by construction (plaintext, no peer auth); TCP
+            # crosses the shared container bridge, so it is mTLS with the
+            # tartarus guest certificate. Plaintext must be explicit on both
+            # auth knobs: `auto` would resolve TCP to mTLS, and the module
+            # rejects implicit auth disabling.
+            security = {
+              transportEncryption =
+                if connection.transport == "tcp"
+                then "mtls"
+                else "none";
+              clientAuth =
+                if connection.transport == "tcp"
+                then "transport"
+                else "none";
+              serverAuth =
+                if connection.transport == "tcp"
+                then "transport"
+                else "none";
+            };
+            # The module only emits `[mtls]` when the resolved transport
+            # encryption is mTLS, so this block is inert for VSOCK.
+            mtls =
+              clientMtls "1.3.6.1.4.1.99999.3.2" "1.3.6.1.4.1.99999.3.1"
+              // {enable = connection.transport == "tcp";};
             waylandDisplay = "wprs-0";
             autostart = g.graphical;
             proxy.enable = true;

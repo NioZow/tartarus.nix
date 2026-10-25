@@ -155,7 +155,11 @@ or complains the config is missing, rebuild the host and confirm
 packages and as self-contained NixOS **and** home-manager modules. They need
 only their own `tartarus.<service>.*` options and can be used with no guest, no
 VM and no host module at all. See their deep-dive docs and the ready-to-edit
-files in [`examples/`](../../examples).
+files in [`examples/`](../../examples). The `clipboard-bridge` server is
+multi-listener: it binds every `tartarus.clipboard-bridge.server.listeners`
+entry (a `vsock` guest callback, a `tcp` guest callback, and a same-user Unix
+admin listener) in one process, each with its own security; there is no shared
+secret.
 
 The `homeManagerModules."tartarus-ssh"` module is the client-side counterpart
 for hosts that run guests: enable `tartarus.ssh.client.enable = true` and it

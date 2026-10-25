@@ -65,7 +65,7 @@ Host-wide defaults for `kind = "container"` guests.
 | `autostart` | bool | `false` | Start on login via a tartarus user service. |
 | `requires` | list | `[]` | Names of other enabled guests started before this one. Must be acyclic. |
 | `relays` | list | `[]` | Host port forwards into this guest (`{ port; targetPort; protocol; host; }`). Every guest can reach the relay as `host:<port>` (the `host` alias is in its `/etc/hosts`); on Linux the host firewall DNATs the port, on Darwin a `socat` relay binds the gateway. |
-| `services.clipboardBridge` | bool | `false` | Clipboard bridge (guest client + host server, mTLS). |
+| `services.clipboardBridge` | bool | `false` | Clipboard bridge: a guest client plus a host server that binds several self-contained listeners — `vsock` guest callback with no TLS, `tcp` guest callback with mTLS, and a same-user Unix admin listener for the local CLI. No shared secret. |
 | `services.sshAgentProxy` | bool | `false` | Forward the host ssh-agent into the guest. |
 | `services.sudoAuthProxy` | bool | `false` | PAM sudo authentication proxy. |
 | `services.gpgAgentProxy` | bool | `false` | GPG agent forwarding over SSH. |

@@ -89,6 +89,15 @@
   sshReq = requesting "sshAgentProxy";
   clipReq = requesting "clipboardBridge";
 
+  # Same-user Unix socket the clipboard server binds for the host CLI. The
+  # guest-facing listener may be `vsock` (a Linux VM's callback transport), and
+  # a host process cannot dial its own VSOCK CID, so the admin client needs a
+  # local socket. `%t` resolves to the same runtime dir for the service and the
+  # CLI. It is a normal listener marked `admin = true`, authorized by same-user
+  # Unix permissions (socket 0600, parent 0700) plus the allow-all rule -- there
+  # is no shared secret and no admin certificate.
+  clipAdminSocket = "%t/clipboard-bridge-admin.sock";
+
   needsSudo = sudoReq != {};
   needsSsh = sshReq != {};
   needsClip = clipReq != {};
@@ -119,13 +128,6 @@
 
   listOf = req: mapAttrsToList (name: g: {inherit name g;}) req;
 
-  mkTransport = req:
-    if isDarwin
-    then "tcp"
-    else if any (e: transportOf e.g == "vsock") (listOf req)
-    then "vsock"
-    else "tcp";
-
   # Host address(es) a callback `tcp` listener must bind. `entries` is the set
   # of requesting guests whose *effective* transport is `tcp` (the callers
   # filter out vsock and `unix`-marker guests); only those decide the bind
@@ -143,19 +145,75 @@
     then ["0.0.0.0"]
     else optional hasVm instances.vm.hostIP ++ optional hasCtn instances.container.hostIP;
 
-  # Single-address convenience for the clipboard server, whose module binds one
-  # socket. `entries` must already be tcp-only (as for `mkTcpHosts`).
-  mkTcpHost = entries: let
-    hosts = mkTcpHosts entries;
-  in
-    if hosts == []
-    then
-      (
-        if isDarwin
-        then "0.0.0.0"
-        else instances.vm.hostIP
-      )
-    else builtins.head hosts;
+  # One listener per distinct transport the clipboard guests ask for, plus the
+  # local admin listener. The server binds all of them in one process, so a
+  # Linux host serves its VSOCK VMs and its TCP containers at the same time
+  # instead of collapsing to a single transport and leaving the other kind with
+  # connection refused.
+  clipKinds = lib.unique (map (e: transportOf e.g) (listOf clipReq));
+  clipTcpEntries = filter (e: transportOf e.g == "tcp") (listOf clipReq);
+
+  # VSOCK callbacks are private by construction: plaintext with no peer auth.
+  clipVsockListener = {
+    type = "vsock";
+    name = "tartarus-vsock";
+    cid = 2;
+    port = 27795;
+    resolution = "tartarus";
+    security = callbackSecurity;
+  };
+
+  # The tartarus TCP container listener is mTLS with the guest certificate: the
+  # container bridge is shared, so this callback is not trusted by construction
+  # (unlike VSOCK). One entry per bind address the TCP guests actually dial.
+  clipTcpListeners =
+    lib.optionals (builtins.elem "tcp" clipKinds)
+    (map (host: {
+        type = "tcp";
+        name = "tartarus-tcp-${host}";
+        inherit host;
+        port = 27795;
+        resolution = "tartarus";
+        security = unixSecurity;
+        mtls = {
+          enable = true;
+          caFile = x509Ca;
+          certFile = x509HostCert;
+          keyFile = x509HostKey;
+          requiredOid = clipServerOid;
+          peerOid = clipClientOid;
+        };
+      })
+      (mkTcpHosts clipTcpEntries));
+
+  # The host CLI talks to this same-user Unix listener, which serves the admin
+  # control plane and is authorized by the allow-all rule below.
+  clipAdminListener = {
+    type = "unix";
+    name = "admin";
+    socket = clipAdminSocket;
+    admin = true;
+    resolution = "none";
+    security = callbackSecurity;
+    socketDirMode = "0700";
+    socketMode = "0600";
+  };
+
+  # Stable, deterministic listener order: vsock, tcp, admin.
+  clipListeners =
+    optional (builtins.elem "vsock" clipKinds) clipVsockListener
+    ++ clipTcpListeners
+    ++ [clipAdminListener];
+
+  # The local admin socket is same-user IPC, so its identity is the filesystem
+  # boundary; allow every admin action on it. Guest listeners serve only the
+  # guest actions, so they need no rule.
+  clipRules = [
+    {
+      match.listeners = ["admin"];
+      policy = "allow";
+    }
+  ];
 
   # ---- sudo-auth-proxy host wiring (audit A1) ----------------------------
   # One listener per distinct transport the requesting guests ask for: a guest
@@ -286,6 +344,14 @@
   # services), so the unix listener's mTLS EKU check admits the guests without
   # an operator fingerprint list.
   sudoClientOid = "1.3.6.1.4.1.99999.1.2";
+
+  # Clipboard EKU OIDs (same subtree convention as sudo/ssh). The admin OID is
+  # reserved for the optional certificate-admin listener; the default host admin
+  # path is the same-user Unix socket, which needs no certificate.
+  clipServerOid = "1.3.6.1.4.1.99999.3.1";
+  clipClientOid = "1.3.6.1.4.1.99999.3.2";
+  clipAdminOid = "1.3.6.1.4.1.99999.3.3";
+
   homeDir =
     args.homeDir
     or (
@@ -311,6 +377,22 @@
       name = e.name;
     })
     sshEntries;
+
+  # `vm`/`tcp_vm` feed `resolution = "tartarus"`: a VSOCK peer is named by CID,
+  # a TCP peer by source IP. The TCP map covers every requesting guest (the IP
+  # simply never matches for a VSOCK guest).
+  clipVmEntries =
+    map (e: {
+      cid = guestId e.name e.g;
+      name = e.name;
+    })
+    (filter (e: transportOf e.g == "vsock") (listOf clipReq));
+  clipTcpEntriesForResolution =
+    map (e: {
+      ip = guestIP e.name e.g;
+      name = e.name;
+    })
+    (listOf clipReq);
 in {
   config = mkIf needsAny {
     # The tartarus home-manager service modules pick their unit schema from the
@@ -357,17 +439,27 @@ in {
       (mkIf needsClip {
         tartarus.clipboard-bridge.server = {
           enable = mkDefault true;
-          transport = mkDefault (mkTransport clipReq);
-          host = mkDefault (mkTcpHost (filter (e: transportOf e.g == "tcp") (listOf clipReq)));
-          port = mkDefault 27795;
-          mtls = {
-            enable = mkDefault true;
-            caFile = mkDefault x509Ca;
-            certFile = mkDefault x509HostCert;
-            keyFile = mkDefault x509HostKey;
-            requiredOid = mkDefault "1.3.6.1.4.1.99999.3.1";
-            peerOid = mkDefault "1.3.6.1.4.1.99999.3.2";
+          # Every listener is self-contained: VSOCK callbacks are private by
+          # construction (plaintext, no auth), TCP callbacks are mTLS with the
+          # guest certificate, and the local admin socket is same-user Unix IPC.
+          listeners = mkDefault clipListeners;
+          # Authorize the local admin listener; guest listeners only serve the
+          # guest actions and need no rule.
+          rule = mkDefault clipRules;
+          # `vm`/`tcp_vm` feed `resolution = "tartarus"`.
+          settings = {
+            vm = mkDefault clipVmEntries;
+            tcp_vm = mkDefault clipTcpEntriesForResolution;
           };
+        };
+
+        # Point an enabled admin client at the admin Unix socket. It is
+        # same-user IPC, so it runs with no crypto and no authentication (both
+        # auth knobs must be explicit for plaintext).
+        tartarus.clipboard-bridge.adminClient = {
+          transport = mkDefault "unix";
+          socket = mkDefault clipAdminSocket;
+          security = mkDefault callbackSecurity;
         };
       })
     ];

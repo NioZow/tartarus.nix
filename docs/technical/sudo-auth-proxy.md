@@ -1105,6 +1105,15 @@ issuance is future work. The table below records the intended mapping:
 | sudo-auth-proxy  | `1.3.6.1.4.1.99999.1.1`                     | `1.3.6.1.4.1.99999.1.2`                     |
 | ssh-agent-proxy  | `1.3.6.1.4.1.99999.2.1`                     | `1.3.6.1.4.1.99999.2.2`                     |
 | clipboard-bridge | `1.3.6.1.4.1.99999.3.1`                     | `1.3.6.1.4.1.99999.3.2`                     |
+| clipboard admin  | —                                           | `1.3.6.1.4.1.99999.3.3`                     |
+
+The clipboard **admin** certificate is the one deliberate exception to the
+"all three client OIDs" rule: it carries only `clientAuth` plus
+`1.3.6.1.4.1.99999.3.3`, and guest certificates never carry that OID (see
+`docs/technical/clipboard-bridge.md` §8.3/§8.5). It is issued by
+`tartarus ca admin` or `tartarus-certs issue-admin` only when a
+certificate-auth admin listener is configured; the default admin path is the
+local Unix socket.
 
 The implementation enforces the _client_ OID on the leaf for mTLS, but because
 every client cert carries every client OID that check is not discriminating.

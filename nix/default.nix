@@ -156,9 +156,132 @@ in {
       grep -qF 'transport_encryption = "none"' ${sudoToml}
       echo ok > $out
     '';
+
+    # A standalone home-manager clipboard-bridge server with three
+    # self-contained listeners: a plaintext VSOCK guest listener, a TCP guest
+    # listener that resolves to mTLS via `auto`, and a plaintext Unix admin
+    # listener plus an allow rule. The generated TOML must carry exactly three
+    # `[[listeners]]` headers, one mTLS block, the admin flag and the rule.
+    clipboardTomlHm = inputs.home-manager.lib.homeManagerConfiguration {
+      inherit pkgs;
+      modules = [
+        self.homeManagerModules."clipboard-bridge"
+        {
+          _module.args.system = system;
+          home.username = "user";
+          home.homeDirectory = "/home/user";
+          home.stateVersion = "26.05";
+          tartarus.clipboard-bridge.server = {
+            enable = true;
+            listeners = [
+              {
+                type = "vsock";
+                name = "tartarus-vsock";
+                cid = 2;
+                port = 27795;
+                security = {
+                  transportEncryption = "none";
+                  clientAuth = "none";
+                  serverAuth = "none";
+                };
+              }
+              {
+                type = "tcp";
+                name = "tartarus-tcp";
+                host = "127.0.0.1";
+                port = 27795;
+                mtls = {
+                  enable = true;
+                  caFile = "/tmp/ca.crt";
+                  certFile = "/tmp/server.crt";
+                  keyFile = "/tmp/server.key";
+                };
+              }
+              {
+                type = "unix";
+                name = "admin";
+                socket = "/tmp/clipboard-bridge-admin.sock";
+                admin = true;
+                resolution = "none";
+                security = {
+                  transportEncryption = "none";
+                  clientAuth = "none";
+                  serverAuth = "none";
+                };
+              }
+            ];
+            rule = [
+              {
+                match.listeners = ["admin"];
+                policy = "allow";
+              }
+            ];
+          };
+        }
+      ];
+    };
+    clipboardToml =
+      clipboardTomlHm.config.home.file
+      ."/home/user/.config/clipboard-bridge/server.toml"
+      .source;
+    clipboardTomlShape = pkgs.runCommand "tartarus-clipboard-bridge-toml-shape" {} ''
+      set -eu
+      test "$(grep -c '^\[\[listeners\]\]' ${clipboardToml})" -eq 3
+      ! grep -qF '[listener_defaults]' ${clipboardToml}
+      grep -qF 'transport_encryption = "mtls"' ${clipboardToml}
+      grep -qF 'transport_encryption = "none"' ${clipboardToml}
+      test "$(grep -c '^\[listeners.mtls\]' ${clipboardToml})" -eq 1
+      grep -qF 'admin = true' ${clipboardToml}
+      grep -qF '[[rule]]' ${clipboardToml}
+      grep -qF 'policy = "allow"' ${clipboardToml}
+      # Bind-target keys stay with their own listener kind.
+      ! grep -qF 'socket = ' ${clipboardToml} || test "$(grep -c 'socket = ' ${clipboardToml})" -eq 1
+      echo ok > $out
+    '';
+
+    # A Nix-rendered certificate admin client must carry the admin EKU, not the
+    # guest client EKU, or it rejects its own admin certificate before the
+    # handshake.
+    clipboardAdminTomlHm = inputs.home-manager.lib.homeManagerConfiguration {
+      inherit pkgs;
+      modules = [
+        self.homeManagerModules."clipboard-bridge"
+        {
+          _module.args.system = system;
+          home.username = "user";
+          home.homeDirectory = "/home/user";
+          home.stateVersion = "26.05";
+          tartarus.clipboard-bridge.adminClient = {
+            enable = true;
+            transport = "tcp";
+            host = "127.0.0.1";
+            port = 27796;
+            mtls = {
+              enable = true;
+              caFile = "/tmp/ca.crt";
+              certFile = "/tmp/admin.crt";
+              keyFile = "/tmp/admin.key";
+            };
+          };
+        }
+      ];
+    };
+    clipboardAdminToml =
+      clipboardAdminTomlHm.config.home.file
+      ."/home/user/.config/clipboard-bridge/admin.toml"
+      .source;
+    clipboardAdminTomlShape = pkgs.runCommand "tartarus-clipboard-bridge-admin-toml-shape" {} ''
+      set -eu
+      grep -qF 'required_oid = "1.3.6.1.4.1.99999.3.3"' ${clipboardAdminToml}
+      grep -qF 'peer_required_oid = "1.3.6.1.4.1.99999.3.1"' ${clipboardAdminToml}
+      ! grep -qF 'required_oid = "1.3.6.1.4.1.99999.3.2"' ${clipboardAdminToml}
+      echo ok > $out
+    '';
   in
     (lib.mapAttrs' (name: t: lib.nameValuePair (safe name) (mkCheck name t)) suite.tests)
     // {
       "tartarus-sudo-auth-proxy-toml-shape" = tomlShape;
+      "tartarus-clipboard-bridge-toml-shape" = clipboardTomlShape;
+      "tartarus-clipboard-bridge-admin-toml-shape" = clipboardAdminTomlShape;
     });
 }

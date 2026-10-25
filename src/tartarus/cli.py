@@ -218,13 +218,17 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("name", nargs="?", help="instance name (default: every guest)")
     p.add_argument("--json", action="store_true", help="print as JSON instead of a table")
 
-    p = sub.add_parser("ca", help="manage the shared guest CA material")
+    p = sub.add_parser("ca", help="manage the shared guest/admin CA material")
     ca_sub = p.add_subparsers(dest="ca_command", required=True)
     q = ca_sub.add_parser(
         "ensure",
         help="create/refresh a guest's CA-signed SSH host key and X509 client cert without starting it",
     )
     q.add_argument("name", help="guest name (template or instance)")
+    ca_sub.add_parser(
+        "admin",
+        help="create/refresh the optional clipboard-bridge admin certificate (clientAuth + admin EKU) without a guest",
+    )
 
 
 def build_parser(config) -> argparse.ArgumentParser:
@@ -345,6 +349,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         # build/lifecycle routing. NixOS calls it from `container@<name>`'s
         # preStart so the CA bind mounts exist before nspawn resolves them.
         if args.command == "ca":
+            # `ca admin` mints the optional clipboard admin cert and has no
+            # guest, so it must be handled before any `args.name`/require_guest
+            # access (and it never needs `resolve_kind`).
+            if getattr(args, "ca_command", None) == "admin":
+                ca.ensure_clipboard_admin_cert(config)
+                ok("Clipboard admin certificate material is ready.")
+                return
             kind = "container" if args.container else "vm"
             guest = config.require_guest(args.name, kind)
             if guest.host is not None:

@@ -1413,6 +1413,62 @@
     };
   };
 
+  # clipboard-bridge analogue: its server used to collapse to a single
+  # transport (vsock won), leaving the container with connection refused.
+  hostClipMixedTransports = mkHost {
+    guests = {
+      vsockVm = {
+        enable = true;
+        kind = "vm";
+        id = 3;
+        internet = true;
+        services.clipboardBridge = true;
+      };
+      tcpCtn = {
+        enable = true;
+        kind = "container";
+        id = 4;
+        internet = true;
+        services.clipboardBridge = true;
+      };
+    };
+  };
+
+  # Two TCP callback kinds on one host: a `disableVsock` VM binds the VM bridge
+  # and a container binds the container bridge. Both entries must get distinct
+  # listener names or the module's unique-name assertion rejects the host.
+  hostClipMixedTcpKinds = mkHost {
+    guests = {
+      tcpVm = {
+        enable = true;
+        kind = "vm";
+        id = 3;
+        internet = true;
+        services = {
+          clipboardBridge = true;
+          disableVsock = true;
+        };
+      };
+      tcpCtn = {
+        enable = true;
+        kind = "container";
+        id = 4;
+        internet = true;
+        services.clipboardBridge = true;
+      };
+    };
+  };
+
+  # Force the home-manager assertions the nested host config carries (the host
+  # level `internalAssertions` covers only tartarus's own list).
+  homeAssertionsPass = host: let
+    r = builtins.tryEval (
+      all (assertion: assertion.assertion)
+      host.config.home-manager.users.user.assertions
+    );
+  in
+    r.success && r.value;
+
   # A container-host stand-in VM (`ch` serving its inner container's sudo
   # request, `disableVsock = true`) must yield exactly one `tcp` listener. This
   # is the same shape as `hostNestedService`, so reuse it rather than pay for a
@@ -3344,6 +3400,39 @@ in {
         && tcp != null
         && tcp.host == ids.ctnHostIP)
       "the ssh-agent server did not bind both a vsock and a tcp listener for a mixed host, or bound the tcp listener on the VM bridge instead of the container bridge";
+    "hostClipMixedTransports" =
+      T
+      (let
+        listeners = hostServerListeners hostClipMixedTransports "clipboard-bridge";
+        kinds = map (t: t.type) listeners;
+        tcp = lib.findFirst (t: t.type == "tcp") null listeners;
+      in
+        hasKind kinds "vsock"
+        && hasKind kinds "tcp"
+        && tcp != null
+        && tcp.host == ids.ctnHostIP)
+      "the clipboard server did not bind both a vsock and a tcp listener for a mixed host, or bound the tcp listener on the container bridge";
+    # Two TCP binds (a `disableVsock` VM on the VM bridge and a container on the
+    # container bridge) must have distinct listener names, and the whole host
+    # (including the nested HM assertions) must evaluate.
+    "hostClipMixedTcpKinds" =
+      T
+      (let
+        listeners = hostServerListeners hostClipMixedTcpKinds "clipboard-bridge";
+        tcp = filter (listener: listener.type == "tcp") listeners;
+        hosts = map (listener: listener.host) tcp;
+        names = map (listener: listener.name) tcp;
+      in
+        lib.length tcp
+        == 2
+        && lib.length (lib.unique hosts) == 2
+        && lib.length (lib.unique names) == 2
+        && lib.elem ids.vmHostIP hosts
+        && lib.elem ids.ctnHostIP hosts
+        && assertionsPass hostClipMixedTcpKinds
+        && homeAssertionsPass hostClipMixedTcpKinds
+        && nixosDrvOk hostClipMixedTcpKinds)
+      "the clipboard server duplicated a tcp listener name or the mixed-TCP host did not evaluate";
     # `unix` (host-dials-guest) and a callback transport used to throw; both
     # listeners must now coexist.
     "hostSudoUnixPlusCallback" =
@@ -3581,7 +3670,22 @@ in {
     # explicitly-named `sudo-auth-proxy-pam` alias.
     "standalone/nixos-clipboard-bridge" =
       T
-      (nixosDrvOk (mkStandaloneNixos self.nixosModules."clipboard-bridge" {tartarus.clipboard-bridge.enable = true;}))
+      (nixosDrvOk (mkStandaloneNixos self.nixosModules."clipboard-bridge" {
+        tartarus.clipboard-bridge = {
+          enable = true;
+          server.listeners = [
+            {
+              type = "unix";
+              socket = "/tmp/clipboard-bridge.sock";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+            }
+          ];
+        };
+      }))
       "clipboard-bridge NixOS module does not evaluate standalone";
     "standalone/nixos-ssh-agent-proxy" =
       T
@@ -3703,8 +3807,354 @@ in {
 
     "standalone/hm-clipboard-bridge" =
       T
-      (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {tartarus.clipboard-bridge.enable = true;}))
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge = {
+          enable = true;
+          server.listeners = [
+            {
+              type = "unix";
+              socket = "/tmp/clipboard-bridge.sock";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+            }
+          ];
+        };
+      }))
       "clipboard-bridge home-manager module does not evaluate standalone";
+
+    # A three-listener server (vsock plaintext, tcp mTLS via `auto`, unix admin
+    # plaintext) must evaluate and satisfy every per-listener assertion.
+    "standalone/hm-clipboard-bridge-server" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "vsock";
+              name = "tartarus-vsock";
+              cid = 2;
+              port = 27795;
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+            }
+            {
+              type = "tcp";
+              name = "tartarus-tcp";
+              host = "127.0.0.1";
+              port = 27795;
+              mtls = {
+                enable = true;
+                caFile = "/tmp/ca.crt";
+                certFile = "/tmp/server.crt";
+                keyFile = "/tmp/server.key";
+              };
+            }
+            {
+              type = "unix";
+              name = "admin";
+              socket = "/tmp/clipboard-bridge-admin.sock";
+              admin = true;
+              resolution = "none";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+            }
+          ];
+          rule = [
+            {
+              match.listeners = ["admin"];
+              policy = "allow";
+            }
+          ];
+        };
+      }))
+      "clipboard-bridge home-manager module rejected a three-listener server";
+
+    # `transport_encryption = "none"` must state both auths explicitly; the
+    # default `transport` auths make the combination invalid.
+    "standalone/hm-clipboard-bridge-implicit-plaintext" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "vsock";
+              security.transportEncryption = "none";
+            }
+          ];
+        };
+      })))
+      "clipboard-bridge accepted plaintext with implicit transport authentication";
+
+    # Listener names are the `match.listeners` selector, so they must be unique.
+    "standalone/hm-clipboard-bridge-duplicate-listener-names" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "vsock";
+              name = "duplicate";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+            }
+            {
+              type = "unix";
+              name = "duplicate";
+              socket = "/tmp/clipboard-bridge.sock";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+            }
+          ];
+        };
+      })))
+      "clipboard-bridge accepted duplicate listener names";
+
+    # A unix peer has neither CID nor IP, so tartarus resolution cannot work.
+    "standalone/hm-clipboard-bridge-unix-tartarus-resolution" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "unix";
+              socket = "/tmp/clipboard-bridge.sock";
+              resolution = "tartarus";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+            }
+          ];
+        };
+      })))
+      "clipboard-bridge accepted tartarus resolution on the unix transport";
+
+    # An admin mTLS listener must require the admin EKU, so a guest certificate
+    # cannot act as an admin.
+    "standalone/hm-clipboard-bridge-admin-peer-oid" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "tcp";
+              admin = true;
+              host = "127.0.0.1";
+              port = 27796;
+              security = {
+                transportEncryption = "mtls";
+                clientAuth = "transport";
+                serverAuth = "transport";
+              };
+              mtls = {
+                enable = true;
+                peerOid = "1.3.6.1.4.1.99999.3.2";
+              };
+            }
+          ];
+        };
+      })))
+      "clipboard-bridge accepted an admin mTLS listener with a guest peer OID";
+
+    # A TCP client using mTLS plus an `[acl]` server pin must evaluate.
+    "standalone/hm-clipboard-bridge-client-mtls-acl" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.client = {
+          enable = true;
+          transport = "tcp";
+          host = "127.0.0.1";
+          port = 27795;
+          mtls = {
+            enable = true;
+            caFile = "/tmp/ca.crt";
+            certFile = "/tmp/client.crt";
+            keyFile = "/tmp/client.key";
+          };
+          acl = {
+            trustedFingerprints = ["SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="];
+            trustedNames = ["server"];
+          };
+        };
+      }))
+      "clipboard-bridge client with mTLS and an ACL does not evaluate";
+
+    # The admin client defaults to the admin EKU, not the guest client EKU, so
+    # a Nix-rendered certificate admin passes its own cert verification.
+    "standalone/hm-clipboard-bridge-admin-client-oid" =
+      T
+      (let
+        hm = mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+          tartarus.clipboard-bridge.adminClient = {
+            enable = true;
+            transport = "tcp";
+            host = "127.0.0.1";
+            port = 27796;
+            mtls = {
+              enable = true;
+              caFile = "/tmp/ca.crt";
+              certFile = "/tmp/admin.crt";
+              keyFile = "/tmp/admin.key";
+            };
+          };
+        };
+        admin = hm.config.tartarus.clipboard-bridge.adminClient;
+      in
+        hmDrvOk hm
+        && admin.mtls.requiredOid == "1.3.6.1.4.1.99999.3.3"
+        && admin.mtls.peerOid == "1.3.6.1.4.1.99999.3.1")
+      "the admin client did not default to the admin EKU and the server peer OID";
+
+    # An explicit guest OID on an mTLS admin client must be refused: the admin
+    # certificate carries only the admin EKU.
+    "standalone/hm-clipboard-bridge-admin-client-guest-oid" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.adminClient = {
+          enable = true;
+          transport = "tcp";
+          host = "127.0.0.1";
+          port = 27796;
+          mtls = {
+            enable = true;
+            caFile = "/tmp/ca.crt";
+            certFile = "/tmp/admin.crt";
+            keyFile = "/tmp/admin.key";
+            requiredOid = "1.3.6.1.4.1.99999.3.2";
+          };
+        };
+      })))
+      "clipboard-bridge accepted an admin client requiring the guest EKU";
+
+    # `resolution = "certificate"` needs mTLS to supply a certificate identity.
+    "standalone/hm-clipboard-bridge-certificate-without-mtls" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "unix";
+              name = "admin";
+              socket = "/tmp/clipboard-bridge.sock";
+              resolution = "certificate";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+            }
+          ];
+        };
+      })))
+      "clipboard-bridge accepted certificate resolution without mTLS";
+
+    # A unix client without a socket must fail closed rather than dial TCP.
+    "standalone/hm-clipboard-bridge-unix-client-without-socket" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.client = {
+          enable = true;
+          transport = "unix";
+          security = {
+            transportEncryption = "none";
+            clientAuth = "none";
+            serverAuth = "none";
+          };
+        };
+      })))
+      "clipboard-bridge accepted a unix client without a socket";
+
+    # An explicit `none` plus `mtls.enable = true` is a Python ConfigError; Nix
+    # must reject it instead of silently upgrading the explicit value.
+    "standalone/hm-clipboard-bridge-server-mtls-none-conflict" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "vsock";
+              mtls.enable = true;
+              security.transportEncryption = "none";
+            }
+          ];
+        };
+      })))
+      "clipboard-bridge accepted a server listener with mtls.enable and explicit none";
+    "standalone/hm-clipboard-bridge-client-mtls-none-conflict" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.client = {
+          enable = true;
+          transport = "vsock";
+          mtls.enable = true;
+          security = {
+            transportEncryption = "none";
+            clientAuth = "none";
+            serverAuth = "none";
+          };
+        };
+      })))
+      "clipboard-bridge accepted a client with mtls.enable and explicit none";
+
+    # Enabling both clients with their proxy services must not collide on a
+    # config path, proxy socket or systemd unit name.
+    "standalone/hm-clipboard-bridge-client-and-admin-proxies" =
+      T
+      (let
+        hm = mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+          tartarus.clipboard-bridge = {
+            client = {
+              enable = true;
+              transport = "unix";
+              socket = "/tmp/clipboard-client.sock";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+              proxy.enable = true;
+            };
+            adminClient = {
+              enable = true;
+              transport = "unix";
+              socket = "/tmp/clipboard-admin.sock";
+              security = {
+                transportEncryption = "none";
+                clientAuth = "none";
+                serverAuth = "none";
+              };
+              proxy.enable = true;
+            };
+          };
+        };
+        cfg = hm.config.tartarus.clipboard-bridge;
+      in
+        hmDrvOk hm
+        && cfg.client.proxy.socketPath != cfg.adminClient.proxy.socketPath)
+      "enabling the guest client and admin client proxies together does not evaluate";
     "standalone/hm-ssh-agent-proxy" =
       T
       (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {tartarus.ssh-agent-proxy.enable = true;}))
@@ -3948,7 +4398,22 @@ in {
     "standalone/no-host-module" =
       T
       (let
-        host = mkStandaloneNixos self.nixosModules."clipboard-bridge" {tartarus.clipboard-bridge.enable = true;};
+        host = mkStandaloneNixos self.nixosModules."clipboard-bridge" {
+          tartarus.clipboard-bridge = {
+            enable = true;
+            server.listeners = [
+              {
+                type = "unix";
+                socket = "/tmp/clipboard-bridge.sock";
+                security = {
+                  transportEncryption = "none";
+                  clientAuth = "none";
+                  serverAuth = "none";
+                };
+              }
+            ];
+          };
+        };
       in
         !(host.config.tartarus ? guests) && !(host.config.tartarus ? proxy))
       "a service-only config pulled in tartarus host options (guests/proxy)";

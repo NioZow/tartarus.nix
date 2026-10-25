@@ -68,6 +68,7 @@ Full documentation lives in [`docs/`](docs/README.md).
   [Container-host VMs](docs/technical/container-host.md) ·
   [ssh-agent-proxy](docs/technical/ssh-agent-proxy.md) ·
   [sudo-auth-proxy](docs/technical/sudo-auth-proxy.md) ·
+  [clipboard-bridge](docs/technical/clipboard-bridge.md) ·
   [Manual smoke list](docs/technical/smoke.md)
 
 ## Platform notes

@@ -33,5 +33,7 @@ if you only want to run it.
 - [Container-host VMs](container-host.md) — nested nspawn, macOS container model.
 - [ssh-agent-proxy](ssh-agent-proxy.md) — architecture, security, threat model.
 - [sudo-auth-proxy](sudo-auth-proxy.md) — architecture, security, threat model.
+- [clipboard-bridge](clipboard-bridge.md) — multi-listener server, per-listener
+  security, admin rules.
 - [Manual smoke list](smoke.md) — the per-platform manual test pass.
 - [Design notes](design/) — `transport-listeners`, `remove-merge-mode`.

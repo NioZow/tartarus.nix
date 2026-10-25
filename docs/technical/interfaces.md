@@ -26,13 +26,13 @@ Current flake (`nix/default.nix`), per system in `x86_64-linux`,
 | `nixosModules."sudo-auth-proxy"` | PAM client module (same as `...-pam`). |
 | `nixosModules."sudo-auth-proxy-pam"` | Explicit alias for the PAM client. |
 | `nixosModules."ssh-agent-proxy"` | Host-side server module. |
-| `nixosModules."clipboard-bridge"` | Host-side server module. |
+| `nixosModules."clipboard-bridge"` | Host-side server module (multi-listener, per-listener security). |
 | `homeManagerModules."sudo-auth-proxy"` | Server module. |
 | `homeManagerModules."ssh-agent-proxy"` | Server/bridge/agent module. |
-| `homeManagerModules."clipboard-bridge"` | Server/client/adminClient module. |
+| `homeManagerModules."clipboard-bridge"` | Server/client/adminClient module; the server binds multiple self-contained listeners (guest `vsock`/`tcp` plus the same-user Unix admin listener), each with its own `security`/`mtls`/`resolution`. |
 | `homeManagerModules."tartarus-ssh"` | Guest SSH client config (`tartarus.ssh.client.*`). |
 | `packages.<system>` | `tartarus`, `sudo-auth-proxy`, `ssh-agent-proxy`, `clipboard-bridge`, `tartarus-certs`. |
-| `apps.<system>."tartarus-certs"` | Runnable certificate tool. |
+| `apps.<system>."tartarus-certs"` | Runnable certificate tool (`init-ca`, `issue-server`, `issue-client`, `issue-admin`). |
 | `checks.<system>` | The eval-level suite plus the sudo-auth-proxy TOML-shape check. |
 | `devShells.<system>.default` | `uv` + Python for the CLI. |
 
@@ -136,6 +136,8 @@ tartarus cid <name>          # MicroVM only
 tartarus ip <name>
 tartarus proxy <name>        # MicroVM only (ProxyCommand)
 tartarus proxy-ip <name>     # MicroVM only (vmnet, macOS)
+tartarus ca ensure <name>    # provision a guest's CA material
+tartarus ca admin            # optional clipboard admin certificate
 ```
 
 Global flags: `-c/--container` (tri-state: force container, or infer from
@@ -146,6 +148,10 @@ SYSTEM`, `--state-root PATH`, `--log/--no-log`.
   containers under their host VM (`--json` mirrors this with `children`).
 - Commands that name one guest infer its kind from `config.toml`.
 - `cid`/`proxy`/`proxy-ip` are MicroVM-only and error under `--container`.
+- `ca ensure` materialises a guest's CA files without starting it; `ca admin`
+  mints the **optional** clipboard admin certificate (admin EKU
+  `1.3.6.1.4.1.99999.3.3`) and takes no guest — the default clipboard admin path
+  is the same-user Unix socket and needs no certificate.
 - Every named-guest command passes the enabled-guest guard before acting.
 - `mount`, `unmount`/`umount` and `mounts` are handled before
   `flake.require_flake`: they need no user-flake evaluation, but named variants
