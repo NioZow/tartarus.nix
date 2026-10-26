@@ -306,6 +306,10 @@
 
     isVm = platform.isVm;
 
+    # The *eval host* platform, unlike `platform.isDarwin`, which describes the
+    # guest and is false for a nested container even on a Darwin host.
+    hostIsDarwin = lib.hasSuffix "-darwin" hostSystem;
+
     # Absolute host staging root exported to Linux VMs as the `tartarus-mounts`
     # share. Resolved per guest so numbered instances get their own directory.
     mountRoot = mountsLib.resolve {

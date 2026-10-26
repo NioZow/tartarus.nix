@@ -136,10 +136,14 @@ in {
       # rootless virtiofsd calls setegid() with the guest's primary GID on
       # every create/mkdir/mknod; unless that GID is already one it can assume,
       # the call fails with EPERM and every write to a virtiofs share is
-      # rejected (the mount still shows `rw`). Darwin does not use virtiofsd,
-      # and its host GID (20) collides with the guest's `lp`, so leave it alone.
+      # rejected (the mount still shows `rw`). A Darwin host does not use
+      # virtiofsd, and its host GID (20) collides with the guest's `lp`, so
+      # leave it alone. Check the *host* platform: a nested container inside a
+      # container-host VM is Linux-inner (`platform.isDarwin = false`) even when
+      # that VM is built on Darwin, and pinning GID 20 breaks its user config.
       users.groups.users.gid =
-        mkIf (!g.platform.isDarwin && g.hostGid != null) (lib.mkForce g.hostGid);
+        mkIf (!g.platform.isDarwin && !g.hostIsDarwin && g.hostGid != null)
+        (lib.mkForce g.hostGid);
       users.users.user =
         {
           createHome = true;
