@@ -33,6 +33,7 @@ Run from the package root::
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import socket
 import struct
@@ -1112,9 +1113,15 @@ SIGN_RESPONSE = 14
 
 
 def _fake_key_agent(
-    path: Path, stop: threading.Event, blob: bytes, comment: bytes = b"test"
+    path: Path,
+    stop: threading.Event,
+    blob: bytes | None = None,
+    comment: bytes = b"test",
+    *,
+    sign_ok: bool = True,
 ) -> threading.Thread:
-    """An upstream agent exposing one identity and answering sign requests."""
+    """An upstream agent exposing at most one identity and answering sign
+    requests (with a fake signature, or FAILURE when ``sign_ok`` is False)."""
 
     def serve() -> None:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1138,12 +1145,18 @@ def _fake_key_agent(
                     if not msg:
                         break
                     if msg[0] == REQUEST_IDENTITIES:
-                        payload = struct.pack(">BI", IDENTITIES_ANSWER, 1)
-                        payload += struct.pack(">I", len(blob)) + blob
-                        payload += struct.pack(">I", len(comment)) + comment
+                        payload = struct.pack(
+                            ">BI", IDENTITIES_ANSWER, 0 if blob is None else 1
+                        )
+                        if blob is not None:
+                            payload += struct.pack(">I", len(blob)) + blob
+                            payload += struct.pack(">I", len(comment)) + comment
                         conn.sendall(_frame(payload))
                     elif msg[0] == SIGN_REQUEST:
-                        conn.sendall(_frame(bytes([SIGN_RESPONSE]) + b"sig"))
+                        if sign_ok:
+                            conn.sendall(_frame(bytes([SIGN_RESPONSE]) + b"sig"))
+                        else:
+                            conn.sendall(_frame(bytes([FAILURE])))
                     else:
                         conn.sendall(_frame(bytes([FAILURE])))
             except OSError:
@@ -1155,6 +1168,83 @@ def _fake_key_agent(
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
     return thread
+
+
+def test_sign_follows_the_upstream_that_advertised_the_key(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    """A configured `key` without `socket` defaults to the first upstream, but
+    signing must go to the agent that actually advertised the blob.
+
+    Regression: a YubiKey/gpg-agent key merged after a keychain agent was
+    pre-registered with the keychain socket as its default, so every signature
+    was sent to the wrong agent and came back "agent refused operation".
+    """
+    first = tmp_path / "first.sock"
+    owner = tmp_path / "owner.sock"
+    server_sock = tmp_path / "server.sock"
+    stop = threading.Event()
+    blob = struct.pack(">I", 11) + b"ssh-ed25519" + b"yubikey"
+    # The first upstream advertises nothing and refuses every sign request.
+    _fake_key_agent(first, stop, None, sign_ok=False)
+    # The second upstream owns the key and signs it.
+    _fake_key_agent(owner, stop, blob, b"cardno:9_249_925", sign_ok=True)
+    _wait_for_socket(first)
+    _wait_for_socket(owner)
+
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        f'''mode = "proxy"
+agent_sockets = ["{first}", "{owner}"]
+
+[[key]]
+id = "yubikey"
+pubkey = "ssh-ed25519 {base64.b64encode(blob).decode()}"
+
+[[rule]]
+key = "*"
+auth = "allow"
+data_signing = "allow"
+notify = false
+
+[[listeners]]
+type = "unix"
+socket = "{server_sock}"
+resolution = "none"
+
+[listeners.security]
+transport_encryption = "none"
+client_auth = "none"
+server_auth = "none"
+''',
+    )
+    # The key entry without `socket` defaults to the first upstream.
+    assert next(iter(cfg.keys.values())).socket == str(first)
+    assert not next(iter(cfg.keys.values())).explicit_socket
+
+    thread = threading.Thread(target=sap.run_proxy, args=(cfg,), daemon=True)
+    thread.start()
+    _wait_for_socket(server_sock)
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(5.0)
+    try:
+        client.connect(str(server_sock))
+        # Enumerate identities so the proxy learns the blob's real owner.
+        client.sendall(_frame(bytes([REQUEST_IDENTITIES])))
+        resp = _recv_frame(client)
+        assert resp[0] == IDENTITIES_ANSWER
+
+        sign = bytes([SIGN_REQUEST])
+        sign += struct.pack(">I", len(blob)) + blob
+        sign += struct.pack(">I", 4) + b"data"
+        client.sendall(_frame(sign))
+        # Without the fix this is FAILURE (it went to `first`).
+        assert _recv_frame(client)[0] == SIGN_RESPONSE
+    finally:
+        client.close()
+        stop.set()
 
 
 def test_proxy_unix_listener_merges_two_agents_allow_all(

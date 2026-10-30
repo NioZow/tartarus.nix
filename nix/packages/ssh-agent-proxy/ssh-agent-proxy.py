@@ -225,6 +225,11 @@ class KeyConfig:
     public_blob: bytes
     fingerprint: str
     socket: str
+    # True when the config pinned this key to `socket` explicitly; an
+    # un-pinned key defaults to the first upstream for direct-sign clients but
+    # is routed to whichever upstream actually advertised it (see
+    # `Handler._sign_via_upstream`).
+    explicit_socket: bool = False
 
 
 @dataclass(frozen=True)
@@ -882,6 +887,7 @@ class Config:
                 public_blob=blob,
                 fingerprint=fingerprint,
                 socket=socket_path,
+                explicit_socket="socket" in entry,
             )
             log.debug(f"Registered key {entry.get('id')} ({fingerprint})")
 
@@ -2099,6 +2105,9 @@ class Handler(AgentIO, BaseRequestHandler):
         )
         self.allowed_keys_for_client: dict[bytes, KeyConfig] = {}
         self.allowed_sockets: list[str] = []
+        # public-key blob -> upstream id that advertised it on this connection,
+        # so a sign request goes to an agent that actually holds the key.
+        self.key_upstream: dict[bytes, str] = {}
         # session identifier -> verified target host key (from session-bind)
         self.bound_destinations: dict[bytes, bytes] = {}
         # usable key blob -> the rule that governs its use for this VM
@@ -2317,6 +2326,12 @@ class Handler(AgentIO, BaseRequestHandler):
             for _ in range(count):
                 key_blob = buf.read_string()
                 comment = buf.read_string()
+                # Record which upstream really owns this blob. A configured
+                # `key` that omits `socket` defaults to the first upstream, but
+                # the key may live in another merged agent (e.g. a YubiKey key
+                # in gpg-agent next to the keychain agent); signing must follow
+                # the agent that advertised it.
+                self.key_upstream.setdefault(key_blob, path)
                 admitted = key_blob in self.allowed_keys_for_client or self._maybe_autoregister(
                     key_blob, comment, path
                 )
@@ -2392,28 +2407,83 @@ class Handler(AgentIO, BaseRequestHandler):
         )
 
         if is_authorized:
-            target_link = real_agents.get(k_cfg.socket)
-            if target_link:
-                log.info(
-                    f"Access granted: VM={self.vm_name}, Key={k_cfg.id}, Fingerprint={k_cfg.fingerprint}, Purpose={purpose}"
+            resp, answered_by = self._sign_via_upstream(
+                key_blob, k_cfg, raw_msg, real_agents
+            )
+            if resp is None:
+                log.warning(
+                    f"Upstream agent closed before responding for key {k_cfg.id}"
                 )
-                resp = target_link.request(raw_msg)
-                if resp is None:
-                    log.warning(
-                        f"Upstream agent closed before responding for key {k_cfg.id}"
-                    )
-                    self._send_msg(client, bytes([AgentMsg.FAILURE]))
-                    return
-                self._send_msg(client, resp)
-                if rule.notify:
-                    notify(title, f"{self.vm_name} used key '{k_cfg.id}' for {purpose}")
+                self._send_msg(client, bytes([AgentMsg.FAILURE]))
                 return
+            if resp[0] == AgentMsg.FAILURE:
+                # Policy allowed it, but every upstream declined (e.g. a
+                # cancelled touch/PIN prompt on the agent that owns the key).
+                log.warning(
+                    f"Upstream agent refused signing: VM={self.vm_name}, "
+                    f"Key={k_cfg.id}, Purpose={purpose}, Last={answered_by}"
+                )
+                self._send_msg(client, resp)
+                return
+            log.info(
+                f"Access granted: VM={self.vm_name}, Key={k_cfg.id}, Fingerprint={k_cfg.fingerprint}, Purpose={purpose}, Upstream={answered_by}"
+            )
+            self._send_msg(client, resp)
+            if rule.notify:
+                notify(title, f"{self.vm_name} used key '{k_cfg.id}' for {purpose}")
+            return
         else:
             log.warning(
                 f"Access refused: VM={self.vm_name}, Key={k_cfg.id}, Fingerprint={k_cfg.fingerprint}, Purpose={purpose}"
             )
 
         self._send_msg(client, bytes([AgentMsg.FAILURE]))
+
+    def _sign_via_upstream(
+        self,
+        key_blob: bytes,
+        k_cfg: "KeyConfig",
+        raw_msg: bytes,
+        real_agents: dict[str, "AgentLink"],
+    ) -> tuple[Optional[bytes], Optional[str]]:
+        """Relay a sign request to an upstream that actually holds the key.
+
+        A configured `key` that omits `socket` defaults to the first upstream
+        (`key.socket`), but that agent may not hold the key: on a merge socket
+        the first agent is often the local keychain/file agent while the key
+        lives in another upstream (e.g. a YubiKey key in `gpg-agent`). Identities
+        advertised on this connection map each blob to its real owner, so try
+        that owner first. An explicitly pinned `key.socket` wins, and every
+        other connected upstream is tried too, taking the first answer that is
+        not `SSH_AGENT_FAILURE` (the documented relay behaviour). Returns
+        `(response, upstream_id)`; the response is None only when no upstream
+        answered at all.
+        """
+        owner = self.key_upstream.get(key_blob)
+        preferred = k_cfg.socket if k_cfg.explicit_socket else (owner or k_cfg.socket)
+        candidates = [preferred] + [owner or preferred]
+        candidates += [path for path in real_agents if path not in candidates]
+        log.debug(
+            f"sign routing: key={k_cfg.id} owner={owner!r} "
+            f"socket={k_cfg.socket!r} explicit={k_cfg.explicit_socket} "
+            f"candidates={candidates!r}"
+        )
+
+        last: Optional[bytes] = None
+        last_path: Optional[str] = None
+        seen: set[str] = set()
+        for path in candidates:
+            if path in seen or path not in real_agents:
+                continue
+            seen.add(path)
+            resp = real_agents[path].request(raw_msg)
+            last_path = path
+            if not resp:
+                continue
+            if resp[0] != AgentMsg.FAILURE:
+                return resp, path
+            last = resp
+        return last, last_path
 
     def _dialog_program(self) -> str:
         return self.config.dialog_program or (
