@@ -457,26 +457,37 @@ all as `user`). At the OS level inside the guest they are indistinguishable, so
 the routing key is the session's **selector**: each person's SSH session carries
 a _different_ value of `SUDO_AUTH_PROXY_SOCK`, set by their own host's SSH config
 to their own socket. `sshd` accepts that variable
-(`AcceptEnv SUDO_AUTH_PROXY_SOCK`), so every process in that session — including
-the shell, `sudo`, and its `pam_exec` child — inherits it.
+(`AcceptEnv SUDO_AUTH_PROXY_SOCK`), so the session's shell and the processes it
+execs inherit it. `pam_exec` is the exception: Linux-PAM starts the helper with
+only the PAM environment (`PAM_USER`, `PAM_TTY`, ...), and sudo does not copy
+`env_keep` variables into it. The wrapper therefore recovers the selector from
+the invoking process ancestry (the login shell is sudo's parent and still has
+it) before handing it to `run_client`.
 
 The client resolves its target socket from **`$SUDO_AUTH_PROXY_SOCK` and nothing
-else** (review log S3/S4, §19.7). The old `/proc/$PPID/environ` fallback and the
-static `socket` path are **removed**: a fallback is both a downgrade (an
-attacker who strips the variable selects the path) and a source of routing
-confusion. If the variable is absent, or the named socket does not exist, the
-client **fast-fails** (§10.2) and PAM continues. `sudo`'s default `env_reset`
-would strip the unknown variable, which is why the guest Nix module deploys
+else** (review log S3/S4, §19.7). The static `socket` path and every guessed
+fallback (a directory scan, the "newest socket") are **removed**: a fallback is
+a downgrade and a source of routing confusion. The one recovery path is the
+invoking process ancestry: because `pam_exec` cannot see the caller's
+environment, the wrapper reads `SUDO_AUTH_PROXY_SOCK` from `/proc/<pid>/environ`
+starting at sudo's parent (the login shell) and walking up a few levels. This is
+the caller's own process chain, not a guess; if no ancestor has the variable, or
+the named socket does not exist, the client **fast-fails** (§10.2) and PAM
+continues. `sudo`'s `env_reset` still strips the variable from the command
+environment, so the guest Nix module keeps
 `Defaults env_keep += "SUDO_AUTH_PROXY_SOCK"` **and**
-`Defaults env_keep += "SUDO_AUTH_PROXY_ACTIVE"` (the recursion guard, §10.4)
-into `sudoers`. Relying on ambient `sudo` behaviour is explicitly rejected
-(review log C1/B2).
+`Defaults env_keep += "SUDO_AUTH_PROXY_ACTIVE"` in `sudoers`; note that
+`env_keep` is not what delivers the selector to the `pam_exec` helper (it
+cannot), and it does not make the recursion guard survive into the elevated
+shell (T18/A5).
 
-> **Implemented (was review log C1).** `run_client` now reads the target socket
-> from `$SUDO_AUTH_PROXY_SOCK` **only** and fails closed when it is unset; the
-> static config `socket` key and the `/proc/$PPID/environ` fallback are gone. The
-> config `socket` key names the **server's** bind path and is ignored by the
-> client. This paragraph describes shipped behaviour, not a planned change.
+> **Implemented (was review log C1).** `run_client` reads the target socket from
+> `$SUDO_AUTH_PROXY_SOCK` **only** and fails closed when it is unset; there is no
+> static config fallback and no guessed socket. The PAM wrapper's ancestry
+> lookup (above) is the sole delivery mechanism for the selector under
+> `pam_exec`; the config `socket` key names the **server's** bind path and is
+> ignored by the client. This paragraph describes shipped behaviour, not a
+> planned change.
 
 > **Guest directory ownership (answering "can `sshd` even write there?").** The
 > `RemoteForward` bind is executed by the guest's `sshd` **as the guest login
@@ -503,11 +514,13 @@ cryptographic credential the client presents (§7.3, §8). The pty (`PAM_TTY`) i
 recorded in the request and covered by the request digest, so a decision is
 bound to the session and cannot be replayed into another one (§6.4).
 
-> **Hard dependency.** The `sudoers env_keep` entries above
-> (`SUDO_AUTH_PROXY_SOCK` and `SUDO_AUTH_PROXY_ACTIVE`) are required for the
-> `unix` transport's per-session routing and for the recursion guard. They are
-> deployed by the guest Nix module, not left to the operator, and are a Phase 2
-> exit criterion.
+> **Hard dependency.** The selector must be present in the session's
+> environment: `sshd`'s `SetEnv` puts it in the login shell, and the PAM
+> wrapper's ancestry lookup recovers it for the helper. The `sudoers env_keep`
+> entries above are still deployed (they keep the variables in the elevated
+> command's environment), but they are **not** what delivers the selector to
+> `pam_exec` and they do not make the recursion guard survive into the elevated
+> shell (T18/A5).
 >
 > **Stale-socket hygiene (corrected, review logs NF4 and audit A8).** A socket
 > left behind by a crashed/aborted session is cleaned up by the guest's `sshd`

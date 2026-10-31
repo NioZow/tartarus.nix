@@ -162,59 +162,60 @@
   # **First match wins; there is no merging between rules.** A permissive rule
   # written above a restrictive one takes precedence, so rule order is a policy
   # decision, not a formatting detail.
-  mkRuleType = lib: lib.types.listOf (lib.types.submodule {
-    options = {
-      match = lib.mkOption {
-        type = lib.types.submodule {
-          options = {
-            machine = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [];
-              description = ''
-                Requester patterns (fnmatch): the resolved friendly name, the
-                `labels` entry and the verified credential fingerprint. Empty
-                matches any requester.
-              '';
-            };
-            listeners = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [];
-              description = ''
-                Accepting listener name patterns (fnmatch). Empty matches every
-                listener; an unnamed listener matches only an empty selector or
-                one made exclusively of `*` patterns.
-              '';
-            };
-            targetUser = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [];
-              description = "Target (PAM) user patterns (fnmatch).";
-            };
-            invokingUser = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [];
-              description = "Invoking user patterns (fnmatch).";
-            };
-            service = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [];
-              description = "PAM service patterns (fnmatch: sudo/su/login).";
+  mkRuleType = lib:
+    lib.types.listOf (lib.types.submodule {
+      options = {
+        match = lib.mkOption {
+          type = lib.types.submodule {
+            options = {
+              machine = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [];
+                description = ''
+                  Requester patterns (fnmatch): the resolved friendly name, the
+                  `labels` entry and the verified credential fingerprint. Empty
+                  matches any requester.
+                '';
+              };
+              listeners = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [];
+                description = ''
+                  Accepting listener name patterns (fnmatch). Empty matches every
+                  listener; an unnamed listener matches only an empty selector or
+                  one made exclusively of `*` patterns.
+                '';
+              };
+              targetUser = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [];
+                description = "Target (PAM) user patterns (fnmatch).";
+              };
+              invokingUser = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [];
+                description = "Invoking user patterns (fnmatch).";
+              };
+              service = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [];
+                description = "PAM service patterns (fnmatch: sudo/su/login).";
+              };
             };
           };
+          default = {};
         };
-        default = {};
+        policy = lib.mkOption {
+          type = lib.types.enum ["allow" "ask" "deny"];
+          default = "ask";
+          description = ''
+            Decision for a matching request: `allow`/`deny` answer immediately
+            without a dialog, `ask` shows the confirmation prompt. Rules are
+            evaluated in order and the first match wins; no match means `ask`.
+          '';
+        };
       };
-      policy = lib.mkOption {
-        type = lib.types.enum ["allow" "ask" "deny"];
-        default = "ask";
-        description = ''
-          Decision for a matching request: `allow`/`deny` answer immediately
-          without a dialog, `ask` shows the confirmation prompt. Rules are
-          evaluated in order and the first match wins; no match means `ask`.
-        '';
-      };
-    };
-  });
+    });
 
   # `[labels]`: fingerprint -> display label. Display/log only; it is never an
   # authorization input and is never accepted from a peer.
@@ -223,9 +224,7 @@
   # The client-side `[acl]`: which **server** the client trusts to answer. A
   # fake or wrong-service server is refused even if CA-signed. Crypto material
   # only (never request metadata).
-  mkClientAclOptions = {
-    lib,
-  }: let
+  mkClientAclOptions = {lib}: let
     inherit (lib) mkOption types;
   in {
     trustedFingerprints = mkOption {
@@ -940,12 +939,50 @@
     clientScript = pkgs.writeShellScript "sudo-auth-proxy-pam-client" ''
       # Recursion guard: the same `SUDO_AUTH_PROXY_ACTIVE` check the Python
       # enforces on entry (doc §10.4). A nested `sudo`/`su` exits non-zero
-      # immediately -- no second dialog -- so PAM falls through. It survives
-      # `sudo` only because the guest mandates
-      # `Defaults env_keep += "SUDO_AUTH_PROXY_ACTIVE"` (doc §10.4); without
-      # that entry `env_reset` strips it and this guard is a no-op.
+      # immediately -- no second dialog -- so PAM falls through. Note that
+      # `pam_exec` gives this script only the PAM environment, so the guard is
+      # only effective if something (not this script) already exported the
+      # variable into the invoking environment; see the selector note below.
       [ -n "''${SUDO_AUTH_PROXY_ACTIVE:-}" ] && exit 1
       ${lib.optionalString (cfg.transport == "unix") ''
+        # `pam_exec.so` starts this helper with only the PAM environment
+        # (`PAM_USER`, `PAM_TTY`, ...), *not* the invoking shell's or sudo's
+        # environment. Linux-PAM creates the PAM environment empty and sudo
+        # only injects `SUDO_PROMPT`; `Defaults env_keep` affects the command
+        # environment built after authentication, so it cannot make the
+        # selector visible here. The selector is still fail-closed: recover it
+        # from the invoking process ancestry (the login shell is sudo's
+        # parent and inherited it from sshd's `SetEnv`). This is the caller's
+        # own process chain, not a static path, a directory scan, or "the
+        # newest socket"; if no ancestor has it, exit non-zero below.
+        if [ -z "''${SUDO_AUTH_PROXY_SOCK:-}" ]; then
+          __sap_pid=''${PPID:-0}
+          __sap_hops=0
+          while [ "$__sap_pid" -gt 1 ] && [ "$__sap_hops" -lt 4 ]; do
+            if [ -r "/proc/$__sap_pid/environ" ]; then
+              while IFS= read -r -d "" __sap_line; do
+                case "$__sap_line" in
+                  SUDO_AUTH_PROXY_SOCK=*)
+                    SUDO_AUTH_PROXY_SOCK=''${__sap_line#SUDO_AUTH_PROXY_SOCK=}
+                    export SUDO_AUTH_PROXY_SOCK
+                    break 2
+                    ;;
+                esac
+              done < "/proc/$__sap_pid/environ"
+            fi
+            __sap_ppid=""
+            while IFS= read -r __sap_key __sap_val __sap_rest; do
+              if [ "$__sap_key" = "PPid:" ]; then
+                __sap_ppid=$__sap_val
+                break
+              fi
+            done < "/proc/$__sap_pid/status"
+            [ -n "$__sap_ppid" ] || break
+            __sap_pid=$__sap_ppid
+            __sap_hops=$((__sap_hops + 1))
+          done
+          unset __sap_line __sap_key __sap_val __sap_rest __sap_ppid __sap_pid __sap_hops
+        fi
         [ -n "''${SUDO_AUTH_PROXY_SOCK:-}" ] || exit 1
         [ -S "$SUDO_AUTH_PROXY_SOCK" ] || exit 1
       ''}
@@ -1001,11 +1038,15 @@
       );
 
       # `sudo`'s default `env_reset` strips the selector and the recursion
-      # guard before the `pam_exec` helper runs. Append the `env_keep` lines to
-      # the tail of `/etc/sudoers` with `mkAfter`, exactly as the guest module
-      # does, so a later `sudoers.d` fragment cannot negate them (doc §4.3,
-      # §10.4). Nothing else needs keeping: signer keys and agent sockets went
-      # with the removed ssh/x509 methods.
+      # guard from the *command* environment. Keep them with the usual
+      # `env_keep` lines, appended with `mkAfter` exactly as the guest module
+      # does, so a later `sudoers.d` fragment cannot negate them. Note that
+      # `pam_exec` does not inherit this environment at all: the wrapper
+      # recovers the selector from the invoking process ancestry (see
+      # `clientScript`), and the `env_keep` entry for the recursion guard only
+      # reaches a nested sudo if something else exported it (doc §10.4/T18).
+      # Nothing else needs keeping: signer keys and agent sockets went with
+      # the removed ssh/x509 methods.
       security.sudo.extraConfig = mkIf (cfg.transport == "unix") (lib.mkAfter ''
         Defaults env_keep += "SUDO_AUTH_PROXY_SOCK"
         Defaults env_keep += "SUDO_AUTH_PROXY_ACTIVE"
