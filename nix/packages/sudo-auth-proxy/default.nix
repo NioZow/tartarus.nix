@@ -1075,7 +1075,7 @@
               done < "/proc/$__sap_pid/environ"
             fi
             __sap_ppid=""
-            while IFS= read -r __sap_key __sap_val __sap_rest; do
+            while read -r __sap_key __sap_val __sap_rest; do
               if [ "$__sap_key" = "PPid:" ]; then
                 __sap_ppid=$__sap_val
                 break
