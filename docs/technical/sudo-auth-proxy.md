@@ -1572,6 +1572,9 @@ The client is inserted as the first auth rule:
 auth [success=done default=ignore] pam_exec.so /run/wrappers/bin/sudo-auth-proxy-client
 ```
 
+With `pamDiagnostics.enable = true` (§10.6) the module becomes
+`pam_exec.so quiet stdout /run/wrappers/bin/sudo-auth-proxy-client`.
+
 - `success=done` — a verified allow finishes authentication.
 - `default=ignore` — anything else is ignored and the stack continues.
 
@@ -1769,6 +1772,55 @@ For reference, the three security knobs and their allowed values are §7.2–§7
 For `tcp`, `transportEncryption` defaults to `"mtls"` (recommended); `"none"` is
 permitted but insecure, and there is no message signing left to fall back on, so
 use it only where the network path is trusted end to end.
+
+### 10.6 Diagnostics
+
+By default `pam_exec.so` redirects the helper's stdout/stderr to `/dev/null` and,
+on any non-zero exit, prints its own generic line:
+
+```
+sudo: /nix/store/...-sudo-auth-proxy-pam-client failed: exit code 1
+```
+
+That line says nothing about *why* the helper declined (no selector, missing
+socket, an `unavailable`/`denied` from the server), which makes an unproxied
+session look identical to a broken tunnel. Two opt-in options move the diagnostic
+into the helper:
+
+```nix
+tartarus.sudo-auth-proxy.pamDiagnostics = {
+  enable = false;           # quiet + stdout + helper-printed reasons
+  warnUnproxiedSsh = false; # warn when SSH is detected but the selector is absent
+};
+```
+
+- `enable` adds `quiet` and `stdout` to the PAM rule, which becomes
+  `pam_exec.so quiet stdout <helper>`. `quiet` suppresses the generic echo;
+  `stdout` routes the helper's stdout **and** stderr through `pam_info` instead
+  of `/dev/null`.
+- `warnUnproxiedSsh` (requires `enable = true`) prints a warning when the
+  ancestry walk finds `SSH_CONNECTION`/`SSH_CLIENT` but no
+  `SUDO_AUTH_PROXY_SOCK`.
+
+With diagnostics enabled the helper decides what is shown:
+
+| Case | Output |
+| --- | --- |
+| selector found, socket missing | `sudo-auth-proxy: proxy socket <path> is not available; is the SSH tunnel up?` |
+| no selector, SSH detected in the ancestry | `sudo-auth-proxy: this SSH session does not carry SUDO_AUTH_PROXY_SOCK; not using the proxy` (only with `warnUnproxiedSsh`) |
+| no selector, no SSH | silent — the local password/U2F prompt is the intended fallback |
+| selector found, client fails | the client's own `sudo-auth-proxy client: unavailable: …` / `denied`, now visible |
+| recursion guard (`SUDO_AUTH_PROXY_ACTIVE`) | silent |
+
+Control flags stay `[success=done default=ignore]`; the fall-through semantics of
+§10.3 are unchanged, and `quiet_log` remains off, so failures are still recorded
+in the journal.
+
+> **Limitation.** The generic `pam_exec` line is emitted unconditionally for every
+> non-zero exit, so it **cannot** be suppressed per case while still being shown
+> for others. Enabling `pamDiagnostics` therefore *replaces* it with the helper's
+> own messages; keeping both is not possible with `pam_exec.so`. A helper killed
+> by a signal prints nothing (the failure is still logged).
 
 ---
 

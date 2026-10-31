@@ -859,6 +859,26 @@
         description = "Log connection/handshake/request timing to stderr for latency debugging.";
       };
 
+      # Terminal diagnostics from the PAM helper. Off by default: the helper
+      # then behaves exactly as before, and `pam_exec.so` prints its generic
+      # `failed: exit code N` line on every non-zero exit. Enabling this adds
+      # the `quiet` and `stdout` options to `pam_exec.so` and makes the helper
+      # print its own reason instead (`stdout` routes both stdout and stderr
+      # through `pam_info`). The generic `pam_exec` line cannot be suppressed
+      # per case, so it is replaced wholesale whenever this is enabled.
+      pamDiagnostics = {
+        enable = mkEnableOption "helper-printed PAM diagnostics (`pam_exec.so quiet stdout`)";
+        warnUnproxiedSsh = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Warn on the terminal when an SSH session is detected but
+            `SUDO_AUTH_PROXY_SOCK` is absent. Requires
+            `pamDiagnostics.enable = true`.
+          '';
+        };
+      };
+
       server = mkServerOptions {inherit lib pkgs;};
 
       # A second, independent server instance. It has its own `listeners` and
@@ -1021,6 +1041,8 @@
     # the recursion guard (mirroring the Python's `recursion_guard_active()`)
     # and, for the `unix` transport, the selector + socket-existence check
     # (doc §10.2; review log Rank 5/R7). Both exit non-zero and PAM continues.
+    # With `pamDiagnostics.enable` the helper prints the reason first; without
+    # it the checks stay silent and `pam_exec.so` prints its generic failure.
     #
     # Fall-through semantics (doc §10.3; review log F5). The control flag is
     # `[success=done default=ignore]`: an `allow` (exit 0) finishes the stack,
@@ -1049,6 +1071,16 @@
       # variable into the invoking environment; see the selector note below.
       [ -n "''${SUDO_AUTH_PROXY_ACTIVE:-}" ] && exit 1
       ${lib.optionalString (cfg.transport == "unix") ''
+        __sap_diagnostics=${
+          if cfg.pamDiagnostics.enable
+          then "1"
+          else "0"
+        }
+        __sap_warn_ssh=${
+          if cfg.pamDiagnostics.enable && cfg.pamDiagnostics.warnUnproxiedSsh
+          then "1"
+          else "0"
+        }
         # `pam_exec.so` starts this helper with only the PAM environment
         # (`PAM_USER`, `PAM_TTY`, ...), *not* the invoking shell's or sudo's
         # environment. Linux-PAM creates the PAM environment empty and sudo
@@ -1062,6 +1094,7 @@
         if [ -z "''${SUDO_AUTH_PROXY_SOCK:-}" ]; then
           __sap_pid=''${PPID:-0}
           __sap_hops=0
+          __sap_ssh=""
           while [ "$__sap_pid" -gt 1 ] && [ "$__sap_hops" -lt 4 ]; do
             if [ -r "/proc/$__sap_pid/environ" ]; then
               while IFS= read -r -d "" __sap_line; do
@@ -1070,6 +1103,9 @@
                     SUDO_AUTH_PROXY_SOCK=''${__sap_line#SUDO_AUTH_PROXY_SOCK=}
                     export SUDO_AUTH_PROXY_SOCK
                     break 2
+                    ;;
+                  SSH_CONNECTION=* | SSH_CLIENT=*)
+                    [ "$__sap_diagnostics" = 1 ] && __sap_ssh=1
                     ;;
                 esac
               done < "/proc/$__sap_pid/environ"
@@ -1085,10 +1121,19 @@
             __sap_pid=$__sap_ppid
             __sap_hops=$((__sap_hops + 1))
           done
-          unset __sap_line __sap_key __sap_val __sap_rest __sap_ppid __sap_pid __sap_hops
+          if [ "$__sap_diagnostics" = 1 ] && [ "$__sap_warn_ssh" = 1 ] \
+            && [ -z "''${SUDO_AUTH_PROXY_SOCK:-}" ] && [ -n "''${__sap_ssh:-}" ]; then
+            echo "sudo-auth-proxy: this SSH session does not carry SUDO_AUTH_PROXY_SOCK; not using the proxy"
+          fi
+          unset __sap_line __sap_key __sap_val __sap_rest __sap_ppid __sap_pid __sap_hops __sap_ssh
         fi
         [ -n "''${SUDO_AUTH_PROXY_SOCK:-}" ] || exit 1
-        [ -S "$SUDO_AUTH_PROXY_SOCK" ] || exit 1
+        if [ ! -S "$SUDO_AUTH_PROXY_SOCK" ]; then
+          if [ "$__sap_diagnostics" = 1 ]; then
+            echo "sudo-auth-proxy: proxy socket $SUDO_AUTH_PROXY_SOCK is not available; is the SSH tunnel up?"
+          fi
+          exit 1
+        fi
       ''}
       exec ${package}/bin/sudo-auth-proxy --config ${cfg.configPath}
     '';
@@ -1119,6 +1164,10 @@
         {
           assertion = !(cfg.pubkey != null && cfg.mtls.enable);
           message = "tartarus.sudo-auth-proxy: pubkey and mtls are mutually exclusive; use one trust mode.";
+        }
+        {
+          assertion = !cfg.pamDiagnostics.warnUnproxiedSsh || cfg.pamDiagnostics.enable;
+          message = "tartarus.sudo-auth-proxy.pamDiagnostics.warnUnproxiedSsh requires pamDiagnostics.enable = true.";
         }
       ];
 
@@ -1170,7 +1219,7 @@
           order = -1000;
           control = "[success=done default=ignore]";
           modulePath = "pam_exec.so";
-          args = ["${clientScript}"];
+          args = lib.optionals cfg.pamDiagnostics.enable ["quiet" "stdout"] ++ ["${clientScript}"];
         };
       });
     };
