@@ -12,7 +12,7 @@ a glance; the per-service detail lives in the deeper docs.
 ## What you'll learn
 
 - what Tartarus protects and where the trust boundaries are,
-- the role of the CA and the mTLS-only stance,
+- the role of the CA (and the no-CA `pubkey` alternative) and the mTLS-only stance,
 - how guest isolation and egress control are enforced,
 - the accepted residual risks.
 
@@ -23,6 +23,8 @@ a glance; the per-service detail lives in the deeper docs.
 - **Guest isolation** — one guest must not read or modify another, nor the host,
   beyond what is declared.
 - **CA private keys** — the SSH and X.509 roots that authenticate every guest.
+  In no-CA `pubkey` mode there is no X.509 CA key; each peer's own private key
+  is the secret that must stay confidential.
 - **Egress** — a guest must only reach the hosts it is allowed to reach.
 
 ## Trust boundaries
@@ -37,16 +39,20 @@ flowchart LR
     G1[guest A]
     G2[guest B]
   end
-  G1 -->|mTLS, CA-signed| SVC
-  G2 -->|mTLS, CA-signed| SVC
+  G1 -->|mTLS, CA-signed or pinned| SVC
+  G2 -->|mTLS, CA-signed or pinned| SVC
   G1 -.cannot reach.- G2
   CA -->|signs| G1
   CA -->|signs| G2
+  G1 -.pubkey mode: pins.- SVC
 ```
 
 The host and its CA keys are trusted. Guests are untrusted: everything a guest
 can do crosses a boundary enforced by the hypervisor, the kernel, nftables or a
-CA-authenticated channel.
+certificate-authenticated channel. The CA is optional: in the no-CA `pubkey`
+mode each side presents a self-signed leaf and the trust anchor is the peer's
+certificate itself, so there is no CA key to compromise — only the peers'
+individual private keys, each of which authenticates exactly one endpoint.
 
 ## How the boundaries are enforced
 
@@ -69,8 +75,9 @@ CA-authenticated channel.
     the transport is private by construction — a point-to-point hypervisor link
     with no path for a third party.
   - **TCP container callbacks** use mTLS, because the container bridge is
-    shared: the peer must chain to the CA **and** carry the client EKU
-    (`1.3.6.1.4.1.99999.3.2`) while the server presents `.3.1`.
+    shared: the peer must be CA-signed **or** be the pinned self-signed peer
+    certificate, **and** carry the client EKU (`1.3.6.1.4.1.99999.3.2`) while
+    the server presents `.3.1`.
   - **The default admin listener** is a same-user Unix socket — `0600` inside a
     `0700` parent — authorized by the UID/filesystem boundary plus the ordered
     `[[rule]]` list. Any process running as that user can already read and write
@@ -119,8 +126,8 @@ CA-authenticated channel.
   may appear as `nobody`/`nogroup`; that is the same accepted trade-off as the
   declarative `idmap = false`.
 - **The enabled-guest guard.** The CLI refuses to act on a guest that is not
-  enabled, because a disabled guest has no firewall rules, CA certificate or
-  proxy entry — i.e. no host-side enforcement in place.
+  enabled, because a disabled guest has no firewall rules, certificate or proxy
+  entry — i.e. no host-side enforcement in place.
 
 ## Adversaries considered
 
@@ -128,14 +135,16 @@ CA-authenticated channel.
   reach other guests, or pivot to the internet.
 - A **malicious co-tenant guest** on the same host.
 - A **network attacker** trying to impersonate a guest or the host service
-  endpoint (defeated by CA-pinned mTLS and signed host keys).
+  endpoint (defeated by certificate-pinned mTLS — CA-signed or self-signed
+  `pubkey` — and signed host keys).
 - A **misconfiguration** that would silently disable a protection (defeated by
   fail-closed defaults and evaluation assertions).
 
 ## Trust assumptions
 
 - The host kernel, hypervisor (QEMU/KVM or vfkit) and systemd-nspawn are sound.
-- The CA private keys and the user's home remain confidential.
+- The CA private keys (CA mode) / each peer's private key (`pubkey` mode) and
+  the user's home remain confidential.
 - The consumer's `systemConfig`/`userConfig` does not weaken the host
   (Tartarus provides the boundary; content is the consumer's responsibility).
 - For `privateUsers = "pick"`, the bind-mount source filesystems support

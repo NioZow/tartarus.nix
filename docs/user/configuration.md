@@ -99,6 +99,59 @@ built. A disabled guest contributes no flake output, no CA certificate, no
 firewall rule, no proxy entry and no autostart, and is omitted from
 `config.toml`. The guest closure is only realised when you build it.
 
+## Service modules: `pubkey` (no CA)
+
+The standalone service modules `sudo-auth-proxy`, `ssh-agent-proxy` and
+`clipboard-bridge` normally authenticate mTLS peers with a CA (`mtls`). Each
+also offers a **no-CA** mode, `pubkey`, where each side presents a self-signed
+certificate and whitelists the peer's certificate. The two are mutually
+exclusive; `pubkey` forces the effective transport to mTLS, exactly like
+`mtls.enable`. The generated TOML keeps the internal `[mtls]` table, but
+`ca_file` becomes the concatenation of the whitelisted peer certificates.
+
+```nix
+pubkey = {
+  certFile = ./server.crt;                 # this side's self-signed cert
+  keyFile = "/etc/<service>/server.key";   # private key, never in the store
+  trustedPeerCerts = [ ./peer.crt ];       # one or more peer certs (non-empty)
+  requiredOid = "1.3.6.1.4.1.99999.N.1";   # optional: this role's OID
+  peerOid = "1.3.6.1.4.1.99999.N.2";       # optional: the peer role's OID
+};
+```
+
+`requiredOid` and `peerOid` default to the same per-role OIDs as `mtls`
+(server/client, and the admin OID `…3.3` for the clipboard admin client). The
+option is available on `tartarus.sudo-auth-proxy` (client) and `.server.listeners`
+/ `.extraServer.listeners`; on `tartarus.ssh-agent-proxy.server.listeners` and
+`.bridge`; and on `tartarus.clipboard-bridge.server.listeners`, `.client` and
+`.adminClient`. `settings.key`/`settings.rule` on ssh-agent-proxy are an
+unrelated SSH-key policy and are not the `pubkey` trust mode.
+
+Generate the material with the `tartarus-certs` tool (no CA is created):
+
+```sh
+# server (e.g. athena)
+tartarus-certs selfsigned --role server --cn athena \
+  --service sudo-auth-proxy \
+  --key ~/.config/sudo-auth-proxy/server.key \
+  --cert ~/.config/sudo-auth-proxy/server.crt \
+  --pub ~/.config/sudo-auth-proxy/server.pub
+
+# client (e.g. zeus)
+sudo tartarus-certs selfsigned --role client --cn zeus \
+  --service sudo-auth-proxy \
+  --key /etc/sudo-auth-proxy/client.key \
+  --cert /etc/sudo-auth-proxy/client.crt \
+  --pub /etc/sudo-auth-proxy/client.pub
+```
+
+`--service` accepts `sudo-auth-proxy`, `ssh-agent-proxy`, `clipboard-bridge`
+(or `sudo`/`ssh-agent`/`clipboard`) and `clipboard-admin`. The produced cert is
+`CA:FALSE` and carries the standard `serverAuth`/`clientAuth` EKU **plus** the
+service OID; the standard EKU is mandatory, because OpenSSL refuses a
+self-signed leaf as a trust anchor otherwise (`unsuitable certificate purpose`).
+Commit only the public `.crt`/`.pub`; keep `.key` local.
+
 ## Host path and resource options
 
 | Option | Type | Default | Description |

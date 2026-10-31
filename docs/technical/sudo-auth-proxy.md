@@ -679,9 +679,11 @@ tty + cwd + nonce` instead (through the request digest, §6.4).
    of the same uid can connect to the single server socket. The requester's
    credential (§7.3) and the approver's judgement constrain what such a process
    can cause to appear; §9.1 constrains other uids.
-4. **The trust roots** (the X.509 CA, and the certificate keys signed by it) are
-   trusted; their compromise is catastrophic and is handled by rotation (§7.8)
-   and by keeping private keys off guests.
+4. **The trust roots** (the X.509 CA and the certificate keys signed by it, or
+   the pinned peer certificates in no-CA `pubkey` mode) are trusted; their
+   compromise is handled by rotation (§7.8) and by keeping private keys off
+   guests. In `pubkey` mode there is no CA key: each side trusts exactly the
+   peer certificates it whitelists (§7.8a).
 
 ### 5.6 Shared-account caveat
 
@@ -1133,6 +1135,11 @@ every client cert carries every client OID that check is not discriminating.
 Tightening this requires issuing one certificate per service (or narrowing
 `ca.py` to a per-service OID and provisioning separate certs).
 
+In the no-CA `pubkey` mode (§7.8a) each certificate is minted for one peer, so
+passing `--service sudo-auth-proxy` to `tartarus-certs selfsigned` already gives
+that cert **only** this service's OID (plus the standard EKU), which is the
+per-service narrowing the shared CA cannot provide.
+
 ### 7.7 Algorithms and keys
 
 There are **no signing keys any more**. The only cryptographic material the
@@ -1140,7 +1147,7 @@ service touches is the mTLS set, and all of it is configured under `[mtls]`:
 
 | Material           | Where                          | Notes                                                                                                                              |
 | ------------------ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| CA certificate     | `[mtls].ca_file` (both sides)  | Trust root for the peer chain; also `acl.ca_file` in `mode = "ca"`.                                                                 |
+| Trust anchor       | `[mtls].ca_file` (both sides)  | A CA certificate in CA mode; the concatenated **peer self-signed certs** in `pubkey` mode (§7.8a).                                  |
 | Peer certificate   | `[mtls].cert_file`             | The identity the other side verifies.                                                                                              |
 | Peer private key   | `[mtls].key_file`              | `0600`, owned by the user running the process (§9.2). Never in the Nix store.                                                       |
 | Required EKU OID   | `[mtls].required_oid`          | Must be present in the **local** certificate; checked at startup before the socket is opened.                                       |
@@ -1151,7 +1158,9 @@ hostname or address (a VSOCK CID or a DHCP lease is not a name): the EKU OID is
 the real trust check. Chain verification is the same explicit, linear,
 single-tier-capable walk used everywhere else in this repository (validity
 window, `BasicConstraints: CA`, `keyCertSign`, `digitalSignature`, unrecognized
-critical extensions rejected).
+critical extensions rejected). In `pubkey` mode the walk terminates immediately
+because the leaf is itself the trusted anchor (§7.8a); the leaf must still be an
+end entity (`CA:FALSE`) and carry `digitalSignature`.
 
 ### 7.8 Key distribution, lifecycle, rotation and permissions
 
@@ -1160,14 +1169,102 @@ critical extensions rejected).
   `0600` (review log F12). The guest module copies them to
   `/etc/tartarus/x509/{ca.crt,client.crt,client.key}`; the host keeps its own
   under the same root.
-- Rotation is a re-issue plus a service restart: the CA is read on every use
-  rather than cached, so replacing `ca.crt` takes effect without a rebuild.
+- In no-CA `pubkey` mode (§7.8a), `tartarus-certs selfsigned` mints a
+  self-signed leaf instead; there is no CA key, and the peer certificate is the
+  trust anchor.
+- Rotation is a re-issue plus a service restart: the trust material is read on
+  every use rather than cached, so replacing `ca.crt`/a peer cert takes effect
+  without a rebuild.
 - **Nothing is copied into the Nix store except public material.** Private keys
-  are referenced by path and written by `ca.py` at runtime; the store is
-  world-readable.
+  are referenced by path and written at runtime; the store is world-readable.
 - The requester's certificate is what the transport verifies: its leaf SPKI
   fingerprint is the identity a `match.machine` rule can pin, and the chain is
   verified against `[mtls].ca_file`.
+
+### 7.8a `pubkey` (no CA): self-signed certificate pinning
+
+The CA can be removed entirely. In this mode each side mints a **self-signed
+leaf** and whitelists the peer's leaf; the trust anchor is the peer certificate
+itself, so there is no CA and no CA private key to protect. The Nix modules
+expose this as `pubkey`, alongside (and mutually exclusive with) `mtls`:
+
+```nix
+tartarus.sudo-auth-proxy.server.listeners = [{
+  type = "unix";
+  socket = "%t/sudo-auth-proxy/server.sock";
+  resolution = "certificate";
+  # Instead of `mtls = { ... };`:
+  pubkey = {
+    certFile = ./server.crt;                    # this side's cert (public, store)
+    keyFile = "/etc/sudo-auth-proxy/server.key"; # private, never in the store
+    trustedPeerCerts = [ ./zeus.crt ];          # one or more peer certs
+    # requiredOid / peerOid default to this role's OIDs:
+    requiredOid = "1.3.6.1.4.1.99999.1.1";
+    peerOid = "1.3.6.1.4.1.99999.1.2";
+  };
+}];
+```
+
+Setting `pubkey` forces `transport_encryption = "mtls"` and both auth knobs to
+`"transport"`, exactly like `mtls.enable`; there is no new runtime mode. The
+generated TOML still uses the internal `[mtls]` table and its `ca_file` key, but
+`ca_file` now points at a Nix-built file that is the concatenation of
+`trustedPeerCerts` (a world-readable, read-only store file) — the "pubkey
+whitelist". `pubkey` and `mtls`
+on the same listener/client is an evaluation error, and an empty
+`trustedPeerCerts` is rejected (an empty whitelist would trust nothing).
+
+The same option exists on the client (`tartarus.sudo-auth-proxy.pubkey`) and on
+every server listener (including `extraServer.listeners`). The client's
+`requiredOid`/`peerOid` default to the client/server pair, the server's to the
+server/client pair; an explicit value overrides them.
+
+#### Generating the material (no CA)
+
+Use the cert tool's `selfsigned` command. It never creates a CA, mints a
+`CA:FALSE` leaf from an existing key (or generates an RSA key if `--key` is
+absent), and writes the optional SPKI `.pub`:
+
+```sh
+# server (the approver host, e.g. athena)
+tartarus-certs selfsigned --role server --cn athena \
+  --service sudo-auth-proxy \
+  --key ~/.config/sudo-auth-proxy/server.key \
+  --cert ~/.config/sudo-auth-proxy/server.crt \
+  --pub ~/.config/sudo-auth-proxy/server.pub
+
+# client (the guest, e.g. zeus)
+sudo tartarus-certs selfsigned --role client --cn zeus \
+  --service sudo-auth-proxy \
+  --key /etc/sudo-auth-proxy/client.key \
+  --cert /etc/sudo-auth-proxy/client.crt \
+  --pub /etc/sudo-auth-proxy/client.pub
+```
+
+The private keys are the paths above (athena: `~/.config/sudo-auth-proxy/
+server.key`, zeus: `/etc/sudo-auth-proxy/client.key`); they never enter the Nix
+store or git. Commit only the public `.crt` and `.pub` files. Put `server.crt`
+in the client's `trustedPeerCerts` and `client.crt` in the server listener's
+(and/or the reverse for mutual server auth).
+
+#### Required extensions
+
+A self-signed leaf is only usable as a trust anchor when it carries the
+**standard** EKU in addition to the service OID:
+
+- server: `extendedKeyUsage = serverAuth,<server OID>`
+- client: `extendedKeyUsage = clientAuth,<client OID>`
+- `basicConstraints = critical,CA:FALSE`
+- `keyUsage = critical,digitalSignature,keyEncipherment` (RSA; a non-RSA key
+  gets `digitalSignature` only)
+- `subjectAltName = DNS:<name>` on the server; `CN=<name>` on both
+
+A self-signed cert with only the service OID is rejected by OpenSSL with
+`certificate verify failed: unsuitable certificate purpose`, which is why the
+standard EKU is mandatory (the `selfsigned` command always adds it). With the
+standard EKU plus the service OID, the leaf is both a valid role certificate and
+a valid trust anchor. Certificate pinning via `[acl]` and
+`resolution = "certificate"` (CN) work unchanged.
 
 ### 7.9 `[security]` table as parsed
 
@@ -1245,7 +1342,9 @@ The `[mtls]` table (`enable`, `ca_file`, `cert_file`, `key_file`,
 EKU checks; `enable = true` is equivalent to `transport_encryption = "mtls"`, and
 under mTLS both auth knobs are forced to `"transport"`. Paths inside `[mtls]` are
 resolved relative to the **config file's directory**, and a leading `~/` is
-expanded.
+expanded. In no-CA `pubkey` mode (§7.8a) the emitted block is identical, except
+that `ca_file` is the concatenation of the peer's self-signed certificates
+rather than a CA.
 
 ## 8. Authorization model
 
@@ -1253,10 +1352,10 @@ Authorization is split across the two ends, and the split is deliberate.
 
 - **The client decides *who may approve*.** Its `[acl]` pins the **server**
   identity it will trust to answer. Without it the client still verifies the
-  server chain + EKU against `[mtls]` (§7.2), but accepts any CA-signed server;
-  with it, a fake or wrong-service server is refused even when it holds a
-  CA-signed certificate. This is the client's protection against an impostor
-  talking it into elevating.
+  server chain + EKU against `[mtls]` (§7.2) — any CA-signed server, or, in
+  `pubkey` mode, the pinned self-signed server certificate; with it, a fake or
+  wrong-service server is refused even when it holds a valid certificate. This
+  is the client's protection against an impostor talking it into elevating.
 - **The server decides *how to answer*.** It has **no cryptographic ACL table**.
   When `client_auth = "transport"` the mTLS transport authenticates the
   requester, and the ordered, document-level `[[rule]]` list decides
@@ -1272,8 +1371,9 @@ deliberate (review log Rank 10).
 ### 8.1 Client `[acl]` — who may approve
 
 The client `[acl]` is **crypto material only**, never request metadata, and it is
-never read from the wire. It accepts a server whose certificate matches **any**
-of the following:
+never read from the wire. It is an additional pin on top of the configured trust
+anchor (CA in `mtls` mode, the peer certificate in `pubkey` mode) and accepts a
+server whose certificate matches **any** of the following:
 
 | Key                    | Type / values                                    | Notes                                                                 |
 | ---------------------- | ------------------------------------------------ | --------------------------------------------------------------------- |
@@ -1281,7 +1381,7 @@ of the following:
 | `trusted_names`        | list of `fnmatch` patterns                       | Matched against the server certificate's CN/DNS SAN. Authoritative on a match. |
 
 At least one of the two must be set when `[acl]` is present (an empty pin would
-trust any CA-signed server, so it is refused). The check runs **after** the TLS
+trust any certificate the anchor accepts, so it is refused). The check runs **after** the TLS
 handshake, on the wrapped socket, in addition to the CA-chain + EKU verification
 the handshake already performed.
 
@@ -1630,6 +1730,21 @@ tartarus.sudo-auth-proxy = {
     peerOid = "1.3.6.1.4.1.99999.1.1";
   };
 };
+```
+
+To drop the CA, replace the `mtls` attribute with `pubkey` (mutually exclusive);
+the effective transport stays mTLS and the emitted `[mtls]` block is the same,
+but `ca_file` becomes the concatenation of the whitelisted peer certificates
+(§7.8a):
+
+```nix
+  # Instead of mtls = { ... };
+  pubkey = {
+    certFile = ./client.crt;                 # this guest's self-signed cert
+    keyFile = "/etc/sudo-auth-proxy/client.key";
+    trustedPeerCerts = [ ./athena.crt ];     # the server's self-signed cert
+    # requiredOid/peerOid default to 1.2 / 1.1 for the client role.
+  };
 ```
 
 This is exactly what the tartarus guest module emits for a guest that sets
@@ -2155,7 +2270,8 @@ the root config and recurses.)
    `server.listeners` list with one listener per distinct transport the guests'
    `services.sudoAuthProxyTransport` markers ask for (`vsock`/`tcp` for
    containers and no-VSOCK guests, `unix` for the SSH-forwarded path), gives the
-   `unix` listener mTLS with the tartarus CA + sudo client OID, and leaves the
+   `unix` listener mTLS with the tartarus CA + sudo client OID (or, in no-CA
+   mode, `pubkey` with the peer certificate whitelisted — §7.8a), and leaves the
    callback listeners unencrypted. Mixing transports across the guests of one
    host is **no longer an evaluation error or warning** — the listeners coexist.
    The rule list is left empty (every request prompts). Set these options by
@@ -2305,7 +2421,11 @@ peer_required_oid = "1.3.6.1.4.1.99999.1.2"
 1. Set `transport` (`"unix"` for the SSH tunnel, or a callback transport) and
    the matching `[security]` values: mTLS (`transport`/`transport` plus the
    `[mtls]` block) when the channel must authenticate anything, or the explicit
-   `none`/`none` pair on a private callback transport.
+   `none`/`none` pair on a private callback transport. A no-CA deployment uses
+   `pubkey` instead of `mtls` (§7.8a); mint the guest leaf with
+   `tartarus-certs selfsigned --role client --cn <guest> --service
+   sudo-auth-proxy --key /etc/sudo-auth-proxy/client.key --cert
+   /etc/sudo-auth-proxy/client.crt`.
 2. **Guest `/run` ownership (hard requirement).** `/run/sudo-auth-proxy` must
    exist, be mode `0700`, and be **owned by the guest login user** — not root.
    The `RemoteForward` bind runs as that user (the guest `sshd`), and the host

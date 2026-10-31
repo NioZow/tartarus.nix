@@ -23,20 +23,35 @@
 #   tartarus-certs issue-client --out DIR --name NAME [--kind K] [--service SVC]
 #                              [--days N] [--bits N] [--force]
 #   tartarus-certs issue-admin  --out DIR [--days N] [--bits N] [--force]
+#   tartarus-certs selfsigned   --role server|client --cn NAME
+#                              [--key PATH] [--cert PATH] [--pub PATH]
+#                              [--san NAME] [--service SVC]
+#                              [--days N] [--bits N] [--force]
 #   tartarus-certs show        --out DIR
 #   tartarus-certs install     --out DIR (--server | --name NAME | --admin) --dest DIR
 #   tartarus-certs verify      --out DIR (--server | --name NAME | --admin) [--service SVC]
+#
+# `selfsigned` is the NO-CA mode: it does not create or use a CA. It mints a
+# self-signed leaf (CA:FALSE) from `--key` (or generates the key if it is
+# absent), carrying the standard serverAuth/clientAuth EKU *plus* the service
+# OID. That combination is what lets the certificate be pinned directly as the
+# peer's trust anchor (`ca_file` = the peer certificate). Use it for the
+# `pubkey` Nix option on sudo-auth-proxy / ssh-agent-proxy / clipboard-bridge.
+# It writes `key` (0600) and `cert` (0644) and, with `--pub`, the SPKI public
+# key in PEM (`openssl pkey -pubout`). `--cert` defaults to `<out>/<role>.crt`
+# and `--key` to the certificate path with `.crt` -> `.key`.
 #
 # `--admin` is shorthand for the optional clipboard admin material at
 # machines/host/admin (equivalent to `--name admin --kind host`); `verify
 # --admin` also checks the admin EKU OID when `--service` is omitted.
 #
-# `--service` is one of ssh-agent | sudo | clipboard | clipboard-admin. When
-# omitted the certificate carries all three service OIDs, exactly like ca.py;
-# when given, it is restricted to that service's OID (plus the standard
-# serverAuth / clientAuth EKU). `issue-admin` always mints the clipboard admin
-# certificate (clientAuth + 1.3.6.1.4.1.99999.3.3 only) at
-# <root>/machines/host/admin/; it is never part of a guest certificate.
+# `--service` is one of ssh-agent | ssh-agent-proxy | sudo | sudo-auth-proxy |
+# clipboard | clipboard-bridge | clipboard-admin. When omitted the certificate
+# carries all three service OIDs, exactly like ca.py; when given, it is
+# restricted to that service's OID (plus the standard serverAuth / clientAuth
+# EKU). `issue-admin` always mints the clipboard admin certificate (clientAuth
+# + 1.3.6.1.4.1.99999.3.3 only) at <root>/machines/host/admin/; it is never
+# part of a guest certificate.
 set -euo pipefail
 
 SERVICE=""
@@ -50,6 +65,12 @@ FORCE=0
 ROLE=""
 DEST=""
 ADMIN=0
+# `selfsigned` (no-CA) arguments.
+SELF_ROLE=""
+SELF_KEY=""
+SELF_CERT=""
+SELF_PUB=""
+SAN=""
 
 die() {
   echo "tartarus-certs: $*" >&2
@@ -57,25 +78,48 @@ die() {
 }
 
 usage() {
-  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'USAGE'
+tartarus-certs — standalone X.509 certificate tooling (no Nix, no tartarus).
+
+  tartarus-certs init-ca       --out DIR [--days N] [--bits N] [--force]
+  tartarus-certs issue-server  --out DIR --cn NAME [--service SVC]
+                               [--days N] [--bits N] [--force]
+  tartarus-certs issue-client  --out DIR --name NAME [--kind K] [--service SVC]
+                               [--days N] [--bits N] [--force]
+  tartarus-certs issue-admin   --out DIR [--days N] [--bits N] [--force]
+  tartarus-certs selfsigned    --role server|client --cn NAME
+                               [--key PATH] [--cert PATH] [--pub PATH]
+                               [--san NAME] [--service SVC]
+                               [--days N] [--bits N] [--force]
+  tartarus-certs show          --out DIR
+  tartarus-certs install       --out DIR (--server | --name NAME | --admin) --dest DIR
+  tartarus-certs verify        --out DIR (--server | --name NAME | --admin) [--service SVC]
+
+`selfsigned` is the no-CA mode: it mints a self-signed leaf (CA:FALSE) carrying
+the standard serverAuth/clientAuth EKU plus the service OID, so the certificate
+can be pinned directly as a peer's trust anchor. It never creates a CA.
+
+`--service` is one of ssh-agent | ssh-agent-proxy | sudo | sudo-auth-proxy |
+clipboard | clipboard-bridge | clipboard-admin.
+USAGE
   exit "${1:-0}"
 }
 
 # OID maps, mirroring src/tartarus/ca.py.
 oid_server() {
   case "$1" in
-    ssh-agent) echo "1.3.6.1.4.1.99999.2.1" ;;
-    sudo)      echo "1.3.6.1.4.1.99999.1.1" ;;
-    clipboard) echo "1.3.6.1.4.1.99999.3.1" ;;
+    ssh-agent|ssh-agent-proxy) echo "1.3.6.1.4.1.99999.2.1" ;;
+    sudo|sudo-auth-proxy)      echo "1.3.6.1.4.1.99999.1.1" ;;
+    clipboard|clipboard-bridge) echo "1.3.6.1.4.1.99999.3.1" ;;
     *) die "unknown service '$1' (ssh-agent|sudo|clipboard)" ;;
   esac
 }
 oid_client() {
   case "$1" in
-    ssh-agent)       echo "1.3.6.1.4.1.99999.2.2" ;;
-    sudo)            echo "1.3.6.1.4.1.99999.1.2" ;;
-    clipboard)       echo "1.3.6.1.4.1.99999.3.2" ;;
-    clipboard-admin) echo "1.3.6.1.4.1.99999.3.3" ;;
+    ssh-agent|ssh-agent-proxy)  echo "1.3.6.1.4.1.99999.2.2" ;;
+    sudo|sudo-auth-proxy)       echo "1.3.6.1.4.1.99999.1.2" ;;
+    clipboard|clipboard-bridge) echo "1.3.6.1.4.1.99999.3.2" ;;
+    clipboard-admin)            echo "1.3.6.1.4.1.99999.3.3" ;;
     *) die "unknown service '$1' (ssh-agent|sudo|clipboard|clipboard-admin)" ;;
   esac
 }
@@ -238,6 +282,91 @@ cmd_issue_admin() {
   echo "Clipboard admin material ready in $dir"
 }
 
+# No-CA mode. Mint a self-signed leaf (CA:FALSE) with the standard
+# serverAuth/clientAuth EKU *plus* the service OID, from an existing key (or a
+# freshly generated one). No CA and no CA key are created: the certificate is
+# meant to be pinned directly as the peer's `ca_file` trust anchor.
+cmd_selfsigned() {
+  [ -n "$CN" ] || die "selfsigned requires --cn"
+  case "$SELF_ROLE" in
+    server|client) ;;
+    "") die "selfsigned requires --role server|client" ;;
+    *) die "--role must be 'server' or 'client' (got '$SELF_ROLE')" ;;
+  esac
+  if [ "$SELF_ROLE" = "server" ] && [ "$SERVICE" = "clipboard-admin" ]; then
+    die "--service clipboard-admin is a client certificate; use --role client"
+  fi
+
+  local crt key ekus keyusage generated_key=0
+  crt="${SELF_CERT:-$OUT/$SELF_ROLE.crt}"
+  if [ -n "$SELF_KEY" ]; then
+    key="$SELF_KEY"
+  else
+    case "$crt" in
+      *.crt) key="${crt%.crt}.key" ;;
+      *) key="$crt.key" ;;
+    esac
+  fi
+
+  if [ "$SELF_ROLE" = "server" ]; then
+    ekus="$(server_ekus)"
+  elif [ "$SERVICE" = "clipboard-admin" ]; then
+    ekus="clientAuth,$(oid_client clipboard-admin)"
+  else
+    ekus="$(client_ekus)"
+  fi
+
+  mkdir -p "$(dirname "$key")" "$(dirname "$crt")"
+
+  if [ -f "$key" ] && [ "$FORCE" -eq 0 ]; then
+    echo "Using existing key: $key"
+  else
+    if [ "$FORCE" -eq 1 ] && [ -f "$key" ]; then
+      rm -f "$key"
+    fi
+    echo "Generating key: $key"
+    openssl genrsa -out "$key" "${BITS:-2048}"
+    generated_key=1
+  fi
+  chmod 600 "$key"
+
+  # Re-issue when the key was just generated: an existing certificate would no
+  # longer match it.
+  if [ -f "$crt" ] && [ "$FORCE" -eq 0 ] && [ "$generated_key" -eq 0 ]; then
+    echo "Certificate already exists: $crt (use --force to re-issue)"
+  else
+    # RSA keys carry keyEncipherment; other key types (EC/Ed25519) only assert
+    # digitalSignature, which is what they can actually do.
+    if openssl rsa -in "$key" -noout -check >/dev/null 2>&1; then
+      keyusage="critical,digitalSignature,keyEncipherment"
+    else
+      keyusage="critical,digitalSignature"
+    fi
+    echo "Generating self-signed $SELF_ROLE certificate for CN=$CN: $crt"
+    local -a addext
+    addext=(
+      -addext "basicConstraints=critical,CA:FALSE"
+      -addext "keyUsage=$keyusage"
+      -addext "extendedKeyUsage=$ekus"
+    )
+    if [ "$SELF_ROLE" = "server" ]; then
+      addext+=(-addext "subjectAltName=DNS:${SAN:-$CN}")
+    fi
+    openssl req -x509 -new -key "$key" -sha256 -days "${DAYS:-365}" \
+      -subj "/CN=$CN" "${addext[@]}" -out "$crt"
+    chmod 644 "$crt"
+  fi
+
+  if [ -n "$SELF_PUB" ]; then
+    mkdir -p "$(dirname "$SELF_PUB")"
+    openssl pkey -in "$key" -pubout -out "$SELF_PUB"
+    chmod 644 "$SELF_PUB"
+    echo "Wrote SPKI public key: $SELF_PUB"
+  fi
+
+  echo "Self-signed material ready: key=$key cert=$crt"
+}
+
 cmd_show() {
   local files=()
   [ -f "$(ca_crt)" ] && files+=("$(ca_crt)")
@@ -321,6 +450,11 @@ while [ $# -gt 0 ]; do
     --dest) DEST="${2:?--dest needs a value}"; shift 2 ;;
     --days) DAYS="${2:?--days needs a value}"; shift 2 ;;
     --bits) BITS="${2:?--bits needs a value}"; shift 2 ;;
+    --role) SELF_ROLE="${2:?--role needs a value}"; shift 2 ;;
+    --key) SELF_KEY="${2:?--key needs a value}"; shift 2 ;;
+    --cert) SELF_CERT="${2:?--cert needs a value}"; shift 2 ;;
+    --pub) SELF_PUB="${2:?--pub needs a value}"; shift 2 ;;
+    --san) SAN="${2:?--san needs a value}"; shift 2 ;;
     --force) FORCE=1; shift ;;
     --server) ROLE="server"; shift ;;
     --admin) ADMIN=1; shift ;;
@@ -353,8 +487,9 @@ case "$COMMAND" in
   issue-server) cmd_issue_server ;;
   issue-client) cmd_issue_client ;;
   issue-admin) cmd_issue_admin ;;
+  selfsigned) cmd_selfsigned ;;
   show) cmd_show ;;
   install) cmd_install ;;
   verify) cmd_verify ;;
-  *) die "unknown command: $COMMAND (init-ca|issue-server|issue-client|issue-admin|show|install|verify)" ;;
+  *) die "unknown command: $COMMAND (init-ca|issue-server|issue-client|issue-admin|selfsigned|show|install|verify)" ;;
 esac

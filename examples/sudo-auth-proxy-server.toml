@@ -182,6 +182,15 @@ server_auth = "transport"
 # [listeners.mtls] — required when transport_encryption = "mtls". `./ca.crt`,
 # `./server.crt` and `./server.key` are the host's X.509 material; the EKU OIDs
 # separate the two roles (see the standalone setup in doc §15.1).
+#
+# NO-CA VARIANT: there is no need for a CA. Mint a self-signed server cert with
+# `tartarus-certs selfsigned --role server --cn athena --service sudo-auth-proxy
+# --key server.key --cert server.crt`, mint the client's the same way with
+# `--role client --cn zeus`, and set `ca_file` to the CLIENT's self-signed cert
+# (concatenate several peer certs if there is more than one peer). The Nix
+# option is `pubkey = { certFile; keyFile; trustedPeerCerts; }`; it emits this
+# same table with `ca_file` pointing at the peer certificate(s), not a CA. The
+# cert must carry serverAuth + the service OID (see doc §7.8a).
 [listeners.mtls]
 enable = true
 ca_file = "./ca.crt"

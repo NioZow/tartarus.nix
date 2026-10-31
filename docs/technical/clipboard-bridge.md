@@ -249,6 +249,90 @@ peer_required_oid = "1.3.6.1.4.1.99999.3.2"  # the peer certificate's EKU
 - A listener whose resolved transport encryption is `mtls` needs this block
   (and an admin mTLS listener needs the admin peer OID, §5.3).
 
+### 4.2a `pubkey` (no CA): self-signed certificate pinning
+
+The CA is optional. Each side can present a **self-signed** leaf and whitelist
+the peer's leaf; the trust anchor is the peer certificate itself, so there is no
+CA key. The Nix modules expose this as `pubkey`, mutually exclusive with `mtls`,
+on every server listener and on the client / admin client:
+
+```nix
+# server listener
+{ type = "tcp"; host = "10.201.0.1"; port = 27795;
+  resolution = "certificate";
+  pubkey = {
+    certFile = ./server.crt;
+    keyFile = "/etc/clipboard-bridge/server.key";
+    trustedPeerCerts = [ ./guest.crt ];   # one or more peer certs
+    # requiredOid / peerOid default to 3.1 / 3.2 for the server role
+  };
+}
+
+# guest client
+tartarus.clipboard-bridge.client = {
+  enable = true; transport = "tcp"; host = "10.201.0.1";
+  pubkey = {
+    certFile = ./client.crt;
+    keyFile = "/etc/clipboard-bridge/client.key";
+    trustedPeerCerts = [ ./athena.crt ];
+    # requiredOid / peerOid default to 3.2 / 3.1 for the client role
+  };
+};
+
+# admin client: requiredOid defaults to 3.3 (the admin EKU),
+# peerOid to 3.1 (the server EKU)
+tartarus.clipboard-bridge.adminClient = {
+  enable = true; transport = "tcp"; host = "127.0.0.1";
+  pubkey = {
+    certFile = ./admin.crt;
+    keyFile = "/etc/clipboard-bridge/admin.key";
+    trustedPeerCerts = [ ./athena.crt ];
+  };
+};
+```
+
+Setting `pubkey` forces the effective transport to mTLS and both auth knobs to
+`"transport"`, exactly like `mtls.enable`. The emitted TOML still uses the
+internal `[listeners.mtls]` / `[mtls]` tables, but `ca_file` is now a Nix-built
+concatenation of `trustedPeerCerts` (the whitelist; a world-readable store
+file), not a CA. `pubkey` + `mtls`
+on one listener/client, or an empty/missing `trustedPeerCerts`, fails
+evaluation. An admin client still pins `required_oid` to the admin EKU, and an
+admin listener still requires `peer_required_oid = …3.3`.
+
+Mint the material (no CA is created) with:
+
+```sh
+# server
+tartarus-certs selfsigned --role server --cn athena \
+  --service clipboard-bridge \
+  --key /etc/clipboard-bridge/server.key \
+  --cert /etc/clipboard-bridge/server.crt \
+  --pub /etc/clipboard-bridge/server.pub
+
+# guest client
+tartarus-certs selfsigned --role client --cn guest \
+  --service clipboard-bridge \
+  --key /etc/clipboard-bridge/client.key \
+  --cert /etc/clipboard-bridge/client.crt \
+  --pub /etc/clipboard-bridge/client.pub
+
+# admin client
+tartarus-certs selfsigned --role client --cn admin \
+  --service clipboard-admin \
+  --key /etc/clipboard-bridge/admin.key \
+  --cert /etc/clipboard-bridge/admin.crt \
+  --pub /etc/clipboard-bridge/admin.pub
+```
+
+The certificate must carry the standard EKU **plus** the service OID
+(`serverAuth,<server OID>` / `clientAuth,<client OID>`), `basicConstraints =
+critical,CA:FALSE`, `keyUsage = critical,digitalSignature,keyEncipherment` (RSA),
+and `subjectAltName = DNS:<name>` on the server. Without the standard EKU the
+self-signed leaf fails the handshake with `unsuitable certificate purpose`; the
+`selfsigned` command always adds both. Keep private keys local (never in the
+Nix store or git) and commit only the `.crt`/`.pub`.
+
 ### 4.3 `resolution`
 
 `resolution` is per listener and is the only place a connecting peer becomes an
@@ -450,8 +534,9 @@ decision, never a runtime fallback.
 
 ### 8.3 mTLS listeners
 
-An mTLS listener authenticates both peers with the tartarus CA chain plus EKU
-OIDs:
+An mTLS listener authenticates both peers with the tartarus CA chain (or, in
+no-CA `pubkey` mode, by pinning the peer's self-signed certificate — §4.2a)
+plus EKU OIDs:
 
 | OID | Role |
 | --- | --- |
@@ -508,6 +593,17 @@ certificate even though both are signed by the same CA.
 Both commands are idempotent: an existing key/cert is reused (unless
 `--force`), a missing certificate is signed from the existing key, and the
 private key mode is re-applied on every run.
+
+For a **no-CA** deployment (§4.2a) mint a self-signed admin leaf instead; no CA
+is created and the server/guest whitelist the admin certificate directly:
+
+```sh
+tartarus-certs selfsigned --role client --cn admin \
+  --service clipboard-admin \
+  --key /etc/clipboard-bridge/admin.key \
+  --cert /etc/clipboard-bridge/admin.crt \
+  --pub /etc/clipboard-bridge/admin.pub
+```
 
 ---
 

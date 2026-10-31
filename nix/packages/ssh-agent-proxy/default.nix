@@ -177,6 +177,37 @@
       };
     };
 
+    # Reusable `pubkey` (no-CA) option set. Each side presents a self-signed
+    # leaf; `trustedPeerCerts` is concatenated into the emitted `[mtls]
+    # ca_file` trust bundle, so the trust anchor is the peer certificate itself
+    # and no CA exists. Mutually exclusive with `mtls`; forces mTLS.
+    mkPubkeyOptions = {lib}: let
+      inherit (lib) mkOption types;
+    in {
+      certFile = mkOption {
+        type = types.path;
+        description = "This side's self-signed certificate (public; usually a Nix store path).";
+      };
+      keyFile = mkOption {
+        type = types.path;
+        description = "This side's private key (local or /etc; never in the Nix store).";
+      };
+      trustedPeerCerts = mkOption {
+        type = types.nonEmptyListOf types.path;
+        description = "One or more peer self-signed certificates to whitelist; concatenated into the `ca_file` trust bundle.";
+      };
+      requiredOid = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "EKU OID the local certificate must contain. Defaults to the role's OID.";
+      };
+      peerOid = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "EKU OID the peer certificate must contain. Defaults to the role's OID.";
+      };
+    };
+
     # One listener's option set. Every entry is **self-contained**: each field
     # carries its real default (so there is no `[listener_defaults]` block),
     # `type` is required and `name` is the optional rule selector. All address
@@ -264,6 +295,15 @@
       };
       security = mkSecurityOptions {inherit lib;};
       mtls = mkMtlsOptions {inherit lib requiredOid peerOid;};
+      pubkey = mkOption {
+        type = types.nullOr (types.submodule {options = mkPubkeyOptions {inherit lib;};});
+        default = null;
+        description = ''
+          No-CA trust mode: a self-signed local certificate whose peer is
+          whitelisted by certificate. Mutually exclusive with `mtls`; setting
+          it forces the effective transport to mTLS.
+        '';
+      };
       scanAgentSocketDirs = mkOption {
         type = types.bool;
         default = false;
@@ -620,6 +660,16 @@
           };
         };
 
+        # No-CA trust mode for the bridge (see the listener `pubkey`).
+        pubkey = mkOption {
+          type = types.nullOr (types.submodule {options = mkPubkeyOptions {inherit lib;};});
+          default = null;
+          description = ''
+            No-CA trust mode: a self-signed bridge certificate whose server is
+            whitelisted by certificate. Mutually exclusive with `mtls`.
+          '';
+        };
+
         extraSettings = mkOption {
           type = types.attrs;
           default = {};
@@ -689,7 +739,10 @@
   # `connect_timeout`/`handshake_timeout`/`decision_timeout` live at the
   # listener level, where `Config.load` reads them (the previous [`security`]
   # placement was dead config).
-  mkServerToml = {lib}: server: let
+  mkServerToml = {
+    lib,
+    pkgs,
+  }: server: let
     inherit (lib) optionalAttrs;
 
     renderSecurity = transportEncryption: {
@@ -714,13 +767,36 @@
       peer_required_oid = mtls.peerOid;
     };
 
+    # No-CA mode: the peer's self-signed cert(s) are the trust anchor, so
+    # `ca_file` is their concatenation rather than a CA. `required_oid`/
+    # `peer_required_oid` fall back to the entry's role defaults.
+    renderPubkeyMtls = entry: {
+      enable = true;
+      ca_file = pkgs.concatText "trusted-peer-certs.pem" entry.pubkey.trustedPeerCerts;
+      cert_file = entry.pubkey.certFile;
+      key_file = entry.pubkey.keyFile;
+      required_oid =
+        if entry.pubkey.requiredOid != null
+        then entry.pubkey.requiredOid
+        else entry.mtls.requiredOid;
+      peer_required_oid =
+        if entry.pubkey.peerOid != null
+        then entry.pubkey.peerOid
+        else entry.mtls.peerOid;
+    };
+
+    renderMtlsOrPubkey = entry:
+      if entry.pubkey != null
+      then renderPubkeyMtls entry
+      else renderMtls entry.mtls;
+
     # One self-contained `[[listeners]]` entry: its own bind target and
     # timeouts, the resolved `[security]` and, when it resolves to mTLS, its own
     # `[mtls]` block.
     renderListener = entry: let
       transportEncryption = resolveTransportEncryption {
         type = entry.type;
-        mtlsEnabled = entry.mtls.enable;
+        mtlsEnabled = entry.mtls.enable || entry.pubkey != null;
         requested = entry.security.transportEncryption;
       };
       fields = {
@@ -743,7 +819,7 @@
       pruneNulls (
         fields
         // {security = renderSecurity transportEncryption;}
-        // optionalAttrs (transportEncryption == "mtls") {mtls = renderMtls entry.mtls;}
+        // optionalAttrs (transportEncryption == "mtls") {mtls = renderMtlsOrPubkey entry;}
       );
   in
     {
@@ -766,7 +842,7 @@
       requested = entry.security.transportEncryption;
       transportEncryption = resolveTransportEncryption {
         type = entry.type;
-        mtlsEnabled = entry.mtls.enable;
+        mtlsEnabled = entry.mtls.enable || entry.pubkey != null;
         requested = requested;
       };
       resolution =
@@ -784,13 +860,18 @@
         message = "tartarus.ssh-agent-proxy.server.listeners: mtls.enable = true conflicts with security.transportEncryption = \"${requested}\" (entry type = \"${entry.type}\"); refusing to downgrade.";
       }
       {
+        assertion = !(entry.pubkey != null && entry.mtls.enable);
+        message = "tartarus.ssh-agent-proxy.server.listeners: pubkey and mtls are mutually exclusive (entry type = \"${entry.type}\").";
+      }
+      {
         assertion =
           !(entry.type == "unix" && (resolution == "tartarus" || resolution == "mofos"));
         message = "tartarus.ssh-agent-proxy.server.listeners: the unix listener only supports resolution = \"none\" or \"certificate\" (entry type = \"unix\").";
       }
       {
         assertion =
-          !(entry.type != "unix"
+          !(entry.type
+            != "unix"
             && (entry.scanAgentSocketDirs || entry.resolveSessionSocket));
         message = "tartarus.ssh-agent-proxy.server.listeners: scanAgentSocketDirs/resolveSessionSocket are only valid on a unix listener (entry type = \"${entry.type}\").";
       }
@@ -837,7 +918,7 @@ in {
       if server.configPath != null
       then server.configPath
       else "/etc/ssh-agent-proxy/config.toml";
-    configFile = tomlFormat.generate "ssh-agent-proxy.toml" (pruneNulls (mkServerToml {inherit lib;} server));
+    configFile = tomlFormat.generate "ssh-agent-proxy.toml" (pruneNulls (mkServerToml {inherit lib pkgs;} server));
   in {
     imports = [optionsModule];
 
@@ -900,7 +981,7 @@ in {
       then bridge.configPath
       else "${home}/.config/ssh-agent-proxy/config.toml";
 
-    serverConfigFile = tomlFormat.generate "ssh-agent-proxy.toml" (pruneNulls (mkServerToml {inherit lib;} server));
+    serverConfigFile = tomlFormat.generate "ssh-agent-proxy.toml" (pruneNulls (mkServerToml {inherit lib pkgs;} server));
 
     # The socket `setSshAuthSock` points at: the first unix listener's socket
     # (each entry is self-contained, so its `socket` always carries a value).
@@ -913,7 +994,7 @@ in {
       else "%t/ssh-agent-proxy/server.sock";
 
     bridgeTransportEncryption =
-      if bridge.mtls.enable
+      if bridge.mtls.enable || bridge.pubkey != null
       then "mtls"
       else if bridge.security.transportEncryption != "auto"
       then bridge.security.transportEncryption
@@ -949,14 +1030,30 @@ in {
       // optionalAttrs (bridge.transport == "tcp") {host = bridge.host;}
       // optionalAttrs (bridge.transport == "unix") {connect_socket = bridge.connectSocket;}
       // optionalAttrs bridgeForceTransportAuth {
-        mtls = {
-          enable = true;
-          ca_file = bridge.mtls.caFile;
-          cert_file = bridge.mtls.certFile;
-          key_file = bridge.mtls.keyFile;
-          required_oid = bridge.mtls.requiredOid;
-          peer_required_oid = bridge.mtls.peerOid;
-        };
+        mtls =
+          if bridge.pubkey != null
+          then {
+            enable = true;
+            ca_file = pkgs.concatText "trusted-peer-certs.pem" bridge.pubkey.trustedPeerCerts;
+            cert_file = bridge.pubkey.certFile;
+            key_file = bridge.pubkey.keyFile;
+            required_oid =
+              if bridge.pubkey.requiredOid != null
+              then bridge.pubkey.requiredOid
+              else bridge.mtls.requiredOid;
+            peer_required_oid =
+              if bridge.pubkey.peerOid != null
+              then bridge.pubkey.peerOid
+              else bridge.mtls.peerOid;
+          }
+          else {
+            enable = true;
+            ca_file = bridge.mtls.caFile;
+            cert_file = bridge.mtls.certFile;
+            key_file = bridge.mtls.keyFile;
+            required_oid = bridge.mtls.requiredOid;
+            peer_required_oid = bridge.mtls.peerOid;
+          };
       };
     bridgeConfigFile = tomlFormat.generate "ssh-agent-host.toml" (
       pruneNulls (lib.recursiveUpdate ({mode = "client";} // bridgeConnection) bridge.extraSettings)
@@ -1033,6 +1130,12 @@ in {
           SSH_AUTH_SOCK = replaceStrings ["%t"] ["$XDG_RUNTIME_DIR"] bridge.listenSocket;
         }))
         {
+          assertions = [
+            {
+              assertion = !(bridge.pubkey != null && bridge.mtls.enable);
+              message = "tartarus.ssh-agent-proxy.bridge: pubkey and mtls are mutually exclusive; use one trust mode.";
+            }
+          ];
           home.packages = [package];
           home.file.${bridgeConfigPath}.source = bridgeConfigFile;
         }

@@ -139,6 +139,37 @@
     };
   };
 
+  # Reusable `pubkey` (no-CA) option set. Each side presents a self-signed
+  # leaf; `trustedPeerCerts` is concatenated into the emitted `[mtls] ca_file`
+  # trust bundle, so the peer certificate is the trust anchor and no CA exists.
+  # Mutually exclusive with `mtls`; forces mTLS.
+  mkPubkeyOptions = {lib}: let
+    inherit (lib) mkOption types;
+  in {
+    certFile = mkOption {
+      type = types.path;
+      description = "This side's self-signed certificate (public; usually a Nix store path).";
+    };
+    keyFile = mkOption {
+      type = types.path;
+      description = "This side's private key (local or /etc; never in the Nix store).";
+    };
+    trustedPeerCerts = mkOption {
+      type = types.nonEmptyListOf types.path;
+      description = "One or more peer self-signed certificates to whitelist; concatenated into the `ca_file` trust bundle.";
+    };
+    requiredOid = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "EKU OID the local certificate must contain. Defaults to the role's OID.";
+    };
+    peerOid = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "EKU OID the peer certificate must contain. Defaults to the role's OID.";
+    };
+  };
+
   # The client-side `[acl]`: which server certificate the client trusts. Crypto
   # material only (never request metadata); enforced after the TLS handshake.
   mkAclOptions = {lib}: let
@@ -306,6 +337,15 @@
       inherit lib requiredOid peerOid;
       certType = "server";
     };
+    pubkey = mkOption {
+      type = types.nullOr (types.submodule {options = mkPubkeyOptions {inherit lib;};});
+      default = null;
+      description = ''
+        No-CA trust mode: a self-signed server certificate whose peer is
+        whitelisted by certificate. Mutually exclusive with `mtls`; setting it
+        forces the effective transport to mTLS.
+      '';
+    };
   };
 
   # Reusable client option set. `client` and `adminClient` both use it; only
@@ -359,6 +399,14 @@
     mtls = mkMtlsOptions {
       inherit lib requiredOid peerOid;
       certType = "client";
+    };
+    pubkey = mkOption {
+      type = types.nullOr (types.submodule {options = mkPubkeyOptions {inherit lib;};});
+      default = null;
+      description = ''
+        No-CA trust mode: a self-signed client certificate whose server is
+        whitelisted by certificate. Mutually exclusive with `mtls`.
+      '';
     };
     acl = mkAclOptions {inherit lib;};
     connectTimeout = mkOption {
@@ -486,7 +534,7 @@
     resolveSecurity {
       type = entry.type;
       security = entry.security;
-      mtlsEnabled = entry.mtls.enable;
+      mtlsEnabled = entry.mtls.enable || entry.pubkey != null;
     };
 
   # Resolve one client document from the client alone (a client has a single
@@ -495,7 +543,7 @@
     resolveSecurity {
       type = client.transport;
       security = client.security;
-      mtlsEnabled = client.mtls.enable;
+      mtlsEnabled = client.mtls.enable || client.pubkey != null;
     };
 
   # One self-contained `[[listeners]]` entry: bind target, socket modes,
@@ -503,6 +551,7 @@
   # `[mtls]` block.
   renderListener = {
     lib,
+    pkgs,
     entry,
   }: let
     prune = mkPruneNulls lib;
@@ -513,14 +562,30 @@
       server_auth = resolved.effectiveServerAuth;
     };
     mtlsSection = lib.optionalAttrs (resolved.effectiveTransportEncryption == "mtls") {
-      mtls = {
-        enable = true;
-        ca_file = entry.mtls.caFile;
-        cert_file = entry.mtls.certFile;
-        key_file = entry.mtls.keyFile;
-        required_oid = entry.mtls.requiredOid;
-        peer_required_oid = entry.mtls.peerOid;
-      };
+      mtls =
+        if entry.pubkey != null
+        then {
+          enable = true;
+          ca_file = pkgs.concatText "trusted-peer-certs.pem" entry.pubkey.trustedPeerCerts;
+          cert_file = entry.pubkey.certFile;
+          key_file = entry.pubkey.keyFile;
+          required_oid =
+            if entry.pubkey.requiredOid != null
+            then entry.pubkey.requiredOid
+            else entry.mtls.requiredOid;
+          peer_required_oid =
+            if entry.pubkey.peerOid != null
+            then entry.pubkey.peerOid
+            else entry.mtls.peerOid;
+        }
+        else {
+          enable = true;
+          ca_file = entry.mtls.caFile;
+          cert_file = entry.mtls.certFile;
+          key_file = entry.mtls.keyFile;
+          required_oid = entry.mtls.requiredOid;
+          peer_required_oid = entry.mtls.peerOid;
+        };
     };
   in
     prune (
@@ -570,6 +635,7 @@
   # `extraSettings`.
   renderServerToml = {
     lib,
+    pkgs,
     server,
   }: let
     prune = mkPruneNulls lib;
@@ -580,7 +646,7 @@
       // lib.optionalAttrs (server.settings.labels != {}) {labels = server.settings.labels;}
       // lib.optionalAttrs server.debug {debug = true;}
       // lib.optionalAttrs (server.rule != []) {rule = map (rule: renderRule {inherit lib rule;}) server.rule;}
-      // {listeners = map (entry: renderListener {inherit lib entry;}) server.listeners;}
+      // {listeners = map (entry: renderListener {inherit lib pkgs entry;}) server.listeners;}
       // server.extraSettings;
   in
     prune document;
@@ -590,6 +656,7 @@
   # bounds and `extraSettings`.
   renderClientToml = {
     lib,
+    pkgs,
     client,
   }: let
     prune = mkPruneNulls lib;
@@ -613,14 +680,30 @@
         socket = client.socket;
       };
     mtlsSection = lib.optionalAttrs (resolved.effectiveTransportEncryption == "mtls") {
-      mtls = {
-        enable = true;
-        ca_file = client.mtls.caFile;
-        cert_file = client.mtls.certFile;
-        key_file = client.mtls.keyFile;
-        required_oid = client.mtls.requiredOid;
-        peer_required_oid = client.mtls.peerOid;
-      };
+      mtls =
+        if client.pubkey != null
+        then {
+          enable = true;
+          ca_file = pkgs.concatText "trusted-peer-certs.pem" client.pubkey.trustedPeerCerts;
+          cert_file = client.pubkey.certFile;
+          key_file = client.pubkey.keyFile;
+          required_oid =
+            if client.pubkey.requiredOid != null
+            then client.pubkey.requiredOid
+            else client.mtls.requiredOid;
+          peer_required_oid =
+            if client.pubkey.peerOid != null
+            then client.pubkey.peerOid
+            else client.mtls.peerOid;
+        }
+        else {
+          enable = true;
+          ca_file = client.mtls.caFile;
+          cert_file = client.mtls.certFile;
+          key_file = client.mtls.keyFile;
+          required_oid = client.mtls.requiredOid;
+          peer_required_oid = client.mtls.peerOid;
+        };
     };
     aclSection = lib.optionalAttrs (client.acl.trustedFingerprints != [] || client.acl.trustedNames != []) {
       acl = {
@@ -664,6 +747,12 @@
     );
     perEntry = entry: let
       resolved = resolveListener entry;
+      # The peer OID actually emitted under `[mtls]`: an explicit pubkey peer
+      # OID wins, otherwise the mtls (role-default) value is used.
+      effectivePeerOid =
+        if entry.pubkey != null && entry.pubkey.peerOid != null
+        then entry.pubkey.peerOid
+        else entry.mtls.peerOid;
     in [
       {
         assertion =
@@ -716,11 +805,15 @@
         assertion =
           !(entry.admin
             && resolved.effectiveTransportEncryption == "mtls"
-            && entry.mtls.peerOid != clipboardAdminOid);
+            && effectivePeerOid != clipboardAdminOid);
         message = ''
           tartarus.clipboard-bridge.server.listeners: an admin listener that
           resolves to mTLS must use the admin peer OID ${clipboardAdminOid}.
         '';
+      }
+      {
+        assertion = !(entry.pubkey != null && entry.mtls.enable);
+        message = "tartarus.clipboard-bridge.server.listeners: pubkey and mtls are mutually exclusive (entry type = ${entry.type}).";
       }
     ];
   in
@@ -744,6 +837,12 @@
     admin ? false,
   }: let
     resolved = resolveClient client;
+    # The required OID actually emitted under `[mtls]`: an explicit pubkey OID
+    # wins, otherwise the mtls (role-default) value is used.
+    effectiveRequiredOid =
+      if client.pubkey != null && client.pubkey.requiredOid != null
+      then client.pubkey.requiredOid
+      else client.mtls.requiredOid;
   in
     [
       {
@@ -775,13 +874,17 @@
           non-empty socket path (a missing socket never silently dials TCP).
         '';
       }
+      {
+        assertion = !(client.pubkey != null && client.mtls.enable);
+        message = "tartarus.clipboard-bridge client: pubkey and mtls are mutually exclusive; use one trust mode.";
+      }
     ]
     ++ lib.optional
-    (admin && resolved.effectiveTransportEncryption == "mtls" && client.mtls.requiredOid != clipboardAdminOid) {
+    (admin && resolved.effectiveTransportEncryption == "mtls" && effectiveRequiredOid != clipboardAdminOid) {
       assertion = false;
       message = ''
         tartarus.clipboard-bridge.adminClient: mTLS requires requiredOid =
-        ${clipboardAdminOid} (the admin EKU); ${client.mtls.requiredOid} would
+        ${clipboardAdminOid} (the admin EKU); ${effectiveRequiredOid} would
         reject the admin certificate.
       '';
     };
@@ -936,7 +1039,7 @@ in {
       if server.configPath != null
       then server.configPath
       else "/etc/clipboard-bridge/server.toml";
-    configFile = tomlFormat.generate "clipboard-bridge-server.toml" (renderServerToml {inherit lib server;});
+    configFile = tomlFormat.generate "clipboard-bridge-server.toml" (renderServerToml {inherit lib pkgs server;});
   in {
     imports = [optionsModule];
 
@@ -1005,10 +1108,10 @@ in {
       then admin.configPath
       else "${home}/.config/clipboard-bridge/admin.toml";
 
-    serverConfigFile = tomlFormat.generate "clipboard-bridge-server.toml" (renderServerToml {inherit lib server;});
-    clientConfigFile = tomlFormat.generate "clipboard-bridge-client.toml" (renderClientToml {inherit lib client;});
+    serverConfigFile = tomlFormat.generate "clipboard-bridge-server.toml" (renderServerToml {inherit lib pkgs server;});
+    clientConfigFile = tomlFormat.generate "clipboard-bridge-client.toml" (renderClientToml {inherit lib pkgs client;});
     adminConfigFile = tomlFormat.generate "clipboard-bridge-admin.toml" (renderClientToml {
-      inherit lib;
+      inherit lib pkgs;
       client = admin;
     });
   in {

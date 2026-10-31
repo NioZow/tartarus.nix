@@ -4375,6 +4375,234 @@ in {
       }))
       "ssh-agent-proxy home-manager module rejected a multi-listener listeners list";
 
+    # ---- no-CA `pubkey` trust mode -------------------------------------
+    # A self-signed certificate whose peer is whitelisted by certificate must
+    # evaluate for every service role. `ca_file` is built from the peer certs,
+    # so no CA is involved; the effective transport is forced to mTLS.
+    "standalone/nixos-sudo-auth-proxy-pubkey-client" =
+      T
+      (nixosDrvOk (mkStandaloneNixos self.nixosModules."sudo-auth-proxy" {
+        tartarus.sudo-auth-proxy = {
+          enable = true;
+          transport = "tcp";
+          pubkey = {
+            certFile = "/tmp/client.crt";
+            keyFile = "/tmp/client.key";
+            trustedPeerCerts = ["/tmp/athena.crt"];
+          };
+        };
+      }))
+      "sudo-auth-proxy pubkey client does not evaluate";
+    "standalone/hm-sudo-auth-proxy-pubkey-server" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."sudo-auth-proxy" {
+        tartarus.sudo-auth-proxy.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "unix";
+              socket = "/tmp/sudo-auth-proxy.sock";
+              resolution = "certificate";
+              pubkey = {
+                certFile = "/tmp/server.crt";
+                keyFile = "/tmp/server.key";
+                trustedPeerCerts = ["/tmp/zeus.crt"];
+              };
+            }
+          ];
+        };
+      }))
+      "sudo-auth-proxy pubkey server listener does not evaluate";
+    "standalone/hm-ssh-agent-proxy-pubkey-server" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
+        tartarus.ssh-agent-proxy.server = {
+          enable = true;
+          settings.agent_sockets = ["/tmp/agent"];
+          listeners = [
+            {
+              type = "unix";
+              socket = "/tmp/ssh-agent-proxy.sock";
+              resolution = "certificate";
+              pubkey = {
+                certFile = "/tmp/server.crt";
+                keyFile = "/tmp/server.key";
+                trustedPeerCerts = ["/tmp/zeus.crt"];
+              };
+            }
+          ];
+        };
+      }))
+      "ssh-agent-proxy pubkey server listener does not evaluate";
+    "standalone/hm-ssh-agent-proxy-pubkey-bridge" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
+        tartarus.ssh-agent-proxy.bridge = {
+          enable = true;
+          transport = "tcp";
+          host = "127.0.0.1";
+          pubkey = {
+            certFile = "/tmp/client.crt";
+            keyFile = "/tmp/client.key";
+            trustedPeerCerts = ["/tmp/athena.crt"];
+          };
+        };
+      }))
+      "ssh-agent-proxy pubkey bridge does not evaluate";
+    "standalone/hm-clipboard-bridge-pubkey-server" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.server = {
+          enable = true;
+          listeners = [
+            {
+              type = "tcp";
+              host = "127.0.0.1";
+              port = 27795;
+              resolution = "certificate";
+              pubkey = {
+                certFile = "/tmp/server.crt";
+                keyFile = "/tmp/server.key";
+                trustedPeerCerts = ["/tmp/guest.crt"];
+              };
+            }
+          ];
+        };
+      }))
+      "clipboard-bridge pubkey server listener does not evaluate";
+    "standalone/hm-clipboard-bridge-pubkey-client" =
+      T
+      (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.client = {
+          enable = true;
+          transport = "tcp";
+          host = "127.0.0.1";
+          port = 27795;
+          pubkey = {
+            certFile = "/tmp/client.crt";
+            keyFile = "/tmp/client.key";
+            trustedPeerCerts = ["/tmp/athena.crt"];
+          };
+        };
+      }))
+      "clipboard-bridge pubkey client does not evaluate";
+    # The admin client keeps its admin EKU and host peer OID defaults when
+    # `pubkey` is set (the fallback comes from the `mtls` role defaults).
+    "standalone/hm-clipboard-bridge-pubkey-admin-client" =
+      T
+      (let
+        hm = mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+          tartarus.clipboard-bridge.adminClient = {
+            enable = true;
+            transport = "tcp";
+            host = "127.0.0.1";
+            port = 27796;
+            pubkey = {
+              certFile = "/tmp/admin.crt";
+              keyFile = "/tmp/admin.key";
+              trustedPeerCerts = ["/tmp/athena.crt"];
+            };
+          };
+        };
+        admin = hm.config.tartarus.clipboard-bridge.adminClient;
+      in
+        hmDrvOk hm
+        && admin.pubkey != null
+        && admin.mtls.requiredOid == "1.3.6.1.4.1.99999.3.3"
+        && admin.mtls.peerOid == "1.3.6.1.4.1.99999.3.1")
+      "the pubkey admin client did not fall back to the admin EKU and server peer OID";
+    # `pubkey` and `mtls` are mutually exclusive: a self-signed whitelist mode
+    # and a CA mode cannot be combined on one listener.
+    "standalone/pubkey-and-mtls-are-mutually-exclusive" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."sudo-auth-proxy" {
+          tartarus.sudo-auth-proxy.server = {
+            enable = true;
+            listeners = [
+              {
+                type = "unix";
+                socket = "/tmp/sudo-auth-proxy.sock";
+                mtls.enable = true;
+                pubkey = {
+                  certFile = "/tmp/server.crt";
+                  keyFile = "/tmp/server.key";
+                  trustedPeerCerts = ["/tmp/zeus.crt"];
+                };
+              }
+            ];
+          };
+        }))
+        && ! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+          tartarus.clipboard-bridge.client = {
+            enable = true;
+            transport = "tcp";
+            host = "127.0.0.1";
+            mtls.enable = true;
+            pubkey = {
+              certFile = "/tmp/client.crt";
+              keyFile = "/tmp/client.key";
+              trustedPeerCerts = ["/tmp/athena.crt"];
+            };
+          };
+        })))
+      "pubkey was accepted together with mtls";
+    # `trustedPeerCerts` is required and must be non-empty: an empty whitelist
+    # would trust every peer, and a missing one would leave no trust anchor.
+    "standalone/pubkey-requires-peer-certs" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
+          tartarus.ssh-agent-proxy.server = {
+            enable = true;
+            settings.agent_sockets = ["/tmp/agent"];
+            listeners = [
+              {
+                type = "unix";
+                socket = "/tmp/ssh-agent-proxy.sock";
+                pubkey = {
+                  certFile = "/tmp/server.crt";
+                  keyFile = "/tmp/server.key";
+                  trustedPeerCerts = [];
+                };
+              }
+            ];
+          };
+        }))
+        && ! (hmDrvOk (mkStandaloneHm self.homeManagerModules."ssh-agent-proxy" {
+          tartarus.ssh-agent-proxy.server = {
+            enable = true;
+            settings.agent_sockets = ["/tmp/agent"];
+            listeners = [
+              {
+                type = "unix";
+                socket = "/tmp/ssh-agent-proxy.sock";
+                pubkey = {
+                  certFile = "/tmp/server.crt";
+                  keyFile = "/tmp/server.key";
+                };
+              }
+            ];
+          };
+        })))
+      "pubkey accepted an empty or missing trustedPeerCerts list";
+    # An explicit guest OID on a pubkey admin client is refused just like the
+    # mtls case: the admin certificate carries only the admin EKU.
+    "standalone/hm-clipboard-bridge-pubkey-admin-client-guest-oid" =
+      T
+      (! (hmDrvOk (mkStandaloneHm self.homeManagerModules."clipboard-bridge" {
+        tartarus.clipboard-bridge.adminClient = {
+          enable = true;
+          transport = "tcp";
+          host = "127.0.0.1";
+          pubkey = {
+            certFile = "/tmp/admin.crt";
+            keyFile = "/tmp/admin.key";
+            trustedPeerCerts = ["/tmp/athena.crt"];
+            requiredOid = "1.3.6.1.4.1.99999.3.2";
+          };
+        };
+      })))
+      "clipboard-bridge accepted a pubkey admin client requiring the guest EKU";
+
     # An enabled server with no listeners must fail evaluation (doc §2.4). The
     # server lives in the home-manager modules, so the HM driver is the one that
     # reaches the assertion.

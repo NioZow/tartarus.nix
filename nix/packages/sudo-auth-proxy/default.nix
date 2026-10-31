@@ -153,6 +153,46 @@
     };
   };
 
+  # Reusable `pubkey` option set: the no-CA mode. Each side presents a
+  # *self-signed* leaf certificate and whitelists the peer's self-signed
+  # certificate(s); the peer certs are concatenated into the emitted
+  # `[mtls] ca_file` trust bundle, so no CA (and no CA private key) exists.
+  #
+  # Mutually exclusive with `mtls`; setting it forces the effective transport
+  # to mTLS. The internal TOML still uses `[mtls]`/`ca_file` names (the Python
+  # config is unchanged), but `ca_file` points at peer certificates, not a CA.
+  # A self-signed cert only works as a trust anchor when it carries the
+  # standard `serverAuth`/`clientAuth` EKU in addition to the service OID.
+  mkPubkeyOptions = {lib}: let
+    inherit (lib) mkOption types;
+  in {
+    certFile = mkOption {
+      type = types.path;
+      description = "This side's self-signed certificate (public; usually a Nix store path).";
+    };
+    keyFile = mkOption {
+      type = types.path;
+      description = "This side's private key (local or /etc; never in the Nix store).";
+    };
+    trustedPeerCerts = mkOption {
+      type = types.nonEmptyListOf types.path;
+      description = ''
+        One or more peer self-signed certificates to whitelist. They are
+        concatenated (in order) into the `ca_file` trust bundle.
+      '';
+    };
+    requiredOid = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "EKU OID the local certificate must contain. Defaults to the role's OID.";
+    };
+    peerOid = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "EKU OID the peer certificate must contain. Defaults to the role's OID.";
+    };
+  };
+
   # The document-level approval rules (`[[rule]]`) and `[labels]` display map —
   # server-only, emitted once per server document and **never per listener**. A
   # rule scopes itself to a listener with `match.listeners`. This is the same
@@ -362,6 +402,15 @@
     # document-level `server.rule` list scopes itself with `match.listeners`).
     security = mkSecurityOptions {inherit lib;};
     mtls = mkMtlsOptions {inherit lib requiredOid peerOid;};
+    pubkey = mkOption {
+      type = types.nullOr (types.submodule {options = mkPubkeyOptions {inherit lib;};});
+      default = null;
+      description = ''
+        No-CA trust mode: a self-signed local certificate whose peer is
+        whitelisted by certificate. Mutually exclusive with `mtls`; setting it
+        forces the effective transport to mTLS. See `mkPubkeyOptions`.
+      '';
+    };
   };
 
   # Reusable `server` option set. Every `listeners` entry is self-contained;
@@ -462,7 +511,7 @@
   resolveListener = entry: let
     requested = entry.security.transportEncryption;
     effectiveTransportEncryption =
-      if entry.mtls.enable
+      if entry.mtls.enable || entry.pubkey != null
       then "mtls"
       else if requested != "auto"
       then requested
@@ -492,6 +541,7 @@
   # (json2toml is fatal on `null`).
   renderServerToml = {
     lib,
+    pkgs,
     server,
   }: let
     prune = mkPruneNulls lib;
@@ -513,6 +563,23 @@
       mtls =
         if resolved.effectiveTransportEncryption != "mtls"
         then null
+        else if entry.pubkey != null
+        then {
+          enable = true;
+          # `ca_file` is the concatenation of the peer's self-signed certs:
+          # the trust anchor is the peer certificate itself, not a CA.
+          ca_file = pkgs.concatText "trusted-peer-certs.pem" entry.pubkey.trustedPeerCerts;
+          cert_file = entry.pubkey.certFile;
+          key_file = entry.pubkey.keyFile;
+          required_oid =
+            if entry.pubkey.requiredOid != null
+            then entry.pubkey.requiredOid
+            else entry.mtls.requiredOid;
+          peer_required_oid =
+            if entry.pubkey.peerOid != null
+            then entry.pubkey.peerOid
+            else entry.mtls.peerOid;
+        }
         else {
           enable = true;
           ca_file = entry.mtls.caFile;
@@ -586,18 +653,24 @@
       lib.filter (n: lib.count (m: m == n) namedListeners > 1) namedListeners
     );
   in
-    map (entry: {
-      assertion = let
-        resolved = resolveListener entry;
-      in
-        resolved.effectiveTransportEncryption
-        != "none"
-        || (resolved.effectiveClientAuth == "none" && resolved.effectiveServerAuth == "none");
-      message = ''
-        tartarus.sudo-auth-proxy.server.listeners: transport_encryption = "none"
-        requires client_auth = server_auth = "none" (entry type = ${entry.type}).
-      '';
-    })
+    lib.concatMap (entry: let
+      resolved = resolveListener entry;
+    in [
+      {
+        assertion =
+          resolved.effectiveTransportEncryption
+          != "none"
+          || (resolved.effectiveClientAuth == "none" && resolved.effectiveServerAuth == "none");
+        message = ''
+          tartarus.sudo-auth-proxy.server.listeners: transport_encryption = "none"
+          requires client_auth = server_auth = "none" (entry type = ${entry.type}).
+        '';
+      }
+      {
+        assertion = !(entry.pubkey != null && entry.mtls.enable);
+        message = "tartarus.sudo-auth-proxy.server.listeners: pubkey and mtls are mutually exclusive (entry type = ${entry.type}).";
+      }
+    ])
     server.listeners
     ++ lib.optional (server.enable && server.listeners == []) {
       assertion = false;
@@ -746,6 +819,19 @@
         };
       };
 
+      # No-CA trust mode for the client (see the server listener `pubkey`). The
+      # client presents its self-signed cert and whitelists the server's
+      # self-signed cert(s). Mutually exclusive with `mtls`; forces mTLS.
+      pubkey = mkOption {
+        type = types.nullOr (types.submodule {options = mkPubkeyOptions {inherit lib;};});
+        default = null;
+        description = ''
+          No-CA trust mode: a self-signed client certificate whose server is
+          whitelisted by certificate. Mutually exclusive with `mtls`; setting
+          it forces the effective transport to mTLS. See `mkPubkeyOptions`.
+        '';
+      };
+
       # Client-side `[acl]`: which server the client trusts to answer. Optional;
       # without it the client still verifies the server chain + EKU, but any
       # CA-signed server is accepted.
@@ -836,7 +922,7 @@
     # "transport" so the Python layer's no-downgrade rules are satisfied
     # without a build-time contradiction.
     effectiveTransportEncryption =
-      if cfg.mtls.enable
+      if cfg.mtls.enable || cfg.pubkey != null
       then "mtls"
       else if cfg.security.transportEncryption != "auto"
       then cfg.security.transportEncryption
@@ -873,14 +959,32 @@
       // optionalAttrs (cfg.transport == "vsock") {cid = cfg.cid;}
       // optionalAttrs (cfg.transport == "tcp") {host = cfg.host;}
       // optionalAttrs (effectiveTransportEncryption == "mtls") {
-        mtls = {
-          enable = true;
-          ca_file = cfg.mtls.caFile;
-          cert_file = cfg.mtls.certFile;
-          key_file = cfg.mtls.keyFile;
-          required_oid = cfg.mtls.requiredOid;
-          peer_required_oid = cfg.mtls.peerOid;
-        };
+        mtls =
+          if cfg.pubkey != null
+          then {
+            enable = true;
+            # Peer certificate(s), not a CA: the self-signed server cert is the
+            # trust anchor.
+            ca_file = pkgs.concatText "trusted-peer-certs.pem" cfg.pubkey.trustedPeerCerts;
+            cert_file = cfg.pubkey.certFile;
+            key_file = cfg.pubkey.keyFile;
+            required_oid =
+              if cfg.pubkey.requiredOid != null
+              then cfg.pubkey.requiredOid
+              else cfg.mtls.requiredOid;
+            peer_required_oid =
+              if cfg.pubkey.peerOid != null
+              then cfg.pubkey.peerOid
+              else cfg.mtls.peerOid;
+          }
+          else {
+            enable = true;
+            ca_file = cfg.mtls.caFile;
+            cert_file = cfg.mtls.certFile;
+            key_file = cfg.mtls.keyFile;
+            required_oid = cfg.mtls.requiredOid;
+            peer_required_oid = cfg.mtls.peerOid;
+          };
       };
 
     settings =
@@ -1012,6 +1116,10 @@
             use transport_encryption = "mtls".
           '';
         }
+        {
+          assertion = !(cfg.pubkey != null && cfg.mtls.enable);
+          message = "tartarus.sudo-auth-proxy: pubkey and mtls are mutually exclusive; use one trust mode.";
+        }
       ];
 
       # `pam_exec.so` runs this PAM helper as the invoking user, which must be
@@ -1108,7 +1216,7 @@
         else "${config.home.homeDirectory}/.config/sudo-auth-proxy/${name}.toml";
     in {
       inherit configPath;
-      configFile = tomlFormat.generate "sudo-auth-proxy-server-${name}.toml" (renderServerToml {inherit lib server;});
+      configFile = tomlFormat.generate "sudo-auth-proxy-server-${name}.toml" (renderServerToml {inherit lib pkgs server;});
     };
 
     instance =
@@ -1196,7 +1304,7 @@
 
     # The generated server TOML: one self-contained `[[listeners]]` entry per
     # entry in `server.listeners`. See `renderServerToml`.
-    configFile = tomlFormat.generate "sudo-auth-proxy-server.toml" (renderServerToml {inherit lib server;});
+    configFile = tomlFormat.generate "sudo-auth-proxy-server.toml" (renderServerToml {inherit lib pkgs server;});
   in {
     imports = [optionsModule namedServersModule];
 

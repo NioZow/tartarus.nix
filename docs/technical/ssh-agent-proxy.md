@@ -381,6 +381,73 @@ deployments use `1.3.6.1.4.1.99999.2.1` (server) and `...2.2` (client). The
 `scripts/tartarus-certs.sh` tooling mirrors this and can restrict to a single
 service with `--service`.
 
+### 6.4 `pubkey` (no CA): self-signed certificate pinning
+
+The CA is optional. Each side can present a **self-signed** leaf and whitelist
+the peer's leaf instead; the trust anchor is the peer certificate itself, so no
+CA key exists. The Nix modules expose this as `pubkey`, mutually exclusive with
+`mtls`, on a server listener and on the bridge/client:
+
+```nix
+# server listener
+{ type = "unix"; socket = "%t/ssh-agent-proxy/server.sock";
+  resolution = "certificate";
+  pubkey = {
+    certFile = ./server.crt;
+    keyFile = "/etc/ssh-agent-proxy/server.key";
+    trustedPeerCerts = [ ./zeus.crt ];   # one or more peer certs
+    # requiredOid / peerOid default to 2.1 / 2.2 for the server role
+  };
+}
+
+# bridge/client
+tartarus.ssh-agent-proxy.bridge = {
+  enable = true; transport = "tcp"; host = "127.0.0.1";
+  pubkey = {
+    certFile = ./client.crt;
+    keyFile = "/etc/ssh-agent-proxy/client.key";
+    trustedPeerCerts = [ ./athena.crt ];
+    # requiredOid / peerOid default to 2.2 / 2.1 for the client role
+  };
+};
+```
+
+Setting `pubkey` forces the effective transport to mTLS and both auth knobs to
+`"transport"`, exactly like `mtls.enable`; the emitted TOML still uses the
+internal `[mtls]` table, but `ca_file` is now a Nix-built concatenation of
+`trustedPeerCerts` (the whitelist; a world-readable store file), not a CA. `pubkey` + `mtls` on the same
+listener/client, or an empty/missing `trustedPeerCerts`, fails evaluation.
+
+The `settings.key`/`settings.rule` SSH-key policy (§7) is **unrelated**: `pubkey`
+is a certificate trust mode for the transport, not an SSH authorised-key list.
+
+Mint the material (no CA is created) with:
+
+```sh
+# server
+tartarus-certs selfsigned --role server --cn athena \
+  --service ssh-agent-proxy \
+  --key /etc/ssh-agent-proxy/server.key \
+  --cert /etc/ssh-agent-proxy/server.crt \
+  --pub /etc/ssh-agent-proxy/server.pub
+
+# client / bridge
+tartarus-certs selfsigned --role client --cn zeus \
+  --service ssh-agent-proxy \
+  --key /etc/ssh-agent-proxy/client.key \
+  --cert /etc/ssh-agent-proxy/client.crt \
+  --pub /etc/ssh-agent-proxy/client.pub
+```
+
+The certificate must carry the standard EKU **plus** the service OID:
+`serverAuth,<server OID>` on the server, `clientAuth,<client OID>` on the client,
+`basicConstraints = critical,CA:FALSE`, `keyUsage =
+critical,digitalSignature,keyEncipherment` (RSA), and `subjectAltName =
+DNS:<name>` on the server. Without the standard EKU the self-signed leaf fails
+the handshake with `unsuitable certificate purpose`; the `selfsigned` command
+always adds both. Keep the private keys local (never in the Nix store or git) and
+commit only the `.crt`/`.pub`.
+
 ---
 
 ## 7. Merging several agents
@@ -611,7 +678,8 @@ pid, so there is no `/proc` equivalent — macOS relies on the directory scan.
 
 - Server: `mode = "proxy"`, `transport = "unix"`,
   `socket = "%t/ssh-agent-proxy/server.sock"`, `resolution = "none"` (or
-  `certificate` + `[security]`/`[mtls]`), `agent_sockets`, `key`/`rule`.
+  `certificate` + `[security]`/`[mtls]`, or the no-CA `pubkey` mode with the
+  peer cert as `ca_file`), `agent_sockets`, `key`/`rule`.
 - Guest: `ssh -R /run/ssh-agent-proxy/<tok>.sock:%t/ssh-agent-proxy/server.sock`,
   then either set `SSH_AUTH_SOCK` to the forwarded path (`none`), or run the proxy
   server with a `unix` **upstream** (no `socket`, so it reads

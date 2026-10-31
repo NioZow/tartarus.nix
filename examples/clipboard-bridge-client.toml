@@ -73,11 +73,16 @@ server_auth = "transport"
 # ===========================================================================
 [mtls]
 enable = true
-ca_file = "./ca.crt"
+ca_file = "./ca.crt"                          # CA, or the SERVER's self-signed cert
 cert_file = "./client.crt"
 key_file = "./client.key"
 required_oid = "1.3.6.1.4.1.99999.3.2"       # this guest client
 peer_required_oid = "1.3.6.1.4.1.99999.3.1"  # clipboard-bridge server
+
+# NO-CA VARIANT: set `ca_file` to the server's self-signed certificate and mint
+# both ends with `tartarus-certs selfsigned --service clipboard-bridge` (client
+# uses `--role client --cn <guest>`). The Nix option is
+# `pubkey = { certFile; keyFile; trustedPeerCerts; }`. See doc §4.2a.
 
 # ===========================================================================
 # [acl] — OPTIONAL server pinning, enforced AFTER the TLS handshake.

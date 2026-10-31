@@ -129,6 +129,14 @@ server_auth = "transport"
 #   peer_required_oid  the EKU the peer (guest client) certificate must carry
 # The OIDs separate roles, not services: a chain-valid certificate with the
 # wrong EKU is rejected before any rule runs.
+#
+# NO-CA VARIANT: `ca_file` may instead be the concatenation of the CLIENT's
+# self-signed certificate(s). Mint them with `tartarus-certs selfsigned --role
+# server|client --service clipboard-bridge` (and `--service clipboard-admin` for
+# an admin cert). The Nix option is `pubkey = { certFile; keyFile;
+# trustedPeerCerts; }`, which emits this same table with `ca_file` pointing at
+# the peer certificate(s), not a CA. Standard serverAuth/clientAuth EKUs are
+# required (see doc §4.2a).
 [listeners.mtls]
 enable = true
 ca_file = "./ca.crt"

@@ -169,3 +169,143 @@ def test_tartarus_certs_install_and_verify_admin_without_kind(
 
     by_name = _run_certs("verify", "--out", str(out), "--name", "admin")
     assert "1.3.6.1.4.1.99999.3.3" in by_name.stdout
+
+
+# --- no-CA `selfsigned` mode ---------------------------------------------
+
+
+def _cert_ext(cert: Path, ext: str) -> str:
+    result = subprocess.run(
+        ["openssl", "x509", "-in", str(cert), "-noout", "-ext", ext],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def test_tartarus_certs_selfsigned_server_and_client(tmp_path: Path) -> None:
+    """`selfsigned` mints CA:FALSE leaves with standard + service EKUs and a SPKI."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not available")
+
+    server_crt = tmp_path / "athena.crt"
+    server_key = tmp_path / "athena.key"
+    server_pub = tmp_path / "athena.pub"
+    client_crt = tmp_path / "zeus.crt"
+    client_key = tmp_path / "zeus.key"
+
+    _run_certs(
+        "selfsigned",
+        "--role",
+        "server",
+        "--cn",
+        "athena",
+        "--service",
+        "sudo-auth-proxy",
+        "--cert",
+        str(server_crt),
+        "--key",
+        str(server_key),
+        "--pub",
+        str(server_pub),
+        "--days",
+        "2",
+    )
+    _run_certs(
+        "selfsigned",
+        "--role",
+        "client",
+        "--cn",
+        "zeus",
+        "--service",
+        "sudo-auth-proxy",
+        "--cert",
+        str(client_crt),
+        "--key",
+        str(client_key),
+        "--days",
+        "2",
+    )
+
+    assert stat.S_IMODE(os.lstat(server_key).st_mode) == 0o600
+    assert stat.S_IMODE(os.lstat(server_crt).st_mode) == 0o644
+    assert server_pub.read_text().startswith("-----BEGIN PUBLIC KEY-----")
+
+    # No CA: every leaf is CA:FALSE and carries the standard EKU plus its OID.
+    for crt in (server_crt, client_crt):
+        assert "CA:FALSE" in _cert_ext(crt, "basicConstraints")
+        key_usage = _cert_ext(crt, "keyUsage")
+        assert "Digital Signature" in key_usage
+    assert "TLS Web Server Authentication" in _cert_ext(server_crt, "extendedKeyUsage")
+    assert "1.3.6.1.4.1.99999.1.1" in _cert_ext(server_crt, "extendedKeyUsage")
+    assert "DNS:athena" in _cert_ext(server_crt, "subjectAltName")
+    assert "TLS Web Client Authentication" in _cert_ext(client_crt, "extendedKeyUsage")
+    assert "1.3.6.1.4.1.99999.1.2" in _cert_ext(client_crt, "extendedKeyUsage")
+
+    # The certificate verifies against itself: there is no CA in the chain.
+    subprocess.run(
+        ["openssl", "verify", "-CAfile", str(server_crt), str(server_crt)],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_tartarus_certs_selfsigned_admin_uses_admin_oid(tmp_path: Path) -> None:
+    """`--role client --service clipboard-admin` carries only the admin OID."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not available")
+
+    cert = tmp_path / "admin.crt"
+    _run_certs(
+        "selfsigned",
+        "--role",
+        "client",
+        "--cn",
+        "admin",
+        "--service",
+        "clipboard-admin",
+        "--cert",
+        str(cert),
+        "--days",
+        "2",
+    )
+    eku = _cert_ext(cert, "extendedKeyUsage")
+    assert "1.3.6.1.4.1.99999.3.3" in eku
+    assert "1.3.6.1.4.1.99999.3.2" not in eku
+
+
+def test_tartarus_certs_selfsigned_reuses_key_and_force(tmp_path: Path) -> None:
+    """Without `--force` the key/cert are reused; `--force` re-issues."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not available")
+
+    cert = tmp_path / "host.crt"
+    key = tmp_path / "host.key"
+    args = (
+        "selfsigned",
+        "--role",
+        "server",
+        "--cn",
+        "host",
+        "--service",
+        "ssh-agent-proxy",
+        "--cert",
+        str(cert),
+        "--key",
+        str(key),
+        "--days",
+        "2",
+    )
+    _run_certs(*args)
+    key_bytes = key.read_bytes()
+    cert_bytes = cert.read_bytes()
+
+    _run_certs(*args)
+    assert key.read_bytes() == key_bytes
+    assert cert.read_bytes() == cert_bytes
+
+    _run_certs(*args, "--force")
+    assert key.read_bytes() != key_bytes
+    # A freshly generated key changes the certificate too.
+    assert cert.read_bytes() != cert_bytes
