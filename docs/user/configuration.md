@@ -9,6 +9,7 @@ option.
 
 - the global options (`proxy`, `dns`, `containers`),
 - every `tartarus.guests.<name>` option and its default,
+- the lifecycle hooks (`tartarus.hooks`, `tartarus.guests.<name>.hooks`),
 - the host-level path/resource options,
 - how memory is returned to the host, and which assertions reject bad configs.
 
@@ -46,6 +47,190 @@ Host-wide defaults for `kind = "container"` guests.
 | `sudoNoPassword.groups` | list | `["wheel"]` | Groups granted the rule. |
 | `privateUsers` | `"no"` \| `"identity"` \| `"pick"` \| int | `"no"` | Default user namespace for every container (`systemd-nspawn --private-users`). `"pick"`/an int is real UID isolation; requires ID-mapped-mount support on the CA/share source filesystems. A guest overrides it with `privateUsers`. |
 | `containerHost` | null or str | `null` | Host-wide default container-host VM: every `kind = "container"` guest without an explicit `host` nests into it. A Linux host leaves it unset (containers stay native); a Darwin host sets it to its container-host VM. |
+
+## Lifecycle hooks
+
+Hooks run a shell command on the **host**, around every lifecycle operation.
+They live in two places with the same shape:
+
+- `tartarus.hooks` — host-wide, applying to every enabled guest;
+- `tartarus.guests.<name>.hooks` — per guest (sugar, see below).
+
+Both are keyed `event → phase → list of entries`, with the events `create`,
+`start`, `stop`, `remove`, `build` and the phases `before` and `after`.
+Rebuilds render them to `~/.config/tartarus/hooks.toml`, which the CLI reads on
+every operation.
+
+### Shape and defaults
+
+```nix
+tartarus.hooks.start.after = [
+  {
+    command = "${pkgs.rex-tunnel}/bin/rex-tunnel up {name}";
+    guests = [ "*" ];              # default: [ "*" ] (every guest)
+    kinds = [ "vm" "container" ];  # default: both kinds
+    timeout = 20;                  # seconds, default 30
+    retries = 15;                  # default 0 (one attempt)
+    retryDelay = 2.0;              # seconds, default 2.0
+    onFailure = "warn";            # "warn" | "abort", default "warn"
+    description = "Rex tunnel up"; # default null (logs fall back to command)
+  }
+];
+
+# Per guest: the guest's own name and kind are forced.
+tartarus.guests.vault.hooks.stop.before = [
+  { command = "printf 'stopping %s\n' {name} >> ~/tartarus.log"; }
+];
+```
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `command` | str | — (required) | Shell command, run as `/bin/sh -c <command>`. |
+| `guests` | list of str | `["*"]` | `fnmatch` glob patterns over instance name and base template; `!pat` excludes, `[]` disables. |
+| `kinds` | list of `"vm"`/`"container"` | both | Guest kinds the hook applies to. |
+| `timeout` | positive int | `30` | Per-attempt timeout in seconds; a slower command is killed and counts as a failure. |
+| `retries` | non-negative int | `0` | Extra attempts after the first failure. |
+| `retryDelay` | non-negative number | `2.0` | Seconds between attempts. |
+| `onFailure` | `"warn"` \| `"abort"` | `"warn"` | After the last failed attempt: warn and continue, or fail the command. |
+| `description` | null or str | `null` | Label for the hook log line and for warnings/errors. |
+
+`guests`/`kinds` written on a **per-guest** entry are ignored: the renderer
+forces `guests = ["<name>"]` and `kinds = ["<kind>"]`, so the hook only fires
+for that guest (numbered instances such as `notes-2` included) and the guest's
+own kind always wins. Use `tartarus.hooks` to cover several guests.
+
+### Events
+
+| Event | When it fires |
+| --- | --- |
+| `create` | A new instance is provisioned: `tartarus spawn` (VM), or the `nixos-container create` of an ad-hoc container instance. |
+| `start` | Every real stopped→running transition, including the start implied by `create`. |
+| `stop` | Every real running→stopped transition. |
+| `remove` | `tartarus stop --purge` (the VM state dir or the container registration is destroyed). |
+| `build` | An explicit `tartarus build <name>`. |
+
+Ordering:
+
+- **create + start** (spawn, or a first container start that provisions):
+  `before create` → `before start` → operation → `after start` →
+  `after create`.
+- **purge**: `before stop` → stop → `after stop` → `before remove` →
+  remove → `after remove`. Purging an **already-stopped** instance fires only
+  the remove hooks.
+- **no-op transitions** (already running / already stopped) fire nothing.
+- **`restart`** has no event of its own: it is exactly stop + start, so both
+  hook sets fire, stop first.
+- A nested container's `build` is delegated to its container-host VM: the
+  container's `build` pair brackets the VM build, which fires its own pair.
+
+`after start` runs once the relays are up, which is the earliest a
+`tartarus ssh`-style command can succeed.
+
+### Filtering
+
+`guests` holds `fnmatch` glob patterns (`*`, `?`, `[seq]`). Each pattern is
+matched against **both** the instance name and its base template, so
+`guests = ["notes"]` covers `notes` and `notes-2`, and `guests = ["dev-*"]`
+covers every numbered `dev` instance.
+
+- A leading `!` excludes: `guests = ["*" "!vpn"]` is every guest except `vpn`.
+- Negations are evaluated **first** and exclude outright; the positive
+  patterns then OR together.
+- `guests = []` matches nothing (the hook is disabled); `["*"]` is the
+  all-inclusive spelling and the default.
+- `kinds` narrows to `["vm"]` or `["container"]` (default: both).
+
+### Tokens and environment
+
+`command` may use these tokens, substituted before the shell sees it:
+
+| Token | Environment variable | Value |
+| --- | --- | --- |
+| `{name}` | `TARTARUS_GUEST` | Instance name (`notes-2`). |
+| `{template}` | `TARTARUS_TEMPLATE` | Base guest the instance came from (`notes`). |
+| `{kind}` | `TARTARUS_KIND` | `vm` or `container`. |
+| `{id}` | `TARTARUS_GUEST_ID` | Guest id (empty when not applicable, e.g. `build.before`). |
+| `{event}` | `TARTARUS_EVENT` | `create`, `start`, `stop`, `remove` or `build`. |
+| `{phase}` | `TARTARUS_PHASE` | `before` or `after`. |
+
+Substitution is a plain string replace, not `str.format`, so ordinary shell
+braces are safe: `${HOME}`, `${1:-default}`, `awk '{print $1}'` all pass
+through untouched.
+
+### Execution model
+
+- Each hook runs as `/bin/sh -c <command>` as the **invoking host user** —
+  never root, never sudo — with the working directory set to your home
+  directory.
+- Output is inherited, so it appears in the terminal with the rest of the
+  `tartarus` output.
+- Each attempt is bounded by `timeout`; `retries` extra attempts are made,
+  `retryDelay` seconds apart. Only the last attempt's outcome is reported.
+- `onFailure = "warn"` prints a warning and the tartarus command carries on.
+  `onFailure = "abort"` fails the command: a `before` hook aborts the
+  operation before it runs; an `after` hook fails it although the operation
+  already happened.
+- Entries run in file order: host-wide hooks before per-guest ones for the
+  same event/phase, and list order within a phase is preserved.
+
+### Where the file comes from
+
+At rebuild, the host module writes `~/.config/tartarus/hooks.toml` (schema
+`1`, separate from `config.toml`, which stays schema `2`). A missing file is
+normal and silent — most hosts have no hooks. Two overrides select another
+file:
+
+- `TARTARUS_HOOKS=/path/to/hooks.toml` in the environment;
+- `tartarus --hooks /path/to/hooks.toml <command>` as a global flag.
+
+The flag wins over the variable, which wins over the file next to the
+effective `config.toml` (so `--config /elsewhere/config.toml` picks
+`/elsewhere/hooks.toml`). An explicitly named file that does not exist is an
+error.
+
+Hooks are not installed by hand: edit the Nix options and rebuild. The
+generated file carries a "do not edit" header.
+
+### Known limitation
+
+Containers that auto-start **inside** a container-host VM are not started
+through the host CLI, so their `start.after` hooks do not fire when the host VM
+boots. An explicit `tartarus -c start <name>` does fire them.
+
+### Example: a Rex tunnel that follows the guest
+
+A common reason for hooks is host-side plumbing that must follow the guest.
+This module (nixcfg's `modules/virtualisation/tartarus/rex-tunnel-hooks.nix`)
+brings an SSH tunnel up after every guest start and takes it down before every
+stop (the generated file is shown in
+[Data model](../technical/data-model.md#the-hookstoml-artifact)):
+
+```nix
+{pkgs, ...}: {
+  config.tartarus.hooks = {
+    start.after = [
+      {
+        command = "${pkgs.rex-tunnel}/bin/rex-tunnel up {name}";
+        timeout = 20;      # a just-booted guest may be slow to answer
+        retries = 15;      # 16 attempts, ~30 s of retrying
+        retryDelay = 2.0;
+        description = "Rex tunnel up";
+      }
+    ];
+    stop.before = [
+      {
+        command = "${pkgs.rex-tunnel}/bin/rex-tunnel down {name}";
+        description = "Rex tunnel down";
+      }
+    ];
+  };
+}
+```
+
+`guests`/`kinds` are left at their defaults, so the hooks cover every enabled
+guest on the host. A host that wants to skip one writes `guests = ["*" "!vpn"]`
+on that entry instead of dropping the hook. Because the command runs as the
+invoking user, it only needs that user's SSH agent and `~/.ssh`.
 
 ## `tartarus.guests.<name>`
 

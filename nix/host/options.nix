@@ -1,7 +1,11 @@
 # The unified `tartarus.*` host option surface: `tartarus.proxy` holds only
 # global transport config (never filtering), and `tartarus.guests.<name>` holds
 # the per-guest metadata + host-enforced networking.
-{lib, config, ...}: let
+{
+  lib,
+  config,
+  ...
+}: let
   inherit
     (lib)
     mkEnableOption
@@ -139,6 +143,32 @@ in {
       has no native container support, so it sets this to its container-host VM
       (e.g. `"ch"`). A guest that must nest elsewhere (or run natively on a host
       that sets a default) still overrides it with its own `host`.
+    '';
+  };
+
+  # Host-wide lifecycle hooks. Rendered by `nix/host/hooks.nix` into
+  # `~/.config/tartarus/hooks.toml` (event/phase + command + filters) and run by
+  # the CLI around every create/start/stop/remove/build. They apply to every
+  # enabled guest unless narrowed with `guests`/`kinds`.
+  options.tartarus.hooks = mkOption {
+    type = shared.hooksType;
+    default = {};
+    description = ''
+      Host-wide lifecycle hooks, keyed by event (`create`, `start`, `stop`,
+      `remove`, `build`) and phase (`before`, `after`). Each entry runs a
+      shell command on the host with the instance name, template, kind, id,
+      event and phase available as `{token}` substitutions and as
+      `TARTARUS_*` environment variables.
+
+      `guests` glob-filters by instance name / base template (with `!`
+      exclusions) and `kinds` by `"vm"`/`"container"`; both default to
+      everything. Commands run as the invoking host user, never as root, and
+      are retried according to `retries`/`retryDelay`. A failing hook warns
+      (`onFailure = "warn"`, default) or aborts the command (`"abort"`).
+
+      Example: a `start.after` entry whose `command` is a `rex-tunnel up
+      {name}` invocation, with `timeout = 20` and `retries = 15` so it can
+      wait for the just-booted guest's sshd.
     '';
   };
 
@@ -332,6 +362,22 @@ in {
           type = shared.proxyPerGuest;
           default = {};
           description = "Per-guest proxy filtering, merged with the global `tartarus.proxy` transport config.";
+        };
+
+        hooks = mkOption {
+          type = shared.hooksType;
+          default = {};
+          description = ''
+            Lifecycle hooks scoped to this guest, same shape as the host-wide
+            `tartarus.hooks` (event -> phase -> list of entries).
+
+            This is sugar: the renderer forces `guests = ["<name>"]` and
+            `kinds = ["<guest kind>"]` on every entry, so a hook declared here
+            only ever fires for this guest's own instances (including numbered
+            `-N` ones) and the guest's own kind wins over any `guests`/`kinds`
+            written in the entry. Use the host-wide `tartarus.hooks` when a
+            hook should cover several guests.
+          '';
         };
 
         systemConfig = mkOption {

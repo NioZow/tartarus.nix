@@ -181,6 +181,48 @@ def test_all_guests_commands_are_not_guarded(monkeypatch):
     assert reached == ["list", "status"]
 
 
+# --- `list` / `ls` alias ---------------------------------------------------
+
+
+def test_list_parses_to_its_own_command():
+    args = cli.build_parser(make_config()).parse_args(["list"])
+    assert args.command == "list"
+
+
+def test_ls_alias_parses():
+    # argparse keeps the spelling that was typed; normalization is separate.
+    args = cli.build_parser(make_config()).parse_args(["ls"])
+    assert args.command == "ls"
+    assert args.json is False and args.tree is False and args.vm is False
+
+
+def test_normalize_command_folds_ls_into_list():
+    args = cli.build_parser(make_config()).parse_args(["ls"])
+    cli.normalize_command(args)
+    assert args.command == "list"
+
+
+def test_normalize_command_leaves_other_commands_alone():
+    args = cli.build_parser(make_config()).parse_args(["status"])
+    cli.normalize_command(args)
+    assert args.command == "status"
+
+
+def test_ls_takes_the_same_route_as_list(monkeypatch):
+    # The alias must reach the unified listing module, not vm/ctn dispatch.
+    config = make_config(VAULT)
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli.flake, "require_flake", lambda _config: None)
+
+    reached: list[str] = []
+    monkeypatch.setattr(cli.listing, "action_list", lambda *_a, **_k: reached.append("list"))
+    monkeypatch.setattr(cli.vm, "dispatch", lambda _c, a: reached.append(a.command))
+
+    cli.main(["ls"])
+
+    assert reached == ["list"]
+
+
 @pytest.mark.parametrize("command", ["cid", "proxy", "proxy-ip"])
 def test_container_vm_only_commands_still_rejected(monkeypatch, capsys, command):
     config = make_config(VAULT)

@@ -20,6 +20,7 @@ from pathlib import Path
 from . import ca, mounts, ssh, system
 from .config import Config
 from .fs import safe_rmtree
+from .hooks import run_hooks
 from .nix import eval as nix_eval
 from .nix import flake
 from .output import c, die, info, ok, print_table, warn
@@ -465,9 +466,15 @@ def _ensure_build_certs(config: Config, base: str) -> None:
 def action_build(config: Config, name: str, mounts: list[str], upgrade: bool = False) -> None:
     base = flake.base_name(config, "vm", name)
     flake.require_template(config, "vm", base)
+    # Lifecycle hooks: `build` is the explicit build event, so a failing
+    # `build.before` aborts before any cert or store work happens. No guest id:
+    # only a numbered instance (which records one) has a cheap id, and the
+    # canonical build would need `guest_id`'s die-on-missing path for no gain.
+    run_hooks(config, "build", "before", name, template=base, kind="vm")
     _ensure_build_certs(config, base)
     reused = _should_reuse(config, name, mounts, upgrade)
     result, _cid = _build_runner(config, name, mounts, upgrade=upgrade)
+    run_hooks(config, "build", "after", name, template=base, kind="vm", guest_id=_cid)
     if reused:
         ok(f"'{name}' already built. Result: {result}")
     else:
@@ -484,6 +491,11 @@ def action_start(config: Config, name: str, mounts: list[str], upgrade: bool = F
         pid = (config.state_dir(name) / "microvm.pid").read_text().strip()
         warn(f"'{name}' is already running (pid {pid}).")
         return
+
+    # Lifecycle hooks: `start` covers a real stopped->running transition only,
+    # hence it opens after the "already running" return above. `create` is the
+    # spawn-only event and is fired by `action_spawn`, not here.
+    run_hooks(config, "start", "before", name, template=base, kind="vm")
 
     # A stale runtime-mount state file or host staging bind can survive an
     # unclean exit (or a host reboot); release both before (re)launching.
@@ -551,6 +563,11 @@ def action_start(config: Config, name: str, mounts: list[str], upgrade: bool = F
 
     _start_relays(config, name)
 
+    # Lifecycle hooks: `after start` runs once relays are up, mirroring the
+    # `ok(...)` line so they fire identically (`start` is the real transition;
+    # spawn's create pair wraps this call from `action_spawn`).
+    run_hooks(config, "start", "after", name, template=base, kind="vm", guest_id=cid)
+
     ok(f"'{name}' started (pid {proc.pid}, cid {cid}). Console: {state / 'console.log'}")
 
 
@@ -560,16 +577,28 @@ def action_spawn(
     flake.require_template(config, "vm", template)
     name = name_override or next_instance_name(config, template)
     info(f"Spawning new '{template}' instance: {name}")
+    # Lifecycle hooks: `create` wraps the start, giving
+    # `before create` -> `before start` -> start -> `after start` ->
+    # `after create`. Only spawn fires it -- plain starts reuse an instance.
+    run_hooks(config, "create", "before", name, template=template, kind="vm")
     action_start(config, name, mounts, upgrade=upgrade)
+    run_hooks(config, "create", "after", name, template=template, kind="vm")
 
 
 def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> None:
-    flake.require_template(config, "vm", flake.base_name(config, "vm", name))
+    base = flake.base_name(config, "vm", name)
+    flake.require_template(config, "vm", base)
     state = config.state_dir(name)
 
     _reap_stale_vfkits(config, name)
 
-    if not ssh.is_running(config, name):
+    running = ssh.is_running(config, name)
+    if running:
+        # Lifecycle hooks: stop hooks bracket only a real running->stopped
+        # transition; an already-stopped guest is a no-op, not a stop.
+        run_hooks(config, "stop", "before", name, template=base, kind="vm")
+
+    if not running:
         warn(f"'{name}' is not running.")
     else:
         shutdown_bin = state / "result/bin/microvm-shutdown"
@@ -614,6 +643,11 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
             pass
         ok(f"'{name}' stopped.")
 
+    # Lifecycle hooks: `after stop` closes the transition opened above, so it
+    # fires only when the guest was really running.
+    if running:
+        run_hooks(config, "stop", "after", name, template=base, kind="vm")
+
     _stop_relays(config, name)
 
     # Runtime mounts do not survive a stop/restart: release host staging binds
@@ -621,6 +655,10 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
     unreleased = mounts.cleanup_vm_mounts(config, name)
 
     if purge:
+        # Lifecycle hooks: `remove` is the destruction of the instance's state,
+        # ordered after a real stop and independent of it, so an already-stopped
+        # purge still fires the remove pair and nothing else.
+        run_hooks(config, "remove", "before", name, template=base, kind="vm")
         if unreleased:
             # Recursively deleting the state dir would walk through a live bind
             # and empty the host source directory.
@@ -634,6 +672,7 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
             warn(
                 f"purged '{name}' only partially: live mounts were left in place"
             )
+        run_hooks(config, "remove", "after", name, template=base, kind="vm")
     else:
         (state / "microvm.pid").unlink(missing_ok=True)
         for sock in state.glob("*.sock"):
@@ -641,6 +680,7 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
 
 
 def action_restart(config: Config, name: str, debug: bool = False, upgrade: bool = False) -> None:
+    # No `restart` event: it is exactly stop+start, so both hook sets fire.
     action_stop(config, name, purge=False, debug=debug)
     action_start(config, name, mounts=[], upgrade=upgrade)
 

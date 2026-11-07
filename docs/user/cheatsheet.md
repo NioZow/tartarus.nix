@@ -61,12 +61,18 @@ tartarus.guests.vault = {
 
 tartarus.containers.containerHost = "ch";        # Darwin: nest containers
 tartarus.containers.sudoNoPassword.enable = true; # no sudo prompt on start/stop
+
+# Lifecycle hooks: run after a start / before a stop, for every guest
+tartarus.hooks.start.after = [{ command = "rex-tunnel up {name}"; retries = 15; }];
+tartarus.hooks.stop.before = [{ command = "rex-tunnel down {name}"; }];
+#                     per guest: only this guest's own instances fire it
+tartarus.guests.vault.hooks.start.after = [{ command = "notify-send {name}"; }];
 ```
 
 ## Commands
 
 ```bash
-tartarus list [-c|--vm] [-t] [--json]
+tartarus list [-c|--vm] [-t] [--json]   # alias: ls
 tartarus status [name]
 tartarus start <name> [-u] [--mount HOST:GUEST]
 tartarus build <name> [-u]
@@ -86,6 +92,27 @@ tartarus proxy-ip <name>     # MicroVM only (vmnet, macOS)
 tartarus --container <cmd> <name>   # force the container path
 ```
 
+Global flags (before the command): `-c/--container`, `--config PATH`,
+`--hooks PATH`. Hook examples:
+
+```nix
+# after a start, retry until the guest answers (15 × 2 s, 20 s per attempt)
+tartarus.hooks.start.after = [{ command = "rex-tunnel up {name}"; timeout = 20; retries = 15; }];
+# before a stop, for one guest only (guests/kinds are forced to it)
+tartarus.guests.vault.hooks.stop.before = [{ command = "rex-tunnel down {name}"; }];
+```
+
+## Lifecycle hooks
+
+`tartarus.hooks.<event>.<phase>` (host-wide) and
+`tartarus.guests.<name>.hooks.<event>.<phase>` (per guest), with events
+`create`, `start`, `stop`, `remove`, `build` and phases `before`/`after`.
+Tokens: `{name} {template} {kind} {id} {event} {phase}` (also `TARTARUS_*` env
+vars). Defaults: `guests = ["*"]`, `kinds = ["vm" "container"]`, `timeout = 30`,
+`retries = 0`, `retryDelay = 2.0`, `onFailure = "warn"`. Rendered to
+`~/.config/tartarus/hooks.toml`; override the file with `--hooks PATH` or
+`TARTARUS_HOOKS`.
+
 ## Common failures
 
 | Message / symptom | Fix |
@@ -104,7 +131,8 @@ tartarus --container <cmd> <name>   # force the container path
 
 | What | Where |
 | --- | --- |
-| Generated CLI config | `~/.config/tartarus/config.toml` |
+| Generated CLI config | `~/.config/tartarus/config.toml` (schema 2) |
+| Generated lifecycle hooks | `~/.config/tartarus/hooks.toml` (schema 1) |
 | Per-guest runtime state | `~/.local/state/tartarus/<name>/` |
 | Container registration | `/etc/nixos-containers/<name>.conf` |
 | Guest proxy env | `~/.config/environment.d/10-tartarus.conf` |

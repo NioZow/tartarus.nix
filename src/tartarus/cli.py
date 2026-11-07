@@ -40,7 +40,11 @@ def add_command_parser(sub: argparse._SubParsersAction) -> None:
     acts on, defaulting to MicroVMs.
     """
 
-    p = sub.add_parser("list", help="show every enabled guest (MicroVMs and containers) and whether it's running")
+    p = sub.add_parser(
+        "list",
+        aliases=["ls"],
+        help="show every enabled guest (MicroVMs and containers) and whether it's running (alias: ls)",
+    )
     p.add_argument("--json", action="store_true", help="print as JSON instead of a table")
     p.add_argument("-t", "--tree", action="store_true", help="nest containers under their container-host VM")
     p.add_argument(
@@ -238,6 +242,7 @@ def build_parser(config) -> argparse.ArgumentParser:
         epilog=(
             f"User flake: {config.flake_path}/flake.nix\n"
             f"Config: {config.config_path or '(defaults; ~/.config/tartarus/config.toml not found)'}\n"
+            f"Hooks: {config.hooks_path or '(none)'}\n"
             f"VM state dir: {config.state_root}/<name>/\n"
             f"Container conf dir: {CTN_CONF_DIR}/<name>.conf"
         ),
@@ -251,6 +256,11 @@ def build_parser(config) -> argparse.ArgumentParser:
         help="force the container path; when omitted, a named guest's kind is inferred from config.toml",
     )
     parser.add_argument("--config", metavar="PATH", help="path to config.toml (default: ~/.config/tartarus/config.toml)")
+    parser.add_argument(
+        "--hooks",
+        metavar="PATH",
+        help="path to hooks.toml (default: ~/.config/tartarus/hooks.toml)",
+    )
     parser.add_argument("--flake", metavar="PATH", help="override the user's flake root (from config.toml)")
     parser.add_argument("--user", metavar="NAME", help="override the configured user name")
     parser.add_argument("--system", metavar="SYSTEM", help="override the guest system (e.g. aarch64-linux)")
@@ -270,6 +280,7 @@ def build_parser(config) -> argparse.ArgumentParser:
 def _overrides(args: argparse.Namespace) -> dict:
     return {
         "config": args.config,
+        "hooks": args.hooks,
         "flake": args.flake,
         "user": args.user,
         "system": args.system,
@@ -309,6 +320,18 @@ def guard_guest(config: Config, args: argparse.Namespace) -> None:
         config.require_guest(name, "container" if args.container else "vm")
 
 
+def normalize_command(args: argparse.Namespace) -> None:
+    """Rewrite aliased subcommand names to their canonical form.
+
+    argparse stores the spelling actually typed (``ls``) in ``args.command``,
+    and ``set_defaults(command=...)`` does not apply to alias dispatch, so the
+    alias is folded back to ``list`` here. Every later check (the both-kinds
+    routing, the guard and ``listing.action_list``) then matches on one name.
+    """
+    if args.command == "ls":
+        args.command = "list"
+
+
 def _list_kind(args: argparse.Namespace) -> str | None:
     """The kind filter for ``list``: ``"vm"``, ``"container"`` or ``None`` (both).
 
@@ -331,6 +354,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         # Resolve without CLI flags first so --help can show the real paths.
         parser = build_parser(load_config())
         args = parser.parse_args(argv)
+        normalize_command(args)
 
         config = load_config(_overrides(args))
 

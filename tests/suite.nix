@@ -1526,6 +1526,111 @@
     };
   };
 
+  # ==== lifecycle hooks =================================================
+  # A minimal host with one VM (`notes`), one container (`box`) and one
+  # disabled VM (`ghost`). Host-wide hooks cover both kinds; `notes` carries a
+  # per-guest hook; `ghost` carries one that must never be rendered.
+  hostHooks = mkHost {
+    guests = {
+      notes = {
+        enable = true;
+        kind = "vm";
+        id = 3;
+        internet = true;
+        hooks.start.after = [
+          {
+            command = "notes-up {name}";
+            description = "Per-guest notes hook";
+          }
+        ];
+      };
+      box = {
+        enable = true;
+        kind = "container";
+        id = 4;
+        internet = true;
+      };
+      ghost = {
+        enable = false;
+        kind = "vm";
+        id = 5;
+        internet = true;
+        hooks.start.after = [{command = "ghost-up {name}";}];
+      };
+    };
+    modules = [
+      {
+        tartarus.hooks = {
+          start.after = [
+            {
+              command = "host-up {name}";
+              guests = ["*" "!vpn"];
+              kinds = ["container"];
+              timeout = 20;
+              retries = 15;
+              retryDelay = 2.0;
+              description = "Host-wide hook";
+            }
+          ];
+          stop.before = [{command = "host-down {name}";}];
+        };
+      }
+    ];
+  };
+
+  hooksToml = hostHooks.config.home-manager.users.user.home.file.".config/tartarus/hooks.toml".text;
+  # A hook-less host still renders the file (header only) when it has guests.
+  hooksNoHooksToml =
+    (mkHost {
+      guests.only = {
+        enable = true;
+        kind = "vm";
+        id = 3;
+        internet = true;
+      };
+    })
+    .config.home-manager.users.user.home.file.".config/tartarus/hooks.toml"
+    .text;
+
+  # One complete rendered host-wide block (`start.after`, every field set) and
+  # the forced per-guest block for `notes` (`start.after`).
+  hooksHostBlock = ''
+    [[hooks]]
+    event = "start"
+    phase = "after"
+    command = "host-up {name}"
+    guests = ["*", "!vpn"]
+    kinds = ["container"]
+    timeout = 20.0
+    retries = 15
+    retry_delay = 2.0
+    on_failure = "warn"
+    description = "Host-wide hook"'';
+
+  hooksGuestBlock = ''
+    [[hooks]]
+    event = "start"
+    phase = "after"
+    command = "notes-up {name}"
+    guests = ["notes"]
+    kinds = ["vm"]
+    timeout = 30.0
+    retries = 0
+    retry_delay = 2.0
+    on_failure = "warn"
+    description = "Per-guest notes hook"'';
+
+  # File offset of `block` inside `text`: everything before the first match is
+  # `matchToString`'s captured prefix, so its `stringLength` is the block's
+  # position. `99999` (past any realistic file) means "not found", which makes
+  # an ordering comparison fail loudly instead of silently passing.
+  hooksOffset = block: text: let
+    found = builtins.match "(.*)${lib.strings.escapeRegex block}(.*)" text;
+  in
+    if found == null
+    then 99999
+    else builtins.stringLength (builtins.head found);
+
   # ==== rendered nftables ===============================================
   nftOf = host: host.config.networking.nftables.tables;
   # Split a kind's table content at the forward chain: everything before it is
@@ -4645,6 +4750,43 @@ in {
       in
         !(host.config.tartarus ? guests) && !(host.config.tartarus ? proxy))
       "a service-only config pulled in tartarus host options (guests/proxy)";
+
+    # ---- lifecycle hooks: generated hooks.toml --------------------------
+    # A separate minimal host: one VM, one container, one disabled VM. The host
+    # module writes hooks.toml only through home-manager, so `mkHost`'s
+    # home-manager wiring is what makes the rendering observable.
+    "hooks/schema-marker" = inStr "schema = 1" hooksToml;
+    # Host-wide and per-guest `[[hooks]]` blocks both land in the file, each in
+    # the shape the CLI (`src/tartarus/hooks.py`) parses.
+    "hooks/host-wide-rendered" = inStr hooksHostBlock hooksToml;
+    "hooks/per-guest-rendered" = inStr hooksGuestBlock hooksToml;
+    # Disabled guests are excluded by construction (hooks.nix reads the enabled
+    # instances, `config.toml` does the same).
+    "hooks/disabled-guest-omitted" = notInStr ''guests = ["ghost"]'' hooksToml;
+    # Filters written on a host-wide hook are rendered verbatim; the CLI does
+    # the glob/negation matching.
+    "hooks/host-wide-guests-verbatim" = inStr ''guests = ["*", "!vpn"]'' hooksToml;
+    "hooks/host-wide-kinds-verbatim" = inStr ''kinds = ["container"]'' hooksToml;
+    # A per-guest hook is forced onto its own guest and kind, whatever the user
+    # wrote in the entry (here semantically identical to the forced values).
+    "hooks/per-guest-forced-filters" = inStr ''guests = ["notes"]'' hooksToml;
+    "hooks/per-guest-forced-kind" = inStr ''kinds = ["vm"]'' hooksToml;
+    # Host-wide entries come before per-guest ones for the same event/phase:
+    # compare the two block offsets in the rendered string (the only reliable
+    # ordering check available without re-implementing the renderer).
+    "hooks/host-wide-before-per-guest" =
+      T (hooksOffset hooksHostBlock hooksToml < hooksOffset hooksGuestBlock hooksToml)
+      "per-guest start.after hook was rendered before the host-wide one";
+    # `description = null` omits the line; a set one is rendered.
+    "hooks/null-description-omitted" = notInStr "description = null" hooksToml;
+    "hooks/description-rendered" = inStr ''description = "Per-guest notes hook"'' hooksToml;
+    # `timeout` is an int option rendered as a TOML float.
+    "hooks/timeout-is-float" = inStr "timeout = 20.0" hooksToml;
+    # A hook-less host still renders the file (header only): the CLI reads it
+    # and gets `[]`, which is the normal hook-less case.
+    "hooks/no-hooks-header-only" =
+      T (hooksNoHooksToml != "" && !hasInfix "[[hooks]]" hooksNoHooksToml)
+      "a hook-less host rendered [[hooks]] blocks";
   };
 
   # Human-inspectable renderings (plain strings, safe for `nix eval --json`).
@@ -4663,6 +4805,8 @@ in {
       envDarwin
       configToml
       containerHostToml
+      hooksToml
+      hooksNoHooksToml
       ;
     vmInput = inputPart "vm" vmContent;
     ctnInput = inputPart "container" ctnContent;

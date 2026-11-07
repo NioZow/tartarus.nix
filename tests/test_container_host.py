@@ -383,6 +383,7 @@ def test_nested_restart_over_ssh(monkeypatch, tmp_path):
     monkeypatch.setattr(ctn, "require_template", lambda *_a, **_k: None)
     monkeypatch.setattr(ctn.ssh, "is_running", lambda _c, _n: True)
     monkeypatch.setattr(ctn, "run_sudo", lambda *_a, **_k: pytest.fail("host systemctl was invoked"))
+    monkeypatch.setattr(ctn.ca, "ensure_ctn_certs", lambda *_a, **_k: None)
     ctl: list[tuple] = []
     monkeypatch.setattr(
         ctn, "nested_systemctl", lambda _c, host, verb, name: ctl.append((host, verb, name)) or _done()
@@ -390,7 +391,9 @@ def test_nested_restart_over_ssh(monkeypatch, tmp_path):
 
     ctn.action_restart(config, "inner")
 
-    assert ctl == [("ch", "restart", "inner")]
+    # Restart is composed from stop+start (a unit `restart` verb would fire no
+    # lifecycle hooks), so the unit is driven down then up over SSH.
+    assert ctl == [("ch", "stop", "inner"), ("ch", "start", "inner")]
 
 
 def test_nested_status_queries_unit_state(monkeypatch, tmp_path, capsys):

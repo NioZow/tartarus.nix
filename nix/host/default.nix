@@ -239,6 +239,7 @@ in {
       ./options.nix
       ./instances.nix
       ./config.nix
+      ./hooks.nix
       (import ./ca.nix {inherit inputs;})
       (import ./firewall.nix {})
       (import ./proxy.nix {inherit inputs;})

@@ -119,6 +119,9 @@
     services = g.services;
     firewall = g.firewall;
     proxy = g.proxy;
+    # Per-guest hooks, exposed here so the hooks renderer reads plain data
+    # rather than forcing the `tartarus.guests` submodule (see the header).
+    hooks = g.hooks;
     shares = g.shares;
     relays = g.relays;
     requires = g.requires;

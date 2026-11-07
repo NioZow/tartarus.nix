@@ -18,6 +18,7 @@ from typing import NoReturn
 from . import ca, mounts, ssh, system
 from .config import Config
 from .errors import TartarusError
+from .hooks import run_hooks
 from .nix import eval as nix_eval
 from .nix import flake
 from .output import c, die, info, ok, print_table, warn
@@ -316,6 +317,19 @@ def action_status(config: Config, name: str | None) -> None:
 
 
 def create_adhoc(config: Config, name: str, base: str) -> None:
+    # Provisioning only; the auto-start it implies is a `start` transition the
+    # callers bracket (see `action_start` and `action_spawn`), so no hooks here.
+    _create_adhoc(config, name, base)
+    adhoc_note(base)
+
+
+def adhoc_note(base: str) -> None:
+    """The post-create status line and CA/share caveat shared by both callers."""
+    print("    Note: ad-hoc instances have no bind-mounted shares and no CA-signed SSH")
+    print(f"    cert (only the canonical '{base}' does).")
+
+
+def _create_adhoc(config: Config, name: str, base: str) -> None:
     suffix = name[len(base) + 1 :] if name != base else name
     container_id = alloc_id()
     env_args = [
@@ -344,8 +358,6 @@ def create_adhoc(config: Config, name: str, base: str) -> None:
         ]
     )
     ok(f"'{name}' created and started (id {container_id}).")
-    print("    Note: ad-hoc instances have no bind-mounted shares and no CA-signed SSH")
-    print(f"    cert (only the canonical '{base}' does).")
 
 
 def action_start(config: Config, name: str, upgrade: bool = False) -> None:
@@ -374,17 +386,34 @@ def action_start(config: Config, name: str, upgrade: bool = False) -> None:
         if nested_state(config, guest.host, name) == "running":
             warn(f"'{name}' is already running.")
             return
+        # Lifecycle hooks: fired once the no-op case is excluded, around the
+        # unit's real stopped->running transition inside the host VM.
+        run_hooks(config, "start", "before", name, template=base, kind="container")
         # The unit is down, so any recorded runtime mounts are stale.
         mounts.cleanup_container_mounts(config, name)
         result = nested_systemctl(config, guest.host, "start", name)
         if result.returncode != 0:
             die(f"failed to start '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
+        run_hooks(config, "start", "after", name, template=base, kind="container")
         ok(f"'{name}' started.")
         return
 
     if name not in list_conf_names():
         if name != base:
-            create_adhoc(config, name, base)
+            # Lifecycle hooks: `nixos-container create` provisions the instance
+            # *and* auto-starts it, so both pairs must fire, ordered
+            # `before create` -> `before start` -> create/start -> `after
+            # start` -> `after create`. The create pair is opened here (not in
+            # `create_adhoc`) so its `before` runs first -- an aborting
+            # `create.before` must prevent the launch, which only a hook before
+            # the command can do -- while the start pair stays here too, so
+            # `action_spawn` (which only creates) fires no spurious start.
+            run_hooks(config, "create", "before", name, template=base, kind="container")
+            run_hooks(config, "start", "before", name, template=base, kind="container")
+            _create_adhoc(config, name, base)
+            run_hooks(config, "start", "after", name, template=base, kind="container")
+            run_hooks(config, "create", "after", name, template=base, kind="container")
+            adhoc_note(base)
             return
         die(
             f"'{name}' is not provisioned on this host. Enable it in your tartarus "
@@ -396,6 +425,9 @@ def action_start(config: Config, name: str, upgrade: bool = False) -> None:
     if is_running(name):
         warn(f"'{name}' is already running.")
         return
+
+    # Lifecycle hooks: a real stopped->running transition of the host unit.
+    run_hooks(config, "start", "before", name, template=base, kind="container")
 
     # A stale state file from an unclean previous exit must not shadow the
     # mounts this start will establish.
@@ -409,6 +441,7 @@ def action_start(config: Config, name: str, upgrade: bool = False) -> None:
 
     ca.ensure_ctn_certs(config, base)
     run_sudo(["systemctl", "start", f"container@{name}"])
+    run_hooks(config, "start", "after", name, template=base, kind="container")
     ok(f"'{name}' started.")
 
 
@@ -423,12 +456,21 @@ def action_build(config: Config, name: str, upgrade: bool = False) -> None:
         from . import vm  # lazy to avoid a circular import
 
         info(f"'{name}' is built as part of container-host VM '{guest.host}'.")
+        # The host VM build fires the VM's own `build` hooks; the container's
+        # pair brackets the delegation so an explicit `tartarus --container
+        # build <nested>` still reports a build for that container.
+        run_hooks(config, "build", "before", name, template=base, kind="container")
         vm.action_build(config, guest.host, mounts=[], upgrade=upgrade)
+        run_hooks(config, "build", "after", name, template=base, kind="container")
         return
 
+    # Lifecycle hooks: the standalone `ctn-<name>` build, bracketed like the VM
+    # build so an `on_failure = "abort"` hook runs before anything is built.
+    run_hooks(config, "build", "before", name, template=base, kind="container")
     state = config.state_dir(name)
     state.mkdir(parents=True, exist_ok=True)
     nix_eval.build(flake.flake_ref(config), flake.ctn_build_attr(base), state / "result")
+    run_hooks(config, "build", "after", name, template=base, kind="container")
     ok(f"'{name}' built. Result: {state / 'result'}")
 
 
@@ -446,7 +488,17 @@ def action_spawn(config: Config, template: str, name_override: str | None) -> No
     if name in list_conf_names():
         die(f"instance '{name}' already exists -- use `tartarus --container start {name}` instead")
     info(f"Spawning new '{template}' instance: {name}")
-    create_adhoc(config, name, template)
+    # Lifecycle hooks: `nixos-container create --auto-start` provisions *and*
+    # starts the instance, so spawn fires both pairs in the create+start order
+    # (`before create` -> `before start` -> create/start -> `after start` ->
+    # `after create`). The start pair is opened here and in `action_start`,
+    # never in `create_adhoc`, so no path fires it twice.
+    run_hooks(config, "create", "before", name, template=base, kind="container")
+    run_hooks(config, "start", "before", name, template=base, kind="container")
+    _create_adhoc(config, name, base)
+    run_hooks(config, "start", "after", name, template=base, kind="container")
+    run_hooks(config, "create", "after", name, template=base, kind="container")
+    adhoc_note(base)
 
 
 def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> None:
@@ -462,11 +514,18 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
         if not ssh.is_running(config, guest.host):
             warn(f"'{name}' is not running (container-host VM '{guest.host}' is down).")
             return
+        # Lifecycle hooks: `stop` only for a real running->stopped transition;
+        # a VM that is up but whose unit is already down is a no-op.
+        running = nested_state(config, guest.host, name) == "running"
+        if running:
+            run_hooks(config, "stop", "before", name, template=base, kind="container")
         result = nested_systemctl(config, guest.host, "stop", name)
         if result.returncode != 0:
             die(f"failed to stop '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
         # The stopped namespace took every runtime mount with it.
         mounts.cleanup_container_mounts(config, name)
+        if running:
+            run_hooks(config, "stop", "after", name, template=base, kind="container")
         ok(f"'{name}' stopped.")
         return
 
@@ -474,8 +533,13 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
         warn(f"'{name}' does not exist.")
         return
 
-    if is_running(name):
+    running = is_running(name)
+    if running:
+        # Lifecycle hooks: bracket only the real stop; an already-stopped
+        # container reaches the purge below with no stop hooks at all.
+        run_hooks(config, "stop", "before", name, template=base, kind="container")
         run_sudo_quiet(["systemctl", "stop", f"container@{name}"], debug=debug)
+        run_hooks(config, "stop", "after", name, template=base, kind="container")
         ok(f"'{name}' stopped.")
     else:
         warn(f"'{name}' is not running.")
@@ -485,8 +549,12 @@ def action_stop(config: Config, name: str, purge: bool, debug: bool = False) -> 
     mounts.cleanup_container_mounts(config, name)
 
     if purge:
+        # Lifecycle hooks: `remove` is the destruction of the registration,
+        # ordered after the stop (when there was one) and fired regardless of
+        # whether the container was running.
+        run_hooks(config, "remove", "before", name, template=base, kind="container")
         run_sudo_quiet(["nixos-container", "destroy", name], debug=debug)
-        base = base_name(config, name)
+        run_hooks(config, "remove", "after", name, template=base, kind="container")
         note = f" (re-provisioned on the next rebuild since '{base}' is canonical)" if name == base else ""
         ok(f"Purged '{name}'{note}.")
 
@@ -496,26 +564,31 @@ def action_restart(config: Config, name: str) -> None:
     require_template(config, base)
     guest = config.guest(base, "container")
     if guest is not None and guest.host is not None:
-        # Nested container: restart its own `container@<name>` unit inside the
-        # container-host VM (starting the VM first if it is down).
-        if not ssh.is_running(config, guest.host):
-            from . import vm  # lazy to avoid a circular import
-
-            ca.ensure_ctn_certs(config, base)
-            vm.action_start(config, guest.host, mounts=[], upgrade=False)
-        result = nested_systemctl(config, guest.host, "restart", name)
-        if result.returncode != 0:
-            die(f"failed to restart '{name}' in container-host VM '{guest.host}': {result.stderr.strip()}")
-        # A restart destroys the namespace, so recorded mounts are stale.
-        mounts.cleanup_container_mounts(config, name)
+        # Nested container: compose stop+start (there is no `restart` event, and
+        # a unit `restart` verb would fire no hooks). When the host VM is down,
+        # `action_stop` warns and returns without any stop hook, while
+        # `action_start` brings the VM up (which also provisions the inner
+        # certs) and then starts the unit -- the same end state as before.
+        action_stop(config, name, purge=False)
+        # `action_start` in this branch only calls `ca.ensure_ctn_certs` when
+        # the host VM is already up; when it has to boot the VM that work is
+        # done on the way up, so no extra call is needed here.
+        action_start(config, name)
+        # Stop and start each clean up their own stale runtime mounts, and the
+        # stopped namespace already took them with it: nothing left to do.
         ok(f"'{name}' restarted.")
         return
     if name not in list_conf_names():
         die(f"'{name}' has never been created -- use `tartarus --container start` or `spawn` first")
     ca.ensure_ctn_certs(config, base)
-    run_sudo(["systemctl", "restart", f"container@{name}"])
-    # A restart destroys the namespace, so recorded mounts are stale.
-    mounts.cleanup_container_mounts(config, name)
+    # The unit's client cert must be in place before it comes back up; the cert
+    # call above (and start's own) cover that, so no third one is needed.
+    # `action_stop` handles the "not running" case with a warning rather than
+    # dying, so restart still works from a stopped container.
+    action_stop(config, name, purge=False)
+    action_start(config, name)
+    # A restart destroys the namespace, so recorded mounts are stale; stop and
+    # start each released theirs already, hence no redundant third cleanup.
     ok(f"'{name}' restarted.")
 
 

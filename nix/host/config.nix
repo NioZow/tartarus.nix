@@ -26,12 +26,20 @@
     attrValues
     concatMapStringsSep
     concatStringsSep
-    mapAttrsToList
     mkIf
     mkOption
     optionalString
-    replaceStrings
     types
+    ;
+  tomlLib = import ../lib/toml.nix {inherit lib;};
+  inherit
+    (tomlLib)
+    tArr
+    tBool
+    tFloat
+    tInline
+    tInt
+    tStr
     ;
 
   # Read from the raw module args (specialArgs); a defaulted formal would be
@@ -70,33 +78,11 @@
   sshRoot = builtins.dirOf config.tartarus.ca.ssh.caDir;
   x509Root = builtins.dirOf config.tartarus.ca.x509.caDir;
 
-  # --- minimal TOML rendering ------------------------------------------------
-  # Hand-rendered rather than `pkgs.formats.toml`: the schema is tiny, stable,
-  # and must match `src/tartarus/config.py` exactly (including the per-guest
-  # inline `proxy` table, which the generic generator does not emit).
-  esc = s:
-    replaceStrings
-    ["\\" "\"" "\n" "\r" "\t"]
-    ["\\\\" "\\\"" "\\n" "\\r" "\\t"]
-    s;
-  tStr = s: "\"${esc s}\"";
-  tBool = b:
-    if b
-    then "true"
-    else "false";
-  tInt = i: toString i;
-  # TOML floats must carry a decimal point; Nix renders 2.0 as "2.000000",
-  # so collapse trailing zeros to keep config.toml readable.
-  tFloat = f: let
-    rendered = toString f;
-    whole = builtins.match "([0-9]+)\\.0+" rendered;
-  in
-    if whole != null
-    then "${builtins.head whole}.0"
-    else rendered;
-  tArr = xs: "[${concatMapStringsSep ", " tStr xs}]";
-  tInline = attrs: "{ ${concatStringsSep ", " (mapAttrsToList (k: v: "${k} = ${v}") attrs)} }";
-
+  # --- config.toml body ------------------------------------------------------
+  # The TOML primitives live in `nix/lib/toml.nix` (shared with hooks.nix); the
+  # schema below is tiny, stable, and must match `src/tartarus/config.py`
+  # exactly (including the per-guest inline `proxy` table, which the generic
+  # `pkgs.formats.toml` generator does not emit).
   relayBlock = r: let
     targetPortLine = optionalString (r.targetPort != null) "    target_port = ${tInt r.targetPort}\n";
     hostLine = optionalString (r.host != null) "    host = ${tStr r.host}\n";

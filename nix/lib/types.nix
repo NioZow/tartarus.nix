@@ -5,7 +5,182 @@
     mkOption
     types
     ;
+
+  # One lifecycle hook entry. Shared by the host-wide `tartarus.hooks` and the
+  # per-guest `tartarus.guests.<name>.hooks` surfaces; the renderer
+  # (`nix/host/hooks.nix`) flattens both into `~/.config/tartarus/hooks.toml`
+  # and the CLI (`src/tartarus/hooks.py`) runs the matching entries.
+  #
+  # `command` runs as the invoking host user through `/bin/sh -c` (never sudo).
+  # It may contain the tokens `{name}`, `{template}`, `{kind}`, `{id}`,
+  # `{event}` and `{phase}`. Substitution is a plain `str.replace`, not
+  # `str.format`, so shell braces (`$VAR`, `awk '{print $1}'`) stay intact.
+  hookType = types.submodule {
+    options = {
+      command = mkOption {
+        type = types.str;
+        description = ''
+          Shell command to run, executed as `/bin/sh -c <command>` by the
+          invoking host user with the hook's environment variables set.
+
+          The tokens `{name}` (instance name), `{template}` (the base guest the
+          instance was spawned from), `{kind}` (`vm`/`container`), `{id}`,
+          `{event}` and `{phase}` are replaced before the shell sees the
+          command. Substitution is a literal string replace, so ordinary shell
+          syntax that uses braces is safe.
+        '';
+      };
+      guests = mkOption {
+        type = types.listOf types.str;
+        default = ["*"];
+        description = ''
+          `fnmatch` glob patterns selecting the guests this hook applies to.
+          Each pattern is matched against BOTH the instance name and its base
+          template, so `["notes"]` matches `notes` and `notes-2`, and
+          `["dev-*"]` matches every numbered `dev` instance.
+
+          A leading `!` excludes a match (`["*" "!vpn"]` = every guest except
+          `vpn`). The default `["*"]` is the all-inclusive spelling; `[]`
+          selects nothing and therefore disables the hook.
+
+          Per-guest hooks (`tartarus.guests.<name>.hooks`) ignore this field:
+          the renderer forces `["<name>"]` there.
+        '';
+      };
+      kinds = mkOption {
+        type = types.listOf (types.enum ["vm" "container"]);
+        default = ["vm" "container"];
+        description = ''
+          Guest kinds this hook applies to. Defaults to both; narrow it to
+          `["vm"]` or `["container"]` to skip the other. Per-guest hooks ignore
+          this field (the renderer forces the guest's own kind).
+        '';
+      };
+      timeout = mkOption {
+        type = types.ints.positive;
+        default = 30;
+        description = ''
+          Per-attempt timeout in seconds (rendered as a TOML float). A command
+          that runs longer is killed and counts as a failed attempt.
+        '';
+      };
+      retries = mkOption {
+        type = types.ints.unsigned;
+        default = 0;
+        description = ''
+          Number of extra attempts after the first failure. Useful right after
+          a start, when a just-booted guest's service may not be reachable yet.
+        '';
+      };
+      retryDelay = mkOption {
+        type = types.numbers.nonnegative;
+        default = 2.0;
+        description = ''
+          Seconds to wait between attempts (accepts `2` or `2.0`; rendered as
+          a TOML float).
+        '';
+      };
+      onFailure = mkOption {
+        type = types.enum ["warn" "abort"];
+        default = "warn";
+        description = ''
+          What to do once every attempt failed: `"warn"` (default) prints a
+          warning and lets the tartarus command continue, `"abort"` fails the
+          command with an error. A failing `before` hook aborts the operation
+          itself before it runs.
+        '';
+      };
+      description = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Human-readable label used in hook log lines. `null` falls back to the command.";
+      };
+    };
+  };
+
+  # One event's hook phases. `before` runs before the operation, `after` once
+  # it completed successfully (for `start`, after relays are up).
+  #
+  # A plain attrset of option declarations, deliberately NOT a
+  # `types.submodule { options = ...; }` binding: `types.submodule` merges
+  # `options` into the enclosing submodule when nested, which would flatten
+  # every event's hooks into a single list instead of keeping them per event.
+  # Keeping the phase shape an attrset of lists also indexes cleanly:
+  # `hooks.start.after` reads a list directly.
+  hookPhaseOptions = {
+    before = mkOption {
+      type = types.listOf hookType;
+      default = [];
+      description = "Hooks run before the event's operation. A failing `onFailure = \"abort\"` hook prevents the operation.";
+    };
+    after = mkOption {
+      type = types.listOf hookType;
+      default = [];
+      description = "Hooks run after the event's operation completed.";
+    };
+  };
+
+  # The full event/phase set used by both hook scopes:
+  #
+  #   tartarus.hooks.<event>.<phase>        # host-wide
+  #   tartarus.guests.<name>.hooks.<event>.<phase>  # per guest
+  #
+  # Event semantics:
+  #   * `create` -- a new instance is provisioned (VM `spawn`, container
+  #     create / first start of an ad-hoc instance);
+  #   * `start` / `stop` -- every real transition, including the start implied
+  #     by `create`. No-op transitions (already running / already stopped) run
+  #     no hooks;
+  #   * `remove` -- `stop --purge` (the VM state dir or the container
+  #     registration is destroyed);
+  #   * `build` -- an explicit `tartarus build`.
+  #
+  # `restart` is composed from stop + start and has no event of its own; both
+  # hook sets fire, `stop` first.
+  #
+  # Ordering of create+start: `before create` -> `before start` -> operation
+  # -> `after start` -> `after create`. Purge orders as `before stop` -> stop
+  # -> `after stop` -> `before remove` -> remove -> `after remove`; purging an
+  # already-stopped instance fires only the remove hooks.
+  #
+  # Gotcha: containers that auto-start *inside* a container-host VM are not
+  # started through the host CLI, so their `start.after` hooks do not fire; an
+  # explicit `tartarus -c start <name>` does fire them.
+  hooksType = types.submodule {
+    options = {
+      create = mkOption {
+        type = types.submodule {options = hookPhaseOptions;};
+        default = {};
+        description = "Hooks for provisioning a new instance (VM spawn / container create).";
+      };
+      start = mkOption {
+        type = types.submodule {options = hookPhaseOptions;};
+        default = {};
+        description = "Hooks for every real start transition (including the start implied by `create`).";
+      };
+      stop = mkOption {
+        type = types.submodule {options = hookPhaseOptions;};
+        default = {};
+        description = "Hooks for every real stop transition.";
+      };
+      remove = mkOption {
+        type = types.submodule {options = hookPhaseOptions;};
+        default = {};
+        description = "Hooks for `stop --purge`, i.e. destroying the instance's state.";
+      };
+      build = mkOption {
+        type = types.submodule {options = hookPhaseOptions;};
+        default = {};
+        description = "Hooks for an explicit `tartarus build`.";
+      };
+    };
+  };
 in {
+  # Shared hook types. `hooksType` is the full event/phase set used by both
+  # `tartarus.hooks` and `tartarus.guests.<name>.hooks`; `hookType` is a single
+  # entry, exported for callers that build one outside the option tree.
+  inherit hookType hooksType;
+
   # Static IDs share the 3-100 range; auto-assignment (see ./ids.nix) starts
   # at 101 so forced and auto IDs can never collide.
   idType = types.nullOr (types.addCheck types.ints.positive (x: x > 2));
