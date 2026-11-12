@@ -2937,7 +2937,7 @@ def _resolve_agent_sockets(
             elif p.exists():
                 add(entry)
             else:
-                log.debug(f"agent_sockets: upstream {entry!r} is absent; skipping")
+                log.warning(f"agent_sockets: upstream {entry!r} is absent; skipping")
         except OSError as e:
             log.warning(f"agent_sockets: cannot inspect upstream {entry!r}: {e}")
     return paths
@@ -3188,10 +3188,14 @@ def run_proxy(config: Config) -> None:
     ]
     for thread in threads:
         thread.start()
+    # Set only on the intended-shutdown path, so the join loop below can tell
+    # "we asked the listeners to stop" from "a listener died on its own".
+    shutdown_requested = threading.Event()
     try:
         for thread in threads:
             thread.join()
     except KeyboardInterrupt:
+        shutdown_requested.set()
         log.info("Shutting down...")
     finally:
         for server, listener in bound:
@@ -3206,6 +3210,21 @@ def run_proxy(config: Config) -> None:
             with suppress(Exception):
                 if getattr(remote, "sock", None):
                     remote.sock.close()
+
+    # A `serve_forever` thread only returns on `shutdown()` or on a fatal error
+    # in its accept loop. Reaching here without a requested shutdown therefore
+    # means a listener died while the process was still "serving": exit
+    # non-zero so systemd's `Restart=on-failure` brings the proxy back.
+    if not shutdown_requested.is_set():
+        dead = [
+            _listener_target(listener)
+            for thread, (_server, listener) in zip(threads, bound)
+            if not thread.is_alive()
+        ]
+        log.error(
+            f"SSH Agent Proxy listener(s) stopped unexpectedly: {', '.join(dead)}"
+        )
+        exit(1)
 
 
 def main() -> None:

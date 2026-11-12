@@ -3757,6 +3757,9 @@ def run_server(config: dict) -> None:
         threads.append(
             (threading.Thread(target=server.serve_forever, daemon=True), server)
         )
+    # Set only on the intended-shutdown path, so the join loop below can tell
+    # "we asked the listeners to stop" from "a listener died on its own".
+    shutdown_requested = threading.Event()
     try:
         for thread, _server in threads:
             thread.start()
@@ -3768,10 +3771,30 @@ def run_server(config: dict) -> None:
         for thread, _server in threads:
             thread.join()
     except KeyboardInterrupt:
-        pass
+        shutdown_requested.set()
     finally:
         for server, transport, _ in bound:
             _close_listener(server, transport)
+
+    # A `serve_forever` thread only returns on `shutdown()` or on a fatal error
+    # in its accept loop. Reaching here without a requested shutdown therefore
+    # means a listener died while the process was still "serving": exit
+    # non-zero so systemd's `Restart=on-failure` brings the proxy back.
+    if not shutdown_requested.is_set():
+        dead = [
+            transport.describe()
+            for (thread, _server), (_server2, transport, _security) in zip(
+                threads, bound
+            )
+            if not thread.is_alive()
+        ]
+        print(
+            "sudo-auth-proxy server: listener(s) stopped unexpectedly: "
+            + ", ".join(dead),
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
 
 
 def collect_request_fields() -> dict:

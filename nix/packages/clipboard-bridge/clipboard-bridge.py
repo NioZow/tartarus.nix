@@ -2696,13 +2696,34 @@ def cmd_serve(args):
                 thread.start()
             for _thread, server in threads:
                 server._cb_serving = True
-            while True:
-                time.sleep(3600)
+            # Poll instead of sleeping for an hour, so a listener that dies on
+            # its own is noticed instead of leaving the process "serving"
+            # nothing while systemd still reports active (running).
+            while all(thread.is_alive() for thread, _server in threads):
+                time.sleep(1)
         except KeyboardInterrupt:
             print("\nShutting down...")
         finally:
             for server in servers:
                 _close_server(server)
+
+        dead = [
+            description
+            for (thread, _server), (description, _is_admin) in zip(
+                threads, descriptions
+            )
+            if not thread.is_alive()
+        ]
+        if dead:
+            # `serve_forever` only returns on `shutdown()` or on a fatal error
+            # in its accept loop; none of the paths above call `shutdown()`, so
+            # a stopped thread here means the listener died unexpectedly.
+            print(
+                "clipboard-bridge server: listener(s) stopped unexpectedly: "
+                + ", ".join(dead),
+                file=sys.stderr,
+            )
+            sys.exit(1)
     except BaseException:
         for server in servers:
             _close_server(server)
