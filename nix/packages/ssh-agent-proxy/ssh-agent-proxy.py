@@ -34,10 +34,11 @@ from socketserver import (
 from stat import S_ISLNK, S_ISSOCK
 from struct import calcsize, pack, unpack
 from subprocess import run
+import sys
 from sys import exit, platform as sys_platform
 from tempfile import gettempdir
 from threading import Lock, Thread
-from time import monotonic, time
+from time import monotonic, sleep, time
 from tomllib import load
 from typing import Any, Callable, Optional
 from xml.etree import ElementTree
@@ -3188,14 +3189,34 @@ def run_proxy(config: Config) -> None:
     ]
     for thread in threads:
         thread.start()
-    # Set only on the intended-shutdown path, so the join loop below can tell
-    # "we asked the listeners to stop" from "a listener died on its own".
+    # Set only on the intended-shutdown path, so the exit-code decision below
+    # can tell "we asked the listeners to stop" from "a listener died on its
+    # own".
     shutdown_requested = threading.Event()
+    # Snapshot of the listeners found dead *before* cleanup runs. The `finally`
+    # block calls `shutdown()`, which blocks until every `serve_forever`
+    # returns, so after cleanup every thread is dead -- including on a clean
+    # Ctrl-C. Liveness must therefore be sampled here, not after the `finally`.
+    dead: list[str] = []
+    # An empty listener list would make the `all(...)` wait loop below spin
+    # forever: `all([])` is `True`, so there is nothing to serve and no way to
+    # notice. Treat it as a fatal misconfiguration instead.
+    if not threads:
+        log.error("SSH Agent Proxy: no listeners configured; nothing to serve")
+        sys.exit(1)
     try:
-        for thread in threads:
-            thread.join()
+        # Poll instead of joining, so a listener that dies while the others
+        # keep serving is noticed instead of blocking the process forever.
+        while all(thread.is_alive() for thread in threads):
+            sleep(0.5)
+        dead = [
+            _listener_target(listener)
+            for thread, (_server, listener) in zip(threads, bound)
+            if not thread.is_alive()
+        ]
     except KeyboardInterrupt:
         shutdown_requested.set()
+        dead = []
         log.info("Shutting down...")
     finally:
         for server, listener in bound:
@@ -3212,19 +3233,12 @@ def run_proxy(config: Config) -> None:
                     remote.sock.close()
 
     # A `serve_forever` thread only returns on `shutdown()` or on a fatal error
-    # in its accept loop. Reaching here without a requested shutdown therefore
-    # means a listener died while the process was still "serving": exit
-    # non-zero so systemd's `Restart=on-failure` brings the proxy back.
-    if not shutdown_requested.is_set():
-        dead = [
-            _listener_target(listener)
-            for thread, (_server, listener) in zip(threads, bound)
-            if not thread.is_alive()
-        ]
-        log.error(
-            f"SSH Agent Proxy listener(s) stopped unexpectedly: {', '.join(dead)}"
-        )
-        exit(1)
+    # in its accept loop. A listener found dead before any shutdown was
+    # requested died while the process was still "serving": exit non-zero so
+    # systemd's `Restart=on-failure` brings the proxy back.
+    if not shutdown_requested.is_set() and dead:
+        log.error(f"SSH Agent Proxy listener(s) stopped unexpectedly: {', '.join(dead)}")
+        sys.exit(1)
 
 
 def main() -> None:

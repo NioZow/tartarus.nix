@@ -2691,6 +2691,16 @@ def cmd_serve(args):
             )
             threads.append((thread, server))
 
+        # An empty listener list would make the `all(...)` wait loop below spin
+        # forever: `all([])` is `True`, so there is nothing to serve and no way
+        # to notice. Treat it as a fatal misconfiguration instead.
+        if not threads:
+            print(
+                "clipboard-bridge server: no listeners configured; nothing to serve",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         try:
             for thread, _server in threads:
                 thread.start()
@@ -2701,23 +2711,27 @@ def cmd_serve(args):
             # nothing while systemd still reports active (running).
             while all(thread.is_alive() for thread, _server in threads):
                 time.sleep(1)
+            # Sample liveness *before* the `finally` runs: `_close_server` calls
+            # `shutdown()`, which blocks until every `serve_forever` returns, so
+            # after cleanup every thread is dead -- including on a clean Ctrl-C.
+            dead = [
+                description
+                for (thread, _server), (description, _is_admin) in zip(
+                    threads, descriptions
+                )
+                if not thread.is_alive()
+            ]
         except KeyboardInterrupt:
             print("\nShutting down...")
+            dead = []
         finally:
             for server in servers:
                 _close_server(server)
 
-        dead = [
-            description
-            for (thread, _server), (description, _is_admin) in zip(
-                threads, descriptions
-            )
-            if not thread.is_alive()
-        ]
         if dead:
             # `serve_forever` only returns on `shutdown()` or on a fatal error
-            # in its accept loop; none of the paths above call `shutdown()`, so
-            # a stopped thread here means the listener died unexpectedly.
+            # in its accept loop; a listener found dead before any shutdown was
+            # requested died unexpectedly.
             print(
                 "clipboard-bridge server: listener(s) stopped unexpectedly: "
                 + ", ".join(dead),

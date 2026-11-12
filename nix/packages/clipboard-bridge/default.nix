@@ -988,9 +988,10 @@
           type = types.str;
           default = "on-failure";
           description = ''
-            systemd `Restart=` policy for the server unit. `"on-failure"`
-            restarts on non-zero exit, signal or timeout, but not on a clean
-            exit 0. Ignored on macOS (launchd).
+            systemd `Restart=` policy for the server unit. `"on-failure"` restarts
+            on non-zero exit, on death by an unrequested signal, and on timeout,
+            but not on a clean exit 0 and not after a stop requested by systemd.
+            Ignored on macOS (launchd).
           '';
         };
 
