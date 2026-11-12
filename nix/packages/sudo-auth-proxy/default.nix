@@ -698,6 +698,25 @@
     options.tartarus.sudo-auth-proxy = {
       enable = mkEnableOption "the sudo-auth-proxy PAM client (guest side)";
 
+      restart = mkOption {
+        type = types.str;
+        default = "on-failure";
+        description = ''
+          systemd `Restart=` policy for the server units. `"on-failure"`
+          restarts on non-zero exit, signal or timeout, but not on a clean
+          exit 0. Ignored on macOS (launchd).
+        '';
+      };
+
+      restartSec = mkOption {
+        type = types.int;
+        default = 60;
+        description = ''
+          systemd `RestartSec=` delay in seconds between restart attempts.
+          Ignored on macOS (launchd).
+        '';
+      };
+
       transport = mkOption {
         type = types.enum ["vsock" "tcp" "unix"];
         default = "tcp";
@@ -1301,6 +1320,8 @@
         after = ["graphical-session.target"];
         partOf = ["graphical-session.target"];
         wantedBy = ["graphical-session.target"];
+        restart = cfg.restart;
+        restartSec = cfg.restartSec;
         # Its own runtime dir, matching the `sudo-auth-proxy-<name>` unit; the
         # Python re-creates/chmods it regardless (doc §9.1).
         extraSystemdServiceConfig = {
@@ -1380,6 +1401,8 @@
         after = ["graphical-session.target"];
         partOf = ["graphical-session.target"];
         wantedBy = ["graphical-session.target"];
+        restart = cfg.restart;
+        restartSec = cfg.restartSec;
         # The server binds `%t/sudo-auth-proxy/server.sock`, so the per-user
         # runtime directory must be `0700` and owned by the server user (doc
         # §9.1). systemd creates and owns it for the user unit; on macOS

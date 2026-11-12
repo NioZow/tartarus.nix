@@ -983,6 +983,25 @@
           default = false;
           description = "Log connection/handshake/request timing to stderr.";
         };
+
+        restart = mkOption {
+          type = types.str;
+          default = "on-failure";
+          description = ''
+            systemd `Restart=` policy for the server unit. `"on-failure"`
+            restarts on non-zero exit, signal or timeout, but not on a clean
+            exit 0. Ignored on macOS (launchd).
+          '';
+        };
+
+        restartSec = mkOption {
+          type = types.int;
+          default = 60;
+          description = ''
+            systemd `RestartSec=` delay in seconds between restart attempts.
+            Ignored on macOS (launchd).
+          '';
+        };
       };
 
       client =
@@ -1055,6 +1074,8 @@ in {
         description = "Clipboard bridge server";
         command = "${package}/bin/clipboard-bridge --config ${configPath} serve --no-notify";
         scope = "system";
+        restart = server.restart;
+        restartSec = server.restartSec;
         # The server reads its config once at startup; restart it when the
         # generated document changes.
         extraSystemdUnitConfig = {
@@ -1133,6 +1154,8 @@ in {
           name = "clipboard-bridge-server";
           description = "Clipboard bridge server";
           command = "${package}/bin/clipboard-bridge --config ${serverConfigPath} serve --no-notify";
+          restart = server.restart;
+          restartSec = server.restartSec;
           # The server reads its config once at startup; restart it when the
           # generated `[[listeners]]`/`security`/`[[rule]]` document changes.
           extraSystemdUnitConfig = {
@@ -1156,6 +1179,8 @@ in {
             if client.autostart
             then null
             else [];
+          restart = cfg.server.restart;
+          restartSec = cfg.server.restartSec;
           environment =
             optionalAttrs (client.waylandDisplay != null) {
               WAYLAND_DISPLAY = client.waylandDisplay;
@@ -1171,6 +1196,8 @@ in {
           name = "clipboard-bridge-proxy";
           description = "Clipboard bridge connection-reuse proxy";
           command = "${package}/bin/clipboard-bridge --config ${clientConfigPath} proxy";
+          restart = cfg.server.restart;
+          restartSec = cfg.server.restartSec;
           extraSystemdUnitConfig = {
             X-Restart-Triggers = [clientConfigFile];
           };
@@ -1190,6 +1217,8 @@ in {
           name = "clipboard-bridge-admin-proxy";
           description = "Clipboard bridge admin connection-reuse proxy";
           command = "${package}/bin/clipboard-bridge --config ${adminConfigPath} proxy";
+          restart = cfg.server.restart;
+          restartSec = cfg.server.restartSec;
           extraSystemdUnitConfig = {
             X-Restart-Triggers = [adminConfigFile];
           };
