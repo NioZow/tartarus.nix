@@ -564,6 +564,25 @@
           default = false;
           description = "Log connection/handshake/request timing to stderr.";
         };
+
+        restart = mkOption {
+          type = types.str;
+          default = "on-failure";
+          description = ''
+            systemd `Restart=` policy for the server unit. `"on-failure"`
+            restarts on non-zero exit, signal or timeout, but not on a clean
+            exit 0. Ignored on macOS (launchd).
+          '';
+        };
+
+        restartSec = mkOption {
+          type = types.int;
+          default = 60;
+          description = ''
+            systemd `RestartSec=` delay in seconds between restart attempts.
+            Ignored on macOS (launchd).
+          '';
+        };
       };
 
       bridge = {
@@ -928,6 +947,8 @@ in {
         description = "SSH agent proxy via its configured listeners";
         command = "${package}/bin/ssh-agent-proxy --config ${configPath}${lib.optionalString server.debug " --debug"}";
         scope = "system";
+        restart = server.restart;
+        restartSec = server.restartSec;
         environment = lib.optionalAttrs (server.settings.agent_sockets == null) {
           SSH_AUTH_SOCK = "/run/ssh-agent-proxy/ssh-agent";
         };
@@ -1100,6 +1121,8 @@ in {
           after = ["graphical-session.target"];
           partOf = ["graphical-session.target"];
           wantedBy = ["graphical-session.target"];
+          restart = server.restart;
+          restartSec = server.restartSec;
           environment = optionalAttrs (server.settings.agent_sockets == null) {
             SSH_AUTH_SOCK = "%t/ssh-agent";
           };
