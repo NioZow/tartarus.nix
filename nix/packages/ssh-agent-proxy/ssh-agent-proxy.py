@@ -2456,9 +2456,11 @@ class Handler(AgentIO, BaseRequestHandler):
         advertised on this connection map each blob to its real owner, so try
         that owner first. An explicitly pinned `key.socket` wins, and every
         other connected upstream is tried too, taking the first answer that is
-        not `SSH_AGENT_FAILURE` (the documented relay behaviour). Returns
-        `(response, upstream_id)`; the response is None only when no upstream
-        answered at all.
+        not `SSH_AGENT_FAILURE` (the documented relay behaviour). An upstream
+        that returns nothing (dead connection) is skipped rather than treated as
+        a refusal, and the key's owner is retried once when it went silent.
+        Returns `(response, upstream_id)`; the response is None only when no
+        upstream answered and the owner's retry also failed.
         """
         owner = self.key_upstream.get(key_blob)
         preferred = k_cfg.socket if k_cfg.explicit_socket else (owner or k_cfg.socket)
@@ -2472,6 +2474,7 @@ class Handler(AgentIO, BaseRequestHandler):
 
         last: Optional[bytes] = None
         last_path: Optional[str] = None
+        owner_silent = False
         seen: set[str] = set()
         for path in candidates:
             if path in seen or path not in real_agents:
@@ -2480,11 +2483,26 @@ class Handler(AgentIO, BaseRequestHandler):
             resp = real_agents[path].request(raw_msg)
             last_path = path
             if not resp:
+                # The upstream went silent (dead pooled connection, reconnect
+                # failed). That is not a refusal: keep looking.
+                if path == owner:
+                    owner_silent = True
                 continue
             if resp[0] != AgentMsg.FAILURE:
                 return resp, path
             last = resp
-        return last, last_path
+        # A FAILURE from an agent that does not own the key says nothing about
+        # the key: it is only "I don't have it". When the real owner went silent
+        # (a pooled vsock/tcp link torn down by a concurrent request), retry it
+        # once instead of relaying the other agent's FAILURE as "agent refused
+        # operation" for a key the owner actually holds.
+        if owner_silent and owner is not None and owner in real_agents:
+            resp = real_agents[owner].request(raw_msg)
+            if resp:
+                return resp, owner
+        if last is not None:
+            return last, last_path
+        return None, last_path
 
     def _dialog_program(self) -> str:
         return self.config.dialog_program or (

@@ -1247,6 +1247,60 @@ server_auth = "none"
         stop.set()
 
 
+def test_sign_retries_owner_after_a_silent_upstream(
+    sap: types.ModuleType, tmp_path: Path
+) -> None:
+    """A dead link on the key's owner must not be reported as a refusal.
+
+    Regression: the owner (a pooled vsock/tcp upstream) returned nothing --
+    a torn-down shared connection, not a refusal -- and the proxy relayed the
+    *other* agent's SSH_AGENT_FAILURE, which the client shows as "agent refused
+    operation" even though the owner holds the private key.
+    """
+
+    class _Link:
+        def __init__(self, *responses: bytes | None) -> None:
+            self._responses = list(responses)
+            self.calls = 0
+
+        def request(self, msg: bytes) -> bytes | None:
+            self.calls += 1
+            return self._responses.pop(0) if self._responses else None
+
+    cfg = _load_proxy(
+        sap,
+        tmp_path,
+        'mode = "proxy"\nagent_sockets = ["/tmp/unix-agent", "/tmp/vsock-agent"]\n',
+    )
+    handler = types.SimpleNamespace(config=cfg, key_upstream={b"blob": "/tmp/vsock-agent"})
+    handler._sign_via_upstream = types.MethodType(sap.Handler._sign_via_upstream, handler)
+    key = types.SimpleNamespace(
+        id="gram", socket="/tmp/unix-agent", explicit_socket=False
+    )
+    signature = bytes([SIGN_RESPONSE]) + b"sig"
+    failure = bytes([FAILURE])
+
+    # The unix agent refuses (it has no private key); the owner goes silent on
+    # the first attempt and signs on the retry.
+    real_agents = {
+        "/tmp/unix-agent": _Link(failure),
+        "/tmp/vsock-agent": _Link(None, signature),
+    }
+    response, answered_by = handler._sign_via_upstream(b"blob", key, b"raw", real_agents)
+    assert response is not None
+    assert response[0] == SIGN_RESPONSE
+    assert answered_by == "/tmp/vsock-agent"
+
+    # A genuine refusal from every upstream is still relayed as FAILURE.
+    real_agents = {
+        "/tmp/unix-agent": _Link(failure),
+        "/tmp/vsock-agent": _Link(failure),
+    }
+    response, _ = handler._sign_via_upstream(b"blob", key, b"raw", real_agents)
+    assert response is not None
+    assert response[0] == FAILURE
+
+
 def test_proxy_unix_listener_merges_two_agents_allow_all(
     sap: types.ModuleType, tmp_path: Path
 ) -> None:
