@@ -94,14 +94,14 @@ schema = 1
 [[hooks]]
 event = "start"
 phase = "after"
-command = "/nix/store/.../bin/rex-tunnel up {name}"
+command = "logger tartarus guest {name} started"
 guests = ["*"]
 kinds = ["vm", "container"]
 timeout = 20.0
 retries = 15
 retry_delay = 2.0
 on_failure = "warn"
-description = "Rex tunnel up"
+description = "Guest started"
 ```
 
 | Field | TOML type | Default in `hooks.py` | Notes |

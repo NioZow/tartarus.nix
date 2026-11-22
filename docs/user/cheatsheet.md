@@ -63,8 +63,8 @@ tartarus.containers.containerHost = "ch";        # Darwin: nest containers
 tartarus.containers.sudoNoPassword.enable = true; # no sudo prompt on start/stop
 
 # Lifecycle hooks: run after a start / before a stop, for every guest
-tartarus.hooks.start.after = [{ command = "rex-tunnel up {name}"; retries = 15; }];
-tartarus.hooks.stop.before = [{ command = "rex-tunnel down {name}"; }];
+tartarus.hooks.start.after = [{ command = "logger tartarus guest {name} started"; retries = 15; }];
+tartarus.hooks.stop.before = [{ command = "logger tartarus guest {name} stopping"; }];
 #                     per guest: only this guest's own instances fire it
 tartarus.guests.vault.hooks.start.after = [{ command = "notify-send {name}"; }];
 ```
@@ -96,10 +96,10 @@ Global flags (before the command): `-c/--container`, `--config PATH`,
 `--hooks PATH`. Hook examples:
 
 ```nix
-# after a start, retry until the guest answers (15 × 2 s, 20 s per attempt)
-tartarus.hooks.start.after = [{ command = "rex-tunnel up {name}"; timeout = 20; retries = 15; }];
+# after a start, retry (15 × 2 s, 20 s per attempt)
+tartarus.hooks.start.after = [{ command = "logger tartarus guest {name} started"; timeout = 20; retries = 15; }];
 # before a stop, for one guest only (guests/kinds are forced to it)
-tartarus.guests.vault.hooks.stop.before = [{ command = "rex-tunnel down {name}"; }];
+tartarus.guests.vault.hooks.stop.before = [{ command = "logger tartarus guest {name} stopping"; }];
 ```
 
 ## Lifecycle hooks

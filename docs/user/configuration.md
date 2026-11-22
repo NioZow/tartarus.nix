@@ -66,14 +66,14 @@ every operation.
 ```nix
 tartarus.hooks.start.after = [
   {
-    command = "${pkgs.rex-tunnel}/bin/rex-tunnel up {name}";
+    command = "logger tartarus guest {name} started";
     guests = [ "*" ];              # default: [ "*" ] (every guest)
     kinds = [ "vm" "container" ];  # default: both kinds
     timeout = 20;                  # seconds, default 30
     retries = 15;                  # default 0 (one attempt)
     retryDelay = 2.0;              # seconds, default 2.0
     onFailure = "warn";            # "warn" | "abort", default "warn"
-    description = "Rex tunnel up"; # default null (logs fall back to command)
+    description = "Guest started"; # default null (logs fall back to command)
   }
 ];
 
@@ -197,30 +197,29 @@ Containers that auto-start **inside** a container-host VM are not started
 through the host CLI, so their `start.after` hooks do not fire when the host VM
 boots. An explicit `tartarus -c start <name>` does fire them.
 
-### Example: a Rex tunnel that follows the guest
+### Example: host-side plumbing that follows the guest
 
-A common reason for hooks is host-side plumbing that must follow the guest.
-This module (nixcfg's `modules/virtualisation/tartarus/rex-tunnel-hooks.nix`)
-brings an SSH tunnel up after every guest start and takes it down before every
-stop (the generated file is shown in
+A common reason for hooks is host-side plumbing that must follow the guest: a
+log entry after every start and before every stop. The entries below do that for
+every guest (the generated file is shown in
 [Data model](../technical/data-model.md#the-hookstoml-artifact)):
 
 ```nix
-{pkgs, ...}: {
+{ ... }: {
   config.tartarus.hooks = {
     start.after = [
       {
-        command = "${pkgs.rex-tunnel}/bin/rex-tunnel up {name}";
-        timeout = 20;      # a just-booted guest may be slow to answer
+        command = "logger tartarus guest {name} started";
+        timeout = 20;      # seconds per attempt
         retries = 15;      # 16 attempts, ~30 s of retrying
         retryDelay = 2.0;
-        description = "Rex tunnel up";
+        description = "Guest started";
       }
     ];
     stop.before = [
       {
-        command = "${pkgs.rex-tunnel}/bin/rex-tunnel down {name}";
-        description = "Rex tunnel down";
+        command = "logger tartarus guest {name} stopping";
+        description = "Guest stopping";
       }
     ];
   };
@@ -230,7 +229,7 @@ stop (the generated file is shown in
 `guests`/`kinds` are left at their defaults, so the hooks cover every enabled
 guest on the host. A host that wants to skip one writes `guests = ["*" "!vpn"]`
 on that entry instead of dropping the hook. Because the command runs as the
-invoking user, it only needs that user's SSH agent and `~/.ssh`.
+invoking user, it sees that user's environment and `$HOME`.
 
 ## `tartarus.guests.<name>`
 
